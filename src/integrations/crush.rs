@@ -21,7 +21,7 @@
 //! `session hook crush`. Remove deletes only those lines.
 use super::{HookResult, Integration};
 use crate::model::Status;
-use crate::setup::{read_opt, shell_quote, write_atomic};
+use crate::setup::{read_opt, write_atomic};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -77,7 +77,7 @@ fn is_ours(line: &str) -> bool {
 }
 
 fn block(exe: &str) -> String {
-    let cmd = shell_quote(&format!("{} session hook crush", super::gemini::quote_once(exe)));
+    let cmd = posix_quote(&format!("{} session hook crush", posix_quote_once(exe)));
     let mut s = format!("{HEADER}\n");
     for e in EVENTS {
         s.push_str(&format!("hook add {e} --name grace --command {cmd}\n"));
@@ -143,6 +143,28 @@ fn hook(_args: &[String], stdin: &str) -> HookResult {
     };
     let cwd = v.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()).map(String::from);
     HookResult { status: Some(status), cwd }
+}
+
+/// crushrc uses POSIX shell quoting on every OS (Crush runs hooks with a built-in POSIX shell),
+/// so we never use the Windows double-quote style here.
+fn posix_quote(s: &str) -> String {
+    let plain = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/_-.:\\+@%".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Quote the exe unless the caller already quoted it.
+fn posix_quote_once(exe: &str) -> String {
+    if exe.starts_with('\'') {
+        exe.to_string()
+    } else {
+        posix_quote(exe)
+    }
 }
 
 #[cfg(test)]
