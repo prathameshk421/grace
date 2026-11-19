@@ -61,13 +61,20 @@ fn plugin_source(exe: &str) -> String {
         r#"// {MARK}. Remove with: grace setup opencode --remove
 const GRACE = {js_exe};
 
+// OpenCode 2.x event names first, then the 1.x names.
 const MAP = {{
-  "session.idle": "ready",
-  "permission.updated": "waiting",
+  "session.execution.started": "working",
+  "session.step.started": "working",
+  "session.tool.called": "working",
+  "session.execution.succeeded": "ready",
+  "session.execution.failed": "ready",
+  "session.execution.interrupted": "ready",
   "permission.asked": "waiting",
   "permission.replied": "working",
   "session.created": "ready",
   "session.deleted": "done",
+  "session.idle": "ready",
+  "permission.updated": "waiting",
 }};
 
 function keyFor(event) {{
