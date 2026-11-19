@@ -88,6 +88,7 @@ fn tag_color(tool: &str) -> Color {
         "vscode" => Color::Rgb(0, 122, 204),
         "vscodium" => Color::Rgb(70, 190, 230),
         "windsurf" => Color::Rgb(0, 200, 170),
+        "t3code" => Color::Rgb(160, 110, 255),
         "zed" => Color::Rgb(255, 140, 40),
         "neovim" => Color::LightGreen,
         "vim" => Color::Rgb(1, 152, 51),

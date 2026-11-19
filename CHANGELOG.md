@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+- Add T3 Code as a built-in tool. The command is `t3` and the tag is `t3code`.
+- Import recent folders from T3 Code with `grace import t3code`. The first-run import includes it.
+- The picker has a fixed color for the `t3code` tag.
+
 ## 1.1.0
 
 - Add editors as built-in tools: VS Code, VS Code Insiders, VSCodium, Windsurf, Zed, Neovim, Vim, Sublime Text, IntelliJ IDEA, PyCharm and WebStorm.

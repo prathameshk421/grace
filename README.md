@@ -79,7 +79,7 @@ Open a new terminal. On the first run, grace imports folders from your Claude Co
 | `grace list` | Print all folders, best first. |
 | `grace pin` / `grace unpin` | Keep the current folder at the top (or remove the pin). |
 | `grace forget` | Remove the current folder from grace. |
-| `grace import [source]` | Import history again. Sources: `all` (default), `claude`, `vscode`, `cursor`, `windsurf`, `antigravity`, `zed`. |
+| `grace import [source]` | Import history again. Sources: `all` (default), `claude`, `vscode`, `cursor`, `windsurf`, `antigravity`, `zed`, `t3code`. |
 | `grace tag <path> <tool> [target]` | Record a tool run. The shell hook calls this. |
 
 Each command that takes a folder also accepts a path, for example `grace forget ~/old-project`.
@@ -92,6 +92,7 @@ Each command that takes a folder also accepts a path, for example `grace forget 
 - `vscode`: VS Code, VS Code Insiders and VSCodium.
 - `cursor`, `windsurf`, `antigravity`: the VS Code family editors of the same name.
 - `zed`: the Zed workspace database.
+- `t3code`: the T3 Code project database (`~/.t3/userdata/statev2.sqlite`). grace skips deleted projects.
 
 With `all`, grace skips sources it cannot find. With a named source, it prints "not found". grace opens editor databases read-only. It never changes your editor data. Remote folders are skipped.
 
@@ -122,7 +123,7 @@ Names use letters, digits, `.`, `_` and `-`, and are at most 64 characters long.
 - Folders that no longer exist (for example, on an unplugged SSD) are hidden, not deleted.
 - Data lives in one SQLite file: `$GRACE_DATA_DIR`, else `$XDG_DATA_HOME/grace`, else `~/.local/share/grace/grace.db`.
 
-Known AI tools: `claude`, `agy` / `antigravity`, `codex`, `gemini`, `cursor` / `cursor-agent`, `opencode`, `aider`, `copilot`, `amp`, `goose`, `crush`, `qwen`.
+Known AI tools: `claude`, `agy` / `antigravity`, `codex`, `gemini`, `cursor` / `cursor-agent`, `opencode`, `aider`, `copilot`, `amp`, `goose`, `crush`, `qwen`, `t3` (tag `t3code`, T3 Code).
 
 Known editors: `code` and `code-insiders` (tag `vscode`), `codium`, `windsurf`, `zed`, `nvim` (tag `neovim`), `vim`, `subl` (tag `sublime`), `idea`, `pycharm` and `webstorm` (tag `jetbrains`).
 

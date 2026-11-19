@@ -36,6 +36,7 @@ pub const TOOLS: &[(&str, &str, &str, Kind)] = &[
     ("goose", "goose", "goose", Ai),
     ("crush", "crush", "crush", Ai),
     ("qwen", "qwen", "qwen", Ai),
+    ("t3", "t3code", "t3", Ai),
     ("code", "vscode", "code .", Editor),
     ("code-insiders", "vscode", "code-insiders .", Editor),
     ("codium", "vscodium", "codium .", Editor),
@@ -178,6 +179,7 @@ mod tests {
         assert_eq!(r.normalize_tag("AGY"), "antigravity");
         assert_eq!(r.normalize_tag(" cursor-agent "), "cursor");
         assert_eq!(r.normalize_tag("Foo"), "foo");
+        assert_eq!(r.normalize_tag("t3"), "t3code");
     }
 
     #[test]
