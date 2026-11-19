@@ -59,6 +59,8 @@ fn plugin_source(exe: &str) -> String {
     let js_exe = serde_json::to_string(&raw_exe(exe)).unwrap_or_else(|_| "\"grace\"".into());
     format!(
         r#"// {MARK}. Remove with: grace setup opencode --remove
+import {{ spawn }} from "node:child_process";
+
 const GRACE = {js_exe};
 
 // OpenCode 2.x event names first, then the 1.x names.
@@ -73,13 +75,15 @@ const MAP = {{
   "permission.replied": "working",
   "session.created": "ready",
   "session.deleted": "done",
+  "location.shutdown": "done",
   "session.idle": "ready",
   "permission.updated": "waiting",
 }};
 
 function keyFor(event) {{
   if (event.type === "session.status") {{
-    const t = event.properties && event.properties.status && event.properties.status.type;
+    const s = (event.properties && event.properties.status) || (event.data && event.data.status);
+    const t = s && s.type;
     if (t === "busy") return "working";
     if (t === "idle") return "ready";
     return null;
@@ -87,16 +91,42 @@ function keyFor(event) {{
   return MAP[event.type] || null;
 }}
 
-export const Grace = async ({{ $, directory }}) => ({{
-  event: async ({{ event }}) => {{
-    try {{
-      const key = keyFor(event);
-      if (!key) return;
-      // Fire and forget: no await, so the agent never waits for grace.
-      $`${{GRACE}} session hook opencode ${{key}} ${{directory}}`.quiet().nothrow();
-    }} catch (_) {{}}
+// Fire and forget: the agent never waits for grace, and errors are ignored.
+function send(key, dir) {{
+  try {{
+    const child = spawn(GRACE, ["session", "hook", "opencode", key, dir || ""], {{
+      stdio: "ignore",
+      detached: true,
+    }});
+    child.on("error", () => {{}});
+    child.unref();
+  }} catch (_) {{}}
+}}
+
+export default {{
+  id: "grace",
+  // OpenCode 2.x
+  async setup(ctx) {{
+    const home = ctx.location && ctx.location.directory;
+    const stop = new AbortController();
+    (async () => {{
+      for await (const event of ctx.event.subscribe({{ signal: stop.signal }})) {{
+        const key = keyFor(event);
+        if (key) send(key, (event.location && event.location.directory) || home);
+      }}
+    }})().catch(() => {{}});
+    return () => stop.abort();
   }},
-}});
+  // OpenCode 1.x
+  async server({{ directory }}) {{
+    return {{
+      event: async ({{ event }}) => {{
+        const key = keyFor(event);
+        if (key) send(key, directory);
+      }},
+    }};
+  }},
+}};
 "#
     )
 }
