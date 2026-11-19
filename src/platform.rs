@@ -58,6 +58,32 @@ pub fn normalize(p: &Path) -> String {
     clean_path_str(&p.to_string_lossy())
 }
 
+/// Path of the running grace program, for configs that call it later
+/// (CLI hooks, the hub tmux.conf).
+///
+/// A package manager can run grace from a folder that the next upgrade
+/// deletes. Homebrew runs `/opt/homebrew/Cellar/grace/<version>/bin/grace`.
+/// When a `grace` on PATH is the same file, this returns that stable path
+/// (`/opt/homebrew/bin/grace`). Otherwise it returns the real path.
+pub fn stable_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(stable_exe_in(&exe, std::env::var_os("PATH").as_deref()))
+}
+
+fn stable_exe_in(exe: &Path, path: Option<&std::ffi::OsStr>) -> PathBuf {
+    let Ok(real) = std::fs::canonicalize(exe) else {
+        return exe.to_path_buf();
+    };
+    let (Some(name), Some(path)) = (exe.file_name(), path) else {
+        return real;
+    };
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|cand| std::fs::canonicalize(cand).is_ok_and(|c| c == real))
+        .unwrap_or(real)
+}
+
 /// Compare two paths. Windows paths ignore case.
 pub fn same_path(a: &str, b: &str) -> bool {
     if cfg!(windows) {
@@ -161,6 +187,34 @@ pub fn pid_alive(_pid: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Homebrew layout: the program lives in a versioned Cellar folder and
+    /// bin/grace links to it. The link on PATH wins over the Cellar path.
+    #[cfg(unix)]
+    #[test]
+    fn stable_exe_prefers_link_on_path() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let cellar = root.join("Cellar/grace/2.0.1/bin");
+        let bin = root.join("bin");
+        let other = root.join("other");
+        for d in [&cellar, &bin, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let real = cellar.join("grace");
+        std::fs::write(&real, "").unwrap();
+        std::os::unix::fs::symlink("../Cellar/grace/2.0.1/bin/grace", bin.join("grace")).unwrap();
+        // A different file with the same name earlier on PATH is skipped.
+        std::fs::write(other.join("grace"), "").unwrap();
+        let path = std::env::join_paths(["relative/bin".into(), other.clone(), root.join("missing"), bin.clone()]).unwrap();
+        assert_eq!(stable_exe_in(&real, Some(&path)), bin.join("grace"));
+        // Not on PATH: the real path, as before.
+        let only_other = std::env::join_paths([other.clone()]).unwrap();
+        assert_eq!(stable_exe_in(&real, Some(&only_other)), real);
+        assert_eq!(stable_exe_in(&real, None), real);
+        // Started through the link: still the link, not the Cellar path.
+        assert_eq!(stable_exe_in(&bin.join("grace"), Some(&path)), bin.join("grace"));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -80,10 +80,10 @@ pub fn codex_config_path() -> Result<PathBuf> {
     Ok(env_dir("CODEX_HOME", ".codex")?.join("config.toml"))
 }
 
-/// Absolute path of the running grace binary.
+/// Absolute path of the running grace binary, one that survives upgrades.
 pub fn exe_string() -> Result<String> {
-    let exe = std::env::current_exe().context("cannot find the grace binary")?;
-    Ok(crate::platform::normalize(&exe))
+    let exe = crate::platform::stable_exe().context("cannot find the grace binary")?;
+    Ok(crate::platform::clean_path_str(&exe.to_string_lossy()))
 }
 
 /// Quote a path for the shell when it has special characters.

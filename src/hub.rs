@@ -759,7 +759,7 @@ fn term_size() -> (u16, u16) {
 }
 
 fn exe() -> Result<String> {
-    let p = std::env::current_exe().context("cannot find the grace program")?;
+    let p = crate::platform::stable_exe().context("cannot find the grace program")?;
     Ok(p.to_string_lossy().into_owned())
 }
 

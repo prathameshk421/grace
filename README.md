@@ -196,7 +196,7 @@ grace sessions -l      # plain list
 
 "shell" means the zsh or fish hook covers it. A blank cell means the CLI does not report it. Cursor CLI and T3 Code show working and done through the shell hook.
 
-`grace setup` makes a backup of the config first. `--remove` undoes it. If Codex already has a `notify` program, `grace setup codex` keeps it and forwards each event to it. In zsh and fish, grace also sees every AI CLI start and exit, with no setup.
+`grace setup` makes a backup of the config first. `--remove` undoes it. The config calls grace by its full path. With Homebrew, that is the stable `/opt/homebrew/bin/grace`, so upgrades keep working. If you move grace to another place, for example from cargo to Homebrew, run `grace setup <cli>` again. If Codex already has a `notify` program, `grace setup codex` keeps it and forwards each event to it. In zsh and fish, grace also sees every AI CLI start and exit, with no setup.
 
 ## Tags show where you worked.
 
