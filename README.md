@@ -30,11 +30,23 @@ In Elden Ring, you rest at a Site of Grace and fast travel to any grace you foun
 
 **1. Install.** Pick the line for your system.
 
-| System | Command |
-|---|---|
-| Linux, macOS | `curl -fsSL https://raw.githubusercontent.com/prathameshk421/grace/main/install.sh \| sh` |
-| Windows (PowerShell) | `irm https://raw.githubusercontent.com/prathameshk421/grace/main/install.ps1 \| iex` |
-| Homebrew (macOS, Linux) | `brew install prathameshk421/grace/grace` |
+Linux and macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/prathameshk421/grace/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/prathameshk421/grace/main/install.ps1 | iex
+```
+
+Homebrew (macOS and Linux):
+
+```sh
+brew install prathameshk421/grace/grace
+```
 
 **2. Connect your shell.** The installer prints the line for your shell. For zsh:
 
