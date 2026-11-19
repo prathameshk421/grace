@@ -19,10 +19,19 @@ $ProgressPreference = 'SilentlyContinue'
 
     $version = $env:GRACE_VERSION
     if (-not $version) {
+        # The releases/latest page redirects to .../tag/<version>. This has no API rate limit.
         try {
-            $version = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
-        } catch {
-            throw "Could not read the latest version. Set GRACE_VERSION or see $releases"
+            $resp = Invoke-WebRequest "$releases/latest" -UseBasicParsing -MaximumRedirection 5
+            $final = $resp.BaseResponse.ResponseUri
+            if (-not $final) { $final = $resp.BaseResponse.RequestMessage.RequestUri }
+            if ("$final" -match '/tag/([^/?#]+)') { $version = $Matches[1] }
+        } catch { }
+        if (-not $version) {
+            try {
+                $version = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
+            } catch {
+                throw "Could not read the latest version. Set GRACE_VERSION or see $releases"
+            }
         }
     }
     if (-not $version) { throw "Could not read the latest version. Set GRACE_VERSION or see $releases" }

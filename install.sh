@@ -40,9 +40,16 @@ target="$arch_part-$os_part"
 
 version="${GRACE_VERSION:-}"
 if [ -z "$version" ]; then
-  version=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
-    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1) ||
-    err "could not read the latest version. Set GRACE_VERSION or see $RELEASES"
+  # The releases/latest page redirects to .../tag/<version>. This has no API rate limit.
+  latest_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$RELEASES/latest" 2>/dev/null || true)
+  case "$latest_url" in
+    */tag/*) version=${latest_url##*/tag/} ;;
+  esac
+  if [ -z "$version" ]; then
+    # Fallback: the GitHub API (rate limited for anonymous calls).
+    version=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+      sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true)
+  fi
   [ -n "$version" ] || err "could not read the latest version. Set GRACE_VERSION or see $RELEASES"
 fi
 
