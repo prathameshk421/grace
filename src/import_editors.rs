@@ -180,7 +180,7 @@ pub fn sqlite_uri(path: &str, query: &str) -> String {
         out.push('/');
     }
     for b in p.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~' | b':') {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -358,7 +358,13 @@ mod tests {
             sqlite_uri("/Users/me/Library/Application Support/Code/a?b#c.db", "immutable=1"),
             "file:/Users/me/Library/Application%20Support/Code/a%3Fb%23c.db?immutable=1"
         );
-        assert_eq!(sqlite_uri(r"C:\Users\x\s.db", "immutable=1"), "file:/C%3A/Users/x/s.db?immutable=1");
+        assert_eq!(sqlite_uri(r"C:\Users\x\s.db", "immutable=1"), "file:/C:/Users/x/s.db?immutable=1");
+    }
+
+    /// Build a file URI the way VS Code writes it: file:///C:/a%20b on Windows, file:///a%20b on Unix.
+    fn file_uri(path: &str) -> String {
+        let p = path.replace('\\', "/").replace(' ', "%20");
+        if p.starts_with('/') { format!("file://{p}") } else { format!("file:///{p}") }
     }
 
     #[test]
@@ -370,8 +376,8 @@ mod tests {
         let c = Connection::open(&dbp).unwrap();
         c.execute("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)", []).unwrap();
         let json = format!(
-            r#"{{"entries":[{{"folderUri":"file://{}"}}]}}"#,
-            proj.to_string_lossy().replace(' ', "%20")
+            r#"{{"entries":[{{"folderUri":"{}"}}]}}"#,
+            file_uri(&proj.to_string_lossy())
         );
         c.execute("INSERT INTO ItemTable VALUES ('history.recentlyOpenedPathsList', ?1)", [json]).unwrap();
         drop(c);
