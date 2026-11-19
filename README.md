@@ -67,7 +67,7 @@ grace sessions         # picker with live agents only
 grace sessions -l      # plain list
 ```
 
-`grace setup` makes a backup of the config first. `--remove` undoes it. In zsh and fish, grace also sees every AI CLI start and exit, with no setup.
+`grace setup` makes a backup of the config first. `--remove` undoes it. If Codex already has a `notify` program, `grace setup codex` keeps it and forwards each event to it. In zsh and fish, grace also sees every AI CLI start and exit, with no setup.
 
 ## Tags show where you worked.
 

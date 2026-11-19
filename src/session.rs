@@ -24,6 +24,20 @@ pub fn parse_claude_hook(json: &str) -> Option<(Status, Option<String>)> {
     Some((status, non_empty_str(&v, "cwd")))
 }
 
+/// Split the args of `session hook codex`. The last arg is the Codex JSON.
+/// Items between `--then` and the JSON are the chained program and its args.
+pub fn split_codex_args(args: &[String]) -> (Option<&str>, Option<&[String]>) {
+    let Some((json, rest)) = args.split_last() else {
+        return (None, None);
+    };
+    let chained = rest
+        .iter()
+        .position(|a| a == "--then")
+        .map(|i| &rest[i + 1..])
+        .filter(|c| !c.is_empty());
+    (Some(json.as_str()), chained)
+}
+
 /// Parse the Codex CLI `notify` JSON. Returns the cwd (None inside: use the current dir)
 /// when the event is `agent-turn-complete`. Outer None: bad JSON or ignored event.
 pub fn parse_codex_notify(json: &str) -> Option<Option<String>> {
@@ -72,6 +86,20 @@ mod tests {
         assert_eq!(parse_claude_hook(r#"{"hook_event_name":"SubagentStop"}"#), None);
         assert_eq!(parse_claude_hook("not json"), None);
         assert_eq!(parse_claude_hook(""), None);
+    }
+
+    #[test]
+    fn split_args() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(split_codex_args(&[]), (None, None));
+        let a = v(&["{}"]);
+        assert_eq!(split_codex_args(&a), (Some("{}"), None));
+        let a = v(&["--then", "prog", "turn-ended", "{\"x\":1}"]);
+        let (j, c) = split_codex_args(&a);
+        assert_eq!(j, Some("{\"x\":1}"));
+        assert_eq!(c.unwrap(), &v(&["prog", "turn-ended"])[..]);
+        let a = v(&["--then", "{}"]);
+        assert_eq!(split_codex_args(&a), (Some("{}"), None));
     }
 
     #[test]

@@ -39,7 +39,14 @@ pub fn run(target: &str, remove: bool) -> Result<()> {
             };
             eprintln!("{msg}");
         }
-        other => bail!("unknown target '{other}'. Use one of: claude, codex"),
+        other => {
+            let hint = if other.to_ascii_lowercase().starts_with("t3") {
+                " T3 Code has no hook system; if it runs the Claude Code CLI, your Claude hooks already report its sessions."
+            } else {
+                ""
+            };
+            bail!("unknown target '{other}'. grace can set up: claude, codex.{hint}")
+        }
     }
     Ok(())
 }
@@ -251,74 +258,117 @@ fn parse_toml(path: &Path, text: Option<&str>) -> Result<DocumentMut> {
         .with_context(|| format!("{} is not valid TOML. Nothing changed", path.display()))
 }
 
-fn notify_is_ours(item: &Item) -> bool {
-    item.as_array().is_some_and(|a| {
-        let strs: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
-        ["session", "hook", "codex"].iter().all(|w| strs.contains(w))
-    })
+/// The notify array as strings. None when notify is not an array of strings.
+fn notify_strings(item: &Item) -> Option<Vec<String>> {
+    item.as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// True when the notify items start with `<exe> session hook codex`.
+fn strs_are_ours(strs: &[String]) -> bool {
+    strs.len() >= 4 && strs[1..4] == ["session", "hook", "codex"]
+}
+
+/// Items after `--then` in one of our notify arrays (empty when there is no `--then`).
+fn chained_items(strs: &[String]) -> &[String] {
+    match strs.get(4) {
+        Some(w) if w == "--then" => &strs[5..],
+        _ => &[],
+    }
+}
+
+fn to_array(items: &[String]) -> Array {
+    let mut arr = Array::new();
+    for s in items {
+        arr.push(s.as_str());
+    }
+    arr
 }
 
 /// Set `notify` in a Codex config file. Returns a summary.
+/// An existing foreign notify program is kept: grace forwards each event to it.
 pub fn codex_add(path: &Path, exe: &str) -> Result<String> {
     let text = read_opt(path)?;
     let mut doc = parse_toml(path, text.as_deref())?;
-    let mut arr = Array::new();
-    for s in [exe, "session", "hook", "codex"] {
-        arr.push(s);
-    }
+    let mut items: Vec<String> = ["session", "hook", "codex"].map(String::from).to_vec();
+    items.insert(0, exe.to_string());
+    let mut note = String::new();
     let verb = match doc.get("notify") {
         None => "added",
-        Some(item) if notify_is_ours(item) => {
-            let same = item.as_array().is_some_and(|a| {
-                a.iter().filter_map(|v| v.as_str()).next() == Some(exe)
-            });
-            if same {
-                return Ok(format!(
-                    "{}: grace notify already set up. Nothing to do.",
-                    path.display()
-                ));
+        Some(item) => {
+            let Some(old) = notify_strings(item) else {
+                bail!(
+                    "{} already sets notify = {}\nCodex supports one notify program, and grace \
+                     cannot chain this value. Merge grace by hand (call `{} session hook codex` \
+                     from your program) or remove your notify line first. Nothing changed.",
+                    path.display(),
+                    item.to_string().trim(),
+                    shell_quote(exe)
+                );
+            };
+            if strs_are_ours(&old) {
+                if old[0] == exe {
+                    return Ok(format!(
+                        "{}: grace notify already set up. Nothing to do.",
+                        path.display()
+                    ));
+                }
+                let rest = &old[4..];
+                items.extend(rest.iter().cloned());
+                "updated path"
+            } else {
+                items.push("--then".into());
+                items.extend(old.iter().cloned());
+                note = format!(
+                    "\ngrace now forwards each Codex event to your old notify program:\n  {}",
+                    old.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
+                );
+                "chained"
             }
-            "updated path"
         }
-        Some(item) => bail!(
-            "{} already sets notify = {}\nCodex supports one notify program. Merge grace by hand \
-             (call `{} session hook codex` from your program) or remove your notify line first. \
-             Nothing changed.",
-            path.display(),
-            item.to_string().trim(),
-            shell_quote(exe)
-        ),
     };
-    doc["notify"] = Item::Value(TomlValue::Array(arr));
+    doc["notify"] = Item::Value(TomlValue::Array(to_array(&items)));
     write_atomic(path, &doc.to_string())?;
     Ok(format!(
-        "Updated {}\n  notify: {verb}\nRestart running Codex sessions to pick this up.",
+        "Updated {}\n  notify: {verb}{note}\nRestart running Codex sessions to pick this up.",
         path.display()
     ))
 }
 
-/// Remove `notify` from a Codex config file when it is ours.
+/// Undo our `notify`: restore the chained program, or remove the key when none.
 pub fn codex_remove(path: &Path) -> Result<String> {
     let text = read_opt(path)?;
     if text.is_none() {
         return Ok(format!("{} does not exist. Nothing to do.", path.display()));
     }
     let mut doc = parse_toml(path, text.as_deref())?;
-    match doc.get("notify") {
-        None => Ok(format!("{}: no notify found. Nothing to do.", path.display())),
-        Some(item) if !notify_is_ours(item) => Ok(format!(
-            "{}: notify is not set by grace. Left it as is.",
-            path.display()
-        )),
-        Some(_) => {
-            doc.remove("notify");
-            write_atomic(path, &doc.to_string())?;
-            Ok(format!(
-                "Updated {}\n  notify: removed\nRestart running Codex sessions to pick this up.",
+    let Some(item) = doc.get("notify") else {
+        return Ok(format!("{}: no notify found. Nothing to do.", path.display()));
+    };
+    let strs = match notify_strings(item) {
+        Some(s) if strs_are_ours(&s) => s,
+        _ => {
+            return Ok(format!(
+                "{}: notify is not set by grace. Left it as is.",
                 path.display()
             ))
         }
-    }
+    };
+    let has_then = strs.get(4).is_some_and(|w| w == "--then");
+    let what = if has_then {
+        doc["notify"] = Item::Value(TomlValue::Array(to_array(chained_items(&strs))));
+        "restored your old program"
+    } else {
+        doc.remove("notify");
+        "removed"
+    };
+    write_atomic(path, &doc.to_string())?;
+    Ok(format!(
+        "Updated {}\n  notify: {what}\nRestart running Codex sessions to pick this up.",
+        path.display()
+    ))
 }
 
 #[cfg(test)]
@@ -440,18 +490,61 @@ mod tests {
         assert!(doc.get("notify").is_some());
     }
 
+    fn notify_of(p: &Path) -> Vec<String> {
+        let doc: DocumentMut = fs::read_to_string(p).unwrap().parse().unwrap();
+        notify_strings(&doc["notify"]).unwrap()
+    }
+
     #[test]
-    fn codex_refuses_foreign_notify() {
+    fn codex_refuses_weird_notify() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("config.toml");
-        let src = "notify = [\"say\", \"done\"]\n";
+        let src = "notify = \"say done\"\n";
         fs::write(&p, src).unwrap();
         let e = codex_add(&p, EXE).unwrap_err().to_string();
-        assert!(e.contains("say") && e.contains("one notify program"));
+        assert!(e.contains("say done") && e.contains("one notify program"));
         assert_eq!(fs::read_to_string(&p).unwrap(), src);
-        // remove leaves foreign notify alone
         codex_remove(&p).unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap(), src);
+    }
+
+    #[test]
+    fn codex_chains_foreign_notify_and_restores() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        let src = "# top\nnotify = [\"/a b/Client\", \"turn-ended\"]  # mine\nmodel = \"o3\"\n";
+        fs::write(&p, src).unwrap();
+        let msg = codex_add(&p, EXE).unwrap();
+        assert!(msg.contains("forwards"));
+        assert_eq!(
+            notify_of(&p),
+            [EXE, "session", "hook", "codex", "--then", "/a b/Client", "turn-ended"]
+        );
+        let t = fs::read_to_string(&p).unwrap();
+        assert!(t.contains("# top") && t.contains("model"));
+        assert!(p.with_file_name("config.toml.grace-backup").exists());
+        // idempotent
+        codex_add(&p, EXE).unwrap();
+        assert_eq!(t, fs::read_to_string(&p).unwrap());
+        // new exe path keeps the chain
+        codex_add(&p, "/new/grace").unwrap();
+        assert_eq!(
+            notify_of(&p),
+            ["/new/grace", "session", "hook", "codex", "--then", "/a b/Client", "turn-ended"]
+        );
+        // remove restores the exact original array
+        codex_remove(&p).unwrap();
+        assert_eq!(notify_of(&p), ["/a b/Client", "turn-ended"]);
+        let t = fs::read_to_string(&p).unwrap();
+        assert!(t.contains("# top") && t.contains("model"));
+    }
+
+    #[test]
+    fn unknown_target_hint() {
+        let e = run("t3code", false).unwrap_err().to_string();
+        assert!(e.contains("grace can set up: claude, codex.") && e.contains("T3 Code"));
+        let e = run("foo", false).unwrap_err().to_string();
+        assert!(!e.contains("T3"));
     }
 
     #[test]

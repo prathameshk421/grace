@@ -181,7 +181,11 @@ enum HookCmd {
     /// Claude Code CLI: the JSON comes on stdin
     Claude,
     /// Codex CLI notify: the JSON is the argument
-    Codex { json: Option<String> },
+    /// Args: [--then PROG ARGS...] JSON. The last arg is the JSON.
+    Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -270,13 +274,34 @@ fn run_hook(agent: HookCmd) -> Result<()> {
             };
             ("claude", status, cwd)
         }
-        HookCmd::Codex { json } => {
-            let Some(cwd) = json.and_then(|j| session::parse_codex_notify(&j)) else {
-                return Ok(());
-            };
-            ("codex", model::Status::Ready, cwd)
+        HookCmd::Codex { args } => {
+            let (json, chained) = session::split_codex_args(&args);
+            // Own update first, then forward. Forward even when our update fails.
+            let own = json
+                .and_then(session::parse_codex_notify)
+                .map(|cwd| set_hook_status("codex", model::Status::Ready, cwd));
+            if let (Some(json), Some(chained)) = (json, chained) {
+                forward_codex(chained, json);
+            }
+            return own.unwrap_or(Ok(()));
         }
     };
+    set_hook_status(tool, status, cwd)
+}
+
+/// Run the chained notify program with the same JSON, detached. Errors are ignored.
+fn forward_codex(chained: &[String], json: &str) {
+    use std::process::{Command, Stdio};
+    let _ = Command::new(&chained[0])
+        .args(&chained[1..])
+        .arg(json)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+fn set_hook_status(tool: &str, status: model::Status, cwd: Option<String>) -> Result<()> {
     let p = resolve(cwd.map(PathBuf::from))?;
     if platform::ignored(&p) {
         return Ok(());
