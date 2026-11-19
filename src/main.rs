@@ -47,9 +47,35 @@ enum Cmd {
     Forget { path: Option<PathBuf> },
     /// Import folders from Claude Code history (~/.claude.json).
     Import,
+    /// Add, remove or list AI tools.
+    Tool {
+        #[command(subcommand)]
+        action: ToolCmd,
+    },
     /// Print the shell setup. Add `eval "$(grace init zsh)"` to ~/.zshrc.
     Init { shell: String },
 }
+
+#[derive(Subcommand)]
+enum ToolCmd {
+    /// Register a command as an AI tool, for example `grace tool add kiro`.
+    Add {
+        /// The command name you type in the shell.
+        command: String,
+        /// Tag to show for this tool. Default: the command in lowercase.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Command that starts the tool. Default: the command.
+        #[arg(long)]
+        launch: Option<String>,
+    },
+    /// Remove a custom tool. Built-in tools cannot be removed.
+    Rm { command: String },
+    /// Print all tools: command, tag, launch command, and built-in or custom.
+    List,
+}
+
+const NEW_TERMINAL: &str = "Open a new terminal (or run: exec zsh) to start tracking it.";
 
 fn resolve(path: Option<PathBuf>) -> Result<String> {
     let p = match path {
@@ -66,13 +92,13 @@ fn ignored(path: &str) -> bool {
     path.is_empty() || path == "/" || path == home.trim_end_matches('/')
 }
 
-fn load(db: &db::Db, tag: Option<&str>) -> Result<Vec<model::Entry>> {
+fn load(db: &db::Db, reg: &tools::Registry, tag: Option<&str>) -> Result<Vec<model::Entry>> {
     let now = model::now();
     let mut entries: Vec<_> = db
         .list_entries()?
         .into_iter()
         .filter(|e| std::path::Path::new(&e.path).is_dir())
-        .filter(|e| tag.map_or(true, |t| e.has_tag(&tools::normalize_tag(t))))
+        .filter(|e| tag.map_or(true, |t| e.has_tag(&reg.normalize_tag(t))))
         .collect();
     rank::sort_entries(&mut entries, now);
     Ok(entries)
@@ -86,17 +112,18 @@ fn main() -> Result<()> {
         let _ = import::import_claude(&db);
     }
     let now = model::now();
+    let reg = tools::Registry::from_db(&db)?;
 
     match cli.cmd.unwrap_or(Cmd::Pick { tag: None, open: false, query: None }) {
         Cmd::Pick { tag, open, query } => {
-            let entries = load(&db, tag.as_deref())?;
+            let entries = load(&db, &reg, tag.as_deref())?;
             if entries.is_empty() {
                 bail!("no folders yet. cd around a bit, or run `grace import`");
             }
             if let Some(e) = picker::pick(entries, query.as_deref().unwrap_or(""), now)? {
                 println!("{}", e.path);
                 if open {
-                    if let Some(cmd) = e.last_tool().and_then(tools::launch_command) {
+                    if let Some(cmd) = e.last_tool().and_then(|t| reg.launch_command(t)) {
                         println!("{cmd}");
                     }
                 }
@@ -113,11 +140,11 @@ fn main() -> Result<()> {
         Cmd::Tag { path, tool } => {
             let p = resolve(Some(path))?;
             if !ignored(&p) {
-                db.record_tool(&p, &tools::normalize_tag(&tool), now)?;
+                db.record_tool(&p, &reg.normalize_tag(&tool), now)?;
             }
         }
         Cmd::List { tag } => {
-            for e in load(&db, tag.as_deref())? {
+            for e in load(&db, &reg, tag.as_deref())? {
                 let tags: Vec<_> = e.tags.iter().map(|t| format!("[{}]", t.tool)).collect();
                 let pin = if e.pinned { "* " } else { "  " };
                 println!(
@@ -135,8 +162,32 @@ fn main() -> Result<()> {
             let n = import::import_claude(&db)?;
             eprintln!("imported {n} folders from Claude Code history");
         }
+        Cmd::Tool { action } => match action {
+            ToolCmd::Add { command, tag, launch } => {
+                let tag = tag.unwrap_or_else(|| command.to_lowercase()).to_lowercase();
+                let launch = launch.unwrap_or_else(|| command.clone());
+                tools::validate(&command, &tag, &launch)?;
+                db.add_tool(&command, &tag, &launch)?;
+                eprintln!("added {command} \u{2192} [{tag}]. {NEW_TERMINAL}");
+            }
+            ToolCmd::Rm { command } => {
+                if db.remove_tool(&command)? {
+                    eprintln!("removed {command}. Open a new terminal (or run: exec zsh) to stop tracking it.");
+                } else if tools::TOOLS.iter().any(|(c, _)| c.eq_ignore_ascii_case(&command)) {
+                    bail!("{command} is a built-in tool and cannot be removed");
+                } else {
+                    bail!("no custom tool named {command}");
+                }
+            }
+            ToolCmd::List => {
+                for t in reg.tools() {
+                    let kind = if t.builtin { "built-in" } else { "custom" };
+                    println!("{:<16} {:<16} {:<24} {}", t.command, t.tag, t.launch, kind);
+                }
+            }
+        },
         Cmd::Init { shell } => match shell.as_str() {
-            "zsh" => print!("{}", shell::init_zsh()),
+            "zsh" => print!("{}", shell::init_zsh(&reg.command_names())),
             other => bail!("unsupported shell: {other} (only zsh for now)"),
         },
     }

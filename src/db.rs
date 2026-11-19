@@ -23,6 +23,11 @@ CREATE TABLE IF NOT EXISTS tags(
     last_used INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(path, tool)
 );
+CREATE TABLE IF NOT EXISTS tools(
+    command TEXT PRIMARY KEY,
+    tag TEXT NOT NULL,
+    launch TEXT NOT NULL
+);
 ";
 
 /// Directory that holds the database file.
@@ -134,6 +139,30 @@ impl Db {
         Ok(out)
     }
 
+    /// Add a custom tool, or replace the one with the same command.
+    pub fn add_tool(&self, command: &str, tag: &str, launch: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tools(command, tag, launch) VALUES(?1, ?2, ?3)
+             ON CONFLICT(command) DO UPDATE SET tag = ?2, launch = ?3",
+            params![command, tag, launch],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a custom tool. Returns true if it existed.
+    pub fn remove_tool(&self, command: &str) -> Result<bool> {
+        let n = self.conn.execute("DELETE FROM tools WHERE command = ?1", params![command])?;
+        Ok(n > 0)
+    }
+
+    /// All custom tools as (command, tag, launch).
+    pub fn custom_tools(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt =
+            self.conn.prepare("SELECT command, tag, launch FROM tools ORDER BY command")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Insert a dir only if missing. Returns true if inserted.
     /// With `tool`, also add a tag with count 1 (only when the dir was inserted).
     pub fn import_dir(&self, path: &str, ts: i64, tool: Option<&str>) -> Result<bool> {
@@ -210,5 +239,20 @@ mod tests {
         assert_eq!(find(&db, "/i").unwrap().last_visit, 100);
         assert!(db.import_dir("/j", 5, Some("claude")).unwrap());
         assert_eq!(find(&db, "/j").unwrap().tags.len(), 1);
+    }
+
+    #[test]
+    fn tools_round_trip() {
+        let (_d, db) = temp_db();
+        assert!(db.custom_tools().unwrap().is_empty());
+        db.add_tool("q", "amazon-q", "q chat").unwrap();
+        db.add_tool("kiro", "kiro", "kiro").unwrap();
+        db.add_tool("kiro", "kiro2", "kiro x").unwrap();
+        let t = db.custom_tools().unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0], ("kiro".into(), "kiro2".into(), "kiro x".into()));
+        assert!(db.remove_tool("kiro").unwrap());
+        assert!(!db.remove_tool("kiro").unwrap());
+        assert_eq!(db.custom_tools().unwrap().len(), 1);
     }
 }

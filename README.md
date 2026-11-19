@@ -40,6 +40,21 @@ Open a new terminal. On the first run, grace imports the folders from your Claud
 
 Each command that takes a folder also accepts a path, for example `grace forget ~/old-project`.
 
+## Add your own AI tool
+
+Run `grace tool add` with the command name. The tag is the command in lowercase. The launch command is the command.
+
+```sh
+grace tool add kiro
+grace tool add q --tag amazon-q --launch "q chat"
+grace tool list
+grace tool rm kiro
+```
+
+Open a new terminal after you add or remove a tool. A custom tool with the same command as a built-in tool replaces it. You cannot remove built-in tools.
+
+Names use letters, digits, `.`, `_` and `-`, and are at most 64 characters long.
+
 ## How it works
 
 - A zsh `chpwd` hook runs `grace add "$PWD"` in the background each time you change folder.
@@ -48,7 +63,7 @@ Each command that takes a folder also accepts a path, for example `grace forget 
 - Folders that no longer exist (for example, on an unplugged SSD) are hidden, not deleted.
 - Data lives in one SQLite file: `$GRACE_DATA_DIR`, else `$XDG_DATA_HOME/grace`, else `~/.local/share/grace/grace.db`.
 
-Known tools: `claude`, `agy` / `antigravity`, `codex`, `gemini`, `cursor` / `cursor-agent`, `opencode`, `aider`, `copilot`, `amp`, `goose`, `crush`, `qwen`. To add one, edit `src/tools.rs`.
+Known tools: `claude`, `agy` / `antigravity`, `codex`, `gemini`, `cursor` / `cursor-agent`, `opencode`, `aider`, `copilot`, `amp`, `goose`, `crush`, `qwen`. To add one, run `grace tool add`.
 
 grace never tracks `/` or your home folder.
 
