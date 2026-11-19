@@ -165,9 +165,23 @@ pub fn classify_all(text: &str) -> Vec<(LineKind, String)> {
         if k == LineKind::Hunk {
             in_hunk = true;
         }
-        out.push((k, line.replace('\t', "    ")));
+        out.push((k, printable(line)));
     }
     out
+}
+
+/// A line that is safe to draw: tabs become spaces, other control bytes become "?".
+/// Raw ESC or CR bytes from a file would move the cursor or change colors.
+pub fn printable(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => o.push_str("    "),
+            c if c.is_control() => o.push('?'),
+            c => o.push(c),
+        }
+    }
+    o
 }
 
 /// Cut a diff to `max` lines. Adds a note when it cuts.
@@ -196,7 +210,7 @@ pub fn untracked_diff(path: &str, content: &[u8]) -> Vec<(LineKind, String)> {
     let n = text.lines().count();
     out.push((LineKind::Hunk, format!("@@ -0,0 +1,{n} @@")));
     for l in text.lines() {
-        out.push((LineKind::Add, format!("+{}", l.replace('\t', "    "))));
+        out.push((LineKind::Add, format!("+{}", printable(l))));
     }
     out
 }
@@ -251,6 +265,14 @@ pub fn file_diff(repo: &Repo, c: &Change) -> Vec<(LineKind, String)> {
     let root = Path::new(&repo.root);
     if c.untracked() {
         let full = root.join(&c.path);
+        // A symlink: show where it points, like git does. Do not follow it: it may
+        // point at a folder, at nothing, or at itself.
+        if let Ok(target) = std::fs::read_link(&full) {
+            return vec![
+                (LineKind::Header, format!("new symlink {} (untracked)", printable(&c.path))),
+                (LineKind::Meta, format!("points to {}", printable(&target.to_string_lossy()))),
+            ];
+        }
         if full.is_dir() {
             return vec![(LineKind::Meta, "untracked folder".into())];
         }

@@ -185,6 +185,8 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum HubCmd {
+    /// Stop the hub: close every workspace and the shells in them
+    Quit,
     /// Show or hide a pane: sidebar, diff, tree, right, zoom or focus
     #[command(hide = true)]
     Toggle {
@@ -276,7 +278,14 @@ The hub uses tmux on its own server, so your tmux setup stays as it is.
 Keys: press ctrl-g, then
   s  sidebar      d  diff         t  tree
   r  right side   z  zoom main    g  go to sidebar
-  q  detach       ?  all keys
+  q  detach       Q  quit hub     ?  all keys
+
+Leave the hub:
+  ctrl-g q         detach. The hub and your agents keep running.
+                   Run `grace hub` to go back.
+  ctrl-g Q         quit. Closes every workspace and stops the hub.
+  grace hub quit   the same, from any terminal.
+  exit             in a workspace shell, closes that workspace.
 
 In the sidebar, type to filter. Enter opens the folder in its own workspace.
 ctrl-o also starts the AI tool you used there last.";
@@ -512,13 +521,18 @@ fn main() -> Result<()> {
         Some(Cmd::Session { action }) => return run_session(action),
         Some(Cmd::Diff { path }) => {
             let p = resolve(path)?;
-            return tui::run(&mut diffview::DiffView::new(p.into(), picker::Theme::from_env()));
+            let in_hub = hub::pane_in_hub("diff");
+            tui::run(&mut diffview::DiffView::new(p.into(), picker::Theme::from_env()).in_hub(in_hub))?;
+            return hub::pane_closed(in_hub, "diff");
         }
         Some(Cmd::Tree { path }) => {
             let p = resolve(path)?;
-            return tui::run(&mut treeview::TreeView::new(p.into(), picker::Theme::from_env()));
+            let in_hub = hub::pane_in_hub("tree");
+            tui::run(&mut treeview::TreeView::new(p.into(), picker::Theme::from_env()).in_hub(in_hub))?;
+            return hub::pane_closed(in_hub, "tree");
         }
         Some(Cmd::Hub { action: Some(HubCmd::Shell), .. }) => return hub::shell(),
+        Some(Cmd::Hub { action: Some(HubCmd::Quit), .. }) => return hub::quit(),
         Some(Cmd::Hub { action: Some(HubCmd::Keys { wait }), .. }) => return hub::keys(wait),
         _ => {}
     }
@@ -569,10 +583,16 @@ fn main() -> Result<()> {
         Cmd::Setup { target, remove } => setup::run(&target, remove)?,
         Cmd::Session { .. } | Cmd::Diff { .. } | Cmd::Tree { .. } => {}
         Cmd::Hub { action, path, no_attach } => match action {
-            None => hub::start(&db, &resolve(path)?, !no_attach)?,
+            None => {
+                let p = resolve(path)?;
+                if !std::path::Path::new(&p).is_dir() {
+                    bail!("not a folder: {p}");
+                }
+                hub::start(&db, &p, !no_attach)?
+            }
             Some(HubCmd::Toggle { what, window }) => hub::toggle(&db, &what, window.as_deref())?,
             Some(HubCmd::Sidebar { path }) => hub::run_sidebar(&db, &reg, &resolve(Some(path))?)?,
-            Some(HubCmd::Shell) | Some(HubCmd::Keys { .. }) => {}
+            Some(HubCmd::Shell) | Some(HubCmd::Keys { .. }) | Some(HubCmd::Quit) => {}
         },
         Cmd::Add { path } => {
             let p = resolve(Some(path))?;

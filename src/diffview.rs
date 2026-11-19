@@ -35,6 +35,7 @@ pub struct DiffView {
     page: usize,
     focus: Focus,
     theme: Theme,
+    hints: [(&'static str, &'static str); 4],
 }
 
 /// Color of a change mark.
@@ -61,6 +62,14 @@ fn line_style(t: &Theme, k: LineKind) -> Style {
 }
 
 impl DiffView {
+    /// In the hub, q hides the pane instead of quitting.
+    pub fn in_hub(mut self, yes: bool) -> DiffView {
+        if yes {
+            self.hints[3] = ("q", "hide");
+        }
+        self
+    }
+
     pub fn new(dir: PathBuf, theme: Theme) -> DiffView {
         let mut v = DiffView {
             dir,
@@ -73,6 +82,7 @@ impl DiffView {
             page: 10,
             focus: Focus::List,
             theme,
+            hints: HINTS,
         };
         v.reload();
         v
@@ -93,6 +103,7 @@ impl DiffView {
             page: 10,
             focus: Focus::List,
             theme: Theme { color: true, truecolor: true },
+            hints: HINTS,
         }
     }
 
@@ -232,7 +243,7 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
         .border_style(dim())
         .title_top(Line::from(Span::styled(" diff ", accent)).left_aligned())
         .title_top(right)
-        .title_bottom(hint_line(&HINTS, w.saturating_sub(4)));
+        .title_bottom(hint_line(&v.hints, w.saturating_sub(4)));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -290,7 +301,7 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
         }
         let bar = if sel && v.focus == Focus::List { "▌" } else { " " };
         let code = c.code();
-        let name = cut_mid(&c.path, lw.saturating_sub(1 + sw(&code) + 1));
+        let name = cut_mid(&git::printable(&c.path), lw.saturating_sub(1 + sw(&code) + 1));
         let name_style = if sel { t.fg(base, t.accent()).add_modifier(Modifier::BOLD) } else { base };
         let used = 1 + sw(&code) + 1 + sw(&name);
         lines.push(Line::from(vec![

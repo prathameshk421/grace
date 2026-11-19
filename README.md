@@ -88,9 +88,21 @@ Press **ctrl-g**, then one key. No tmux prefix needed.
 | `r` | Show or hide the whole right side |
 | `z` | Zoom the main pane, or zoom out |
 | `g` | Go to the sidebar |
-| `q` | Detach. Run `grace hub` to come back. |
+| `q` | Detach. The hub keeps running. Run `grace hub` to come back. |
+| `Q` | Quit the hub. It asks first, then closes every workspace. |
 | `?` | Show all keys |
 | `ctrl-g` | Send ctrl-g to the program |
+
+### Leave the hub
+
+| To | Do this |
+|---|---|
+| Leave for now, with agents still running | `ctrl-g q`. Run `grace hub` to come back. |
+| Stop the hub and every shell in it | `ctrl-g Q`, then `y`. Or run `grace hub quit` in any terminal. |
+| Close one workspace | Type `exit` in its shell. |
+| Hide the diff or the tree | Press `q` in that pane, or `ctrl-g d` or `ctrl-g t`. |
+
+The status bar shows these keys at the bottom right.
 
 A pane that comes back takes its old place and size. grace remembers which panes you show and uses that for new workspaces and the next start. The mouse works too: click a pane to focus it, drag a border to resize it.
 

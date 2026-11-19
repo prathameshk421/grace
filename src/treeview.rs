@@ -165,9 +165,18 @@ pub struct TreeView {
     page: usize,
     theme: Theme,
     flash: Option<(String, Instant)>,
+    hints: [(&'static str, &'static str); 4],
 }
 
 impl TreeView {
+    /// In the hub, q hides the pane instead of quitting.
+    pub fn in_hub(mut self, yes: bool) -> TreeView {
+        if yes {
+            self.hints[3] = ("q", "hide");
+        }
+        self
+    }
+
     pub fn new(dir: PathBuf, theme: Theme) -> TreeView {
         let title = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.to_string_lossy().into_owned());
         let mut v = TreeView {
@@ -183,6 +192,7 @@ impl TreeView {
             page: 10,
             theme,
             flash: None,
+            hints: HINTS,
         };
         v.reload();
         v
@@ -204,6 +214,7 @@ impl TreeView {
             page: 10,
             theme: Theme { color: true, truecolor: true },
             flash: None,
+            hints: HINTS,
         };
         v.rebuild_rows(None);
         v
@@ -342,7 +353,7 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
     let flash = v.flash.as_ref().filter(|(_, until)| Instant::now() < *until).map(|(m, _)| m.clone());
     let bottom = match flash {
         Some(m) => Line::from(Span::styled(format!(" {} ", cut(&m, w.saturating_sub(4))), dim())),
-        None => hint_line(&HINTS, w.saturating_sub(4)),
+        None => hint_line(&v.hints, w.saturating_sub(4)),
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -392,7 +403,7 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
         };
         let bar = if sel { "▌" } else { " " };
         let fixed = 1 + indent + 2 + if tail.is_empty() { 0 } else { 2 };
-        let name = cut(&r.name, iw.saturating_sub(fixed));
+        let name = cut(&git::printable(&r.name), iw.saturating_sub(fixed));
         let name_style = match (sel, r.dir) {
             (true, _) => t.fg(base, t.accent()).add_modifier(Modifier::BOLD),
             (false, true) => base.add_modifier(Modifier::BOLD),

@@ -6,7 +6,10 @@
 - The sidebar shows live agents first, grouped by status, with the same glyphs as the picker. Your folders follow, best first. Type to filter.
 - Each folder gets its own workspace, a tmux window with its own shell. Agents keep running when you switch.
 - Enter in the sidebar switches to a folder. ctrl-o also starts the AI tool you used there last.
-- Press ctrl-g, then `s`, `d`, `t` or `r` to show or hide the sidebar, diff, tree or whole right side. `z` zooms the shell. `g` goes to the sidebar. `q` detaches. `?` shows all keys.
+- Press ctrl-g, then `s`, `d`, `t` or `r` to show or hide the sidebar, diff, tree or whole right side. `z` zooms the shell. `g` goes to the sidebar. `q` detaches. `Q` quits the hub. `?` shows all keys.
+- `grace hub quit` stops the hub from any terminal. After a detach, grace prints how to go back or stop the hub. The status bar shows the detach and quit keys.
+- In the hub, `q` in the diff or tree pane hides that pane, and the layout remembers it.
+- `grace diff` shows an untracked symlink and where it points. Control bytes in files show as `?`, so they cannot change colors or move the cursor.
 - A pane that comes back takes its old place and size. grace saves the layout for new workspaces and the next start.
 - The status bar shows each workspace with the status glyph of its agent.
 - The hub uses its own tmux server (`tmux -L grace`) and its own config file. Your tmux setup stays as it is.

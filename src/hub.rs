@@ -85,6 +85,8 @@ pub enum Toggle {
     /// Give the sidebar and the right column their saved widths again. A tmux hook
     /// runs it when the window changes size, so the main pane gets the new space.
     Fit,
+    /// Close the window when its main pane is gone. A tmux hook runs it.
+    Reap,
 }
 
 impl Toggle {
@@ -97,6 +99,7 @@ impl Toggle {
             "zoom" => Toggle::Zoom,
             "focus" => Toggle::Focus,
             "fit" => Toggle::Fit,
+            "reap" => Toggle::Reap,
             _ => return None,
         })
     }
@@ -135,7 +138,7 @@ impl Layout {
                 l.tree = on;
             }
             Toggle::Focus => l.sidebar = true,
-            Toggle::Zoom | Toggle::Fit => {}
+            Toggle::Zoom | Toggle::Fit | Toggle::Reap => {}
         }
         l
     }
@@ -195,19 +198,26 @@ impl Sizes {
     }
 
     /// Sizes after the panes not in `want` go away: remember their current size.
-    pub fn remember(&self, panes: &[Pane], want: Layout) -> Sizes {
+    /// A width is kept only when the user changed it. A pane that a small window
+    /// shrank keeps its saved size, so it comes back full size in a big window.
+    /// `total` is the window width, or 0 when it is not known.
+    pub fn remember(&self, panes: &[Pane], want: Layout, total: u16) -> Sizes {
         let mut s = self.clone();
         let find = |r: Role| panes.iter().find(|p| p.role == Some(r));
-        if let Some(p) = find(Role::Sidebar) {
-            if !want.sidebar && p.width > 0 {
+        let (diff, tree) = (find(Role::Diff), find(Role::Tree));
+        let right = diff.or(tree);
+        let sidebar = find(Role::Sidebar);
+        let (fit_sb, fit_rt) = fit_widths(self, total, sidebar.is_some(), right.is_some());
+        let moved = |w: u16, fit: u16| total == 0 || w.abs_diff(fit) > 1;
+        if let Some(p) = sidebar {
+            if !want.sidebar && p.width > 0 && moved(p.width, fit_sb) {
                 s.sidebar = p.width.to_string();
             }
         }
-        let (diff, tree) = (find(Role::Diff), find(Role::Tree));
         let right_goes = !want.diff && !want.tree;
         if right_goes {
-            if let Some(p) = diff.or(tree) {
-                if p.width > 0 {
+            if let Some(p) = right {
+                if p.width > 0 && moved(p.width, fit_rt) {
                     s.right = p.width.to_string();
                 }
             }
@@ -215,7 +225,8 @@ impl Sizes {
             if !want.diff || !want.tree {
                 let total = d.height as u32 + t.height as u32 + 1;
                 let pct = ((d.height as u32 * 100 + total / 2) / total.max(1)) as u16;
-                if (10..=90).contains(&pct) {
+                // Rounding moves the split by a row: that is not a change.
+                if (10..=90).contains(&pct) && pct.abs_diff(self.diff) > 1 {
                     s.diff = pct;
                 }
             }
@@ -468,14 +479,15 @@ pub fn parse_panes(out: &str) -> Vec<Pane> {
 // tmux.conf
 
 /// The keys of the hub, after ctrl-g.
-pub const KEYS: [(&str, &str, &str); 9] = [
+pub const KEYS: [(&str, &str, &str); 10] = [
     ("s", "sidebar", "hub toggle sidebar"),
     ("d", "diff", "hub toggle diff"),
     ("t", "tree", "hub toggle tree"),
     ("r", "right side", "hub toggle right"),
     ("z", "zoom main", "hub toggle zoom"),
     ("g", "go to sidebar", "hub toggle focus"),
-    ("q", "detach", ""),
+    ("q", "detach (keeps running)", ""),
+    ("Q", "quit the hub", ""),
     ("?", "this help", ""),
     ("C-g", "send ctrl-g", ""),
 ];
@@ -589,7 +601,8 @@ pub fn conf_text(c: &ConfCtx) -> String {
     line("set -g status-style \"bg=default,fg=colour250\"");
     line("set -g status-left \"#[fg=#e8b94a,bold] grace #[default]\"");
     line("set -g status-left-length 12");
-    line("set -g status-right \"#[fg=colour244]ctrl-g ? keys \"");
+    line("set -g status-right \"#[fg=colour244]ctrl-g: ? keys · q detach · Q quit \"");
+    line("set -g status-right-length 60");
     line("set -g window-status-separator \"\"");
     line("set -g window-status-format \" #[fg=colour244]#I#[default] #W#{?#{@grace_glyph}, #{@grace_glyph},} \"");
     line("set -g window-status-current-format \" #[fg=#e8b94a,bold]#I #W#[default]#{?#{@grace_glyph}, #{@grace_glyph},} \"");
@@ -611,11 +624,16 @@ pub fn conf_text(c: &ConfCtx) -> String {
     let fit = format!("{env} {exe} hub toggle fit '#{{window_id}}'");
     line(&format!("set-hook -g window-resized {}", tmux_quote(&format!("run-shell -b {}", tmux_quote(&fit)))));
     line("bind -T grace q detach-client");
+    line("bind -T grace Q confirm-before -p \"Quit the hub and close every workspace? (y/n)\" \"kill-session -t =grace\"");
+    // A main pane can die without its shell wrapper (kill -9, a crash). Close the
+    // window then, so no side panes stay behind with nothing in the middle.
+    let reap = format!("{env} {exe} hub toggle reap '#{{hook_window}}'");
+    line(&format!("set-hook -g pane-exited {}", tmux_quote(&format!("run-shell -b {}", tmux_quote(&reap)))));
     line("bind -T grace C-g send-keys C-g");
     if at_least(3, 2) {
         let sh = format!("{env} {exe} hub keys --wait");
         let title = if at_least(3, 3) { "-T \" grace keys \" " } else { "" };
-        line(&format!("bind -T grace ? display-popup -E -w 36 -h 15 {title}{}", tmux_quote(&sh)));
+        line(&format!("bind -T grace ? display-popup -E -w 38 -h 16 {title}{}", tmux_quote(&sh)));
     } else {
         line(&format!("bind -T grace ? display-message {}", tmux_quote(&keys_line())));
     }
@@ -781,6 +799,11 @@ pub fn apply(t: &Tmux, window: &str, path: &str, want: Layout, sizes: &Sizes) ->
             }
         }
     }
+    // The plan uses the saved sizes. In a small window, shrink the side panes so the
+    // main pane keeps its 40%.
+    if let Ok(panes) = t.panes(window) {
+        fit(t, window, &panes, sizes);
+    }
     Ok(())
 }
 
@@ -897,8 +920,68 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
         return Ok(());
     }
     let status = t.cmd().stdin(Stdio::inherit()).args(["attach-session", "-t", &format!("={SESSION}")]).status()?;
+    // tmux exits with 1 when the server stops under it (ctrl-g Q, or the last
+    // workspace closed). That is a normal quit, not an error.
+    if !t.ok(&["has-session", "-t", &format!("={SESSION}")]) {
+        eprintln!("grace: the hub stopped.");
+        return Ok(());
+    }
     if !status.success() {
         bail!("tmux attach failed");
+    }
+    eprintln!("grace: detached. The hub and its shells keep running.");
+    eprintln!("  grace hub        go back");
+    eprintln!("  grace hub quit   stop the hub");
+    Ok(())
+}
+
+/// `grace hub quit`: stop the hub server. This closes every workspace.
+pub fn quit() -> Result<()> {
+    let t = Tmux::new();
+    if !t.ok(&["has-session", "-t", &format!("={SESSION}")]) {
+        // A server with no grace session is still ours: stop it too.
+        let _ = t.run(&["kill-server"]);
+        println!("grace: the hub is not running.");
+        return Ok(());
+    }
+    // Close the session: the server then stops on its own, and an attached
+    // terminal shows "[exited]" like a normal end.
+    t.run(&["kill-session", "-t", &format!("={SESSION}")])?;
+    let _ = t.run(&["kill-server"]);
+    println!("grace: the hub stopped.");
+    Ok(())
+}
+
+/// True when this process is the hub's own `role` pane ("diff" or "tree").
+/// A `grace diff` that the user runs in a workspace shell is not.
+pub fn pane_in_hub(role: &str) -> bool {
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
+        return false;
+    };
+    if !inside_hub(std::env::var("TMUX").ok().as_deref(), &socket()) {
+        return false;
+    }
+    Tmux::new().run(&["display-message", "-p", "-t", &pane, "#{@grace_role}"]).is_ok_and(|r| r.trim() == role)
+}
+
+/// After `grace diff` or `grace tree` ends. In the hub, q hides the pane: the toggle
+/// closes this pane and saves the layout, so every workspace stays the same.
+pub fn pane_closed(in_hub: bool, role: &str) -> Result<()> {
+    if !in_hub {
+        return Ok(());
+    }
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
+        return Ok(());
+    };
+    let t = Tmux::new();
+    let Ok(win) = t.run(&["display-message", "-p", "-t", &pane, "#{window_id}"]) else {
+        return Ok(());
+    };
+    let exe = exe()?;
+    let sh = format!("GRACE_TMUX_SOCKET={} {} hub toggle {role} {}", sh_quote(&t.socket), sh_quote(&exe), sh_quote(win.trim()));
+    if t.run(&["run-shell", "-b", &sh.replace('#', "##")]).is_ok() {
+        // The toggle closes this pane. Wait for it, so the pane is still here when it looks.
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
     Ok(())
 }
@@ -906,6 +989,9 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
 /// `grace hub toggle <what>`: run by the ctrl-g keys. Errors show as a tmux message.
 pub fn toggle(db: &Db, what: &str, window: Option<&str>) -> Result<()> {
     let t = Tmux::new();
+    // Each key runs in its own process. Take turns, so fast presses do not each
+    // see the old panes and add the same pane twice.
+    let _lock = toggle_lock();
     if let Err(e) = toggle_inner(&t, db, what, window) {
         t.message(&format!("grace: {e}"));
     }
@@ -920,12 +1006,27 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
         Some(w) => w.to_string(),
         None => t.current_window()?,
     };
+    if what == Toggle::Reap {
+        // The window may be gone already: the shell wrapper closed it.
+        if let Ok(panes) = t.panes(&win) {
+            if !panes.is_empty() && main_pane(&panes).is_none() {
+                let _ = t.run(&["kill-window", "-t", &win]);
+            }
+        }
+        return Ok(());
+    }
     let panes = t.panes(&win)?;
     let path = t.run(&["display-message", "-p", "-t", &win, "#{@grace_path}"])?;
     match what {
+        Toggle::Reap => {}
         Toggle::Zoom => {
             let main = main_pane(&panes).context("no main pane here")?;
             t.run(&["resize-pane", "-Z", "-t", &main.id])?;
+            // The window may have changed size while zoomed: fit the panes now.
+            if !zoomed(t, &win) {
+                let (_, sizes) = load_layout(db);
+                fit(t, &win, &t.panes(&win)?, &sizes);
+            }
         }
         Toggle::Fit => {
             let (_, sizes) = load_layout(db);
@@ -940,6 +1041,12 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
                 let want = Layout::of(&panes).toggled(Toggle::Focus);
                 apply(t, &win, &path, want, &sizes)?;
                 save_layout(db, want, &sizes)?;
+                // Like the other toggles: every workspace shows the sidebar again.
+                for (w, p) in t.windows()? {
+                    if w != win {
+                        let _ = apply(t, &w, &p, want, &sizes);
+                    }
+                }
                 if let Some(sb) = t.panes(&win)?.iter().find(|p| p.role == Some(Role::Sidebar)) {
                     t.run(&["select-pane", "-t", &sb.id])?;
                 }
@@ -949,7 +1056,8 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
             // The current window decides. Every workspace follows, so the layout stays the same.
             let (_, sizes) = load_layout(db);
             let want = Layout::of(&panes).toggled(what);
-            let sizes = sizes.remember(&panes, want);
+            let total = window_width(t, &win);
+            let sizes = sizes.remember(&panes, want, total);
             save_layout(db, want, &sizes)?;
             apply(t, &win, &path, want, &sizes)?;
             for (w, p) in t.windows()? {
@@ -985,9 +1093,31 @@ pub fn fit_widths(sizes: &Sizes, total: u16, sidebar: bool, right: bool) -> (u16
     (sb, rt)
 }
 
+/// The width of a window in columns, or 0.
+fn window_width(t: &Tmux, win: &str) -> u16 {
+    t.run(&["display-message", "-p", "-t", win, "#{window_width}"]).ok().and_then(|w| w.trim().parse().ok()).unwrap_or(0)
+}
+
+/// True when the main pane of the window is zoomed.
+fn zoomed(t: &Tmux, win: &str) -> bool {
+    t.run(&["display-message", "-p", "-t", win, "#{window_zoomed_flag}"]).is_ok_and(|z| z.trim() == "1")
+}
+
+/// A lock file that makes toggles run one at a time. None when it cannot lock.
+fn toggle_lock() -> Option<std::fs::File> {
+    let dir = crate::db::data_dir().ok()?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("hub.lock")).ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
 /// Set the sidebar width and the right column width to the saved sizes.
 fn fit(t: &Tmux, win: &str, panes: &[Pane], sizes: &Sizes) {
-    let total: u16 = t.run(&["display-message", "-p", "-t", win, "#{window_width}"]).ok().and_then(|w| w.parse().ok()).unwrap_or(0);
+    // resize-pane ends a zoom. Leave a zoomed window as it is: zoom out fits it.
+    if zoomed(t, win) {
+        return;
+    }
+    let total = window_width(t, win);
     if total == 0 {
         return;
     }
@@ -1245,15 +1375,42 @@ mod tests {
         let l = Layout::default();
         let mut panes = full();
         panes[1].width = 26;
-        assert_eq!(s.remember(&panes, l.toggled(Toggle::Sidebar)).sidebar, "26");
-        assert_eq!(s.remember(&panes, l.toggled(Toggle::Right)).right, "70");
-        assert_eq!(s.remember(&panes, l.toggled(Toggle::Diff)).diff, 60);
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Sidebar), 0).sidebar, "26");
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Right), 0).right, "70");
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Diff), 0).diff, 60);
         panes[2].height = 24;
         panes[3].height = 19;
-        assert_eq!(s.remember(&panes, l.toggled(Toggle::Tree)).diff, 55);
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Tree), 0).diff, 55);
         assert_eq!(share(44, 60), 26);
         // Nothing hides: sizes stay.
-        assert_eq!(s.remember(&panes, l), s);
+        assert_eq!(s.remember(&panes, l, 0), s);
+    }
+
+    #[test]
+    fn shrunk_sizes_are_not_remembered() {
+        // An 80 column window: fit shrank the sidebar to 22 and the right side to 23.
+        let s = Sizes::default();
+        let l = Layout::default();
+        let (sb, rt) = fit_widths(&s, 80, true, true);
+        let mut panes = full();
+        panes[1].width = sb;
+        panes[2].width = rt;
+        panes[3].width = rt;
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Sidebar), 80).sidebar, "30");
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Right), 80).right, "40%");
+        // The user dragged the sidebar: keep it.
+        panes[1].width = sb + 5;
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Sidebar), 80).sidebar, (sb + 5).to_string());
+        // A split one row off is rounding, not a change.
+        panes[2].height = 13;
+        panes[3].height = 8;
+        assert_eq!(s.remember(&panes, l.toggled(Toggle::Tree), 80).diff, 60);
+    }
+
+    #[test]
+    fn printable_lines() {
+        assert_eq!(crate::git::printable("a\x1b[31mR\rC\x07\tx"), "a?[31mR?C?    x");
+        assert_eq!(crate::git::printable("日本 ok"), "日本 ok");
     }
 
     #[test]
@@ -1308,6 +1465,9 @@ mod tests {
             assert!(c.contains(&format!("bind -T grace {k} run-shell -b ")), "{k}");
         }
         assert!(c.contains("bind -T grace q detach-client"));
+        assert!(c.contains("bind -T grace Q confirm-before"));
+        assert!(c.contains("set-hook -g pane-exited"));
+        assert!(c.contains("hub toggle reap '#{hook_window}'"));
         assert!(c.contains("bind -T grace ? display-popup -E"));
         assert!(c.contains("GRACE_TMUX_SOCKET='grace' '/opt/my tools/grace' hub toggle sidebar '#{window_id}'"));
         assert!(c.contains("set-environment -g GRACE_TMUX_SOCKET \"grace\""));
@@ -1316,7 +1476,7 @@ mod tests {
         assert!(c.contains("set -as terminal-features \",*:RGB\""));
         assert!(c.contains("set -g allow-passthrough on"));
         assert!(c.contains("#{s|^/Users/me|~|:pane_current_path}"));
-        assert!(c.contains("ctrl-g ? keys"));
+        assert!(c.contains("? keys · q detach · Q quit"));
         assert!(!c.contains("~/.tmux.conf\n") && !c.contains("source-file"));
         for opt in ["mouse on", "escape-time 10", "focus-events on", "set-clipboard on", "extended-keys on", "tmux-256color"] {
             assert!(c.contains(opt), "{opt}");
