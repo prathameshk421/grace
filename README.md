@@ -46,6 +46,26 @@ grace          # open the picker
 grace knn      # one match: go there now
 ```
 
+## See which agent needs you.
+
+Run Claude Code, Codex and other CLI agents in many projects at once. `grace sessions` lists the live ones. The agents that wait for your answer come first.
+
+```
+grace ❯
+  ~/code/aiml/knn        [claude]   ● needs you     2m
+  ~/work/api-server      [codex]    ◐ working       now
+  ~/code/aiml/kmeans     [agy]      ✓ done          12m
+```
+
+```sh
+grace setup claude     # Claude Code CLI reports its status to grace
+grace setup codex      # Codex CLI reports when a turn ends
+grace sessions         # picker with live agents only
+grace sessions -l      # plain list
+```
+
+`grace setup` makes a backup of the config first. `--remove` undoes it. In zsh and fish, grace also sees every AI CLI start and exit, with no setup.
+
 ## Tags show where you worked.
 
 Each folder shows the AI tools and editors you used in it. Filter by tag to see only the folders where you used one tool.

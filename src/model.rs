@@ -41,3 +41,47 @@ pub fn now() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// What a CLI agent session is doing right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// The agent is working on a turn.
+    Working,
+    /// The agent waits for the user (a question, a permission, or its turn ended).
+    Waiting,
+    /// The CLI exited.
+    Done,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Working => "working",
+            Status::Waiting => "waiting",
+            Status::Done => "done",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Status> {
+        match s {
+            "working" => Some(Status::Working),
+            "waiting" => Some(Status::Waiting),
+            "done" => Some(Status::Done),
+            _ => None,
+        }
+    }
+}
+
+/// One run of a CLI agent (claude, codex, agy...) in a folder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Session {
+    pub id: i64,
+    pub path: String,
+    /// Canonical tag, e.g. "claude".
+    pub tool: String,
+    pub status: Status,
+    /// PID of the shell that started the CLI, if known. Used to find dead sessions.
+    pub shell_pid: Option<i64>,
+    pub started_at: i64,
+    /// Last status change.
+    pub updated_at: i64,
+}

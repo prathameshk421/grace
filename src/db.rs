@@ -1,5 +1,5 @@
 //! SQLite storage.
-use crate::model::{now, Entry, Tag};
+use crate::model::{now, Entry, Session, Status, Tag};
 use anyhow::{Context, Result};
 use rusqlite::params;
 use std::collections::HashMap;
@@ -28,7 +28,24 @@ CREATE TABLE IF NOT EXISTS tools(
     tag TEXT NOT NULL,
     launch TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sessions(
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    status TEXT NOT NULL,
+    shell_pid INTEGER,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_path_tool ON sessions(path, tool);
 ";
+
+/// Seconds a done session stays visible.
+const DONE_VISIBLE: i64 = 30 * 60;
+/// Seconds without update before a working or waiting session counts as done.
+const STALE_AFTER: i64 = 12 * 3600;
+/// Seconds before a done row is deleted.
+const PRUNE_AFTER: i64 = 7 * 86400;
 
 /// Directory that holds the database file.
 fn data_dir() -> Result<PathBuf> {
@@ -168,6 +185,130 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    fn ensure_dir(&self, path: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)
+             ON CONFLICT(path) DO UPDATE SET
+                last_visit = max(last_visit, ?2),
+                visits = CASE WHEN visits = 0 THEN 1 ELSE visits END",
+            params![path, ts],
+        )?;
+        Ok(())
+    }
+
+    fn prune_sessions(&self, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sessions WHERE status = 'done' AND updated_at < ?1",
+            params![ts - PRUNE_AFTER],
+        )?;
+        Ok(())
+    }
+
+    /// The CLI starts in a folder: mark the session working (new or existing).
+    pub fn session_start(
+        &self,
+        path: &str,
+        tool: &str,
+        shell_pid: Option<i64>,
+        ts: i64,
+    ) -> Result<()> {
+        self.ensure_dir(path, ts)?;
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM sessions WHERE path = ?1 AND tool = ?2 AND status != 'done'
+                 ORDER BY id DESC LIMIT 1",
+                params![path, tool],
+                |r| r.get(0),
+            )
+            .ok();
+        match id {
+            Some(id) => {
+                self.conn.execute(
+                    "UPDATE sessions SET status = 'working', updated_at = ?2,
+                        shell_pid = COALESCE(?3, shell_pid) WHERE id = ?1",
+                    params![id, ts, shell_pid],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at)
+                     VALUES(?1, ?2, 'working', ?3, ?4, ?4)",
+                    params![path, tool, shell_pid, ts],
+                )?;
+            }
+        }
+        self.prune_sessions(ts)
+    }
+
+    /// An agent hook reports a new status for the newest open session of (path, tool).
+    pub fn session_set(&self, path: &str, tool: &str, status: Status, ts: i64) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE sessions SET status = ?3, updated_at = ?4 WHERE id = (
+                SELECT id FROM sessions WHERE path = ?1 AND tool = ?2 AND status != 'done'
+                ORDER BY id DESC LIMIT 1)",
+            params![path, tool, status.as_str(), ts],
+        )?;
+        if n == 0 && status != Status::Done {
+            self.ensure_dir(path, ts)?;
+            self.conn.execute(
+                "INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at)
+                 VALUES(?1, ?2, ?3, NULL, ?4, ?4)",
+                params![path, tool, status.as_str(), ts],
+            )?;
+        }
+        self.prune_sessions(ts)
+    }
+
+    /// The shell finished the command: mark its open sessions done.
+    pub fn session_end_pid(&self, shell_pid: i64, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET status = 'done', updated_at = ?2
+             WHERE shell_pid = ?1 AND status != 'done'",
+            params![shell_pid, ts],
+        )?;
+        self.prune_sessions(ts)
+    }
+
+    /// Open sessions plus sessions done in the last 30 minutes.
+    /// Dead shells and stale sessions are marked done first.
+    pub fn sessions(&self, now: i64) -> Result<Vec<Session>> {
+        let open: Vec<(i64, Option<i64>, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, shell_pid, updated_at FROM sessions WHERE status != 'done'",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (id, pid, updated) in open {
+            let dead = pid.is_some_and(|p| !crate::platform::pid_alive(p));
+            if dead || now - updated > STALE_AFTER {
+                self.conn.execute(
+                    "UPDATE sessions SET status = 'done', updated_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )?;
+            }
+        }
+        self.prune_sessions(now)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, tool, status, shell_pid, started_at, updated_at FROM sessions
+             WHERE status != 'done' OR updated_at >= ?1 ORDER BY updated_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![now - DONE_VISIBLE], |r| {
+            let st: String = r.get(3)?;
+            Ok(Session {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                tool: r.get(2)?,
+                status: Status::parse(&st).unwrap_or(Status::Done),
+                shell_pid: r.get(4)?,
+                started_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Insert a dir only if missing. Returns true if inserted.
     /// With `tool`, also add a tag with count 1 (only when the dir was inserted).
     pub fn import_dir(&self, path: &str, ts: i64, tool: Option<&str>) -> Result<bool> {
@@ -244,6 +385,65 @@ mod tests {
         assert_eq!(find(&db, "/i").unwrap().last_visit, 100);
         assert!(db.import_dir("/j", 5, Some("claude")).unwrap());
         assert_eq!(find(&db, "/j").unwrap().tags.len(), 1);
+    }
+
+    fn status_of(db: &Db, now: i64, path: &str) -> Option<Status> {
+        db.sessions(now).unwrap().into_iter().find(|s| s.path == path).map(|s| s.status)
+    }
+
+    #[test]
+    fn session_lifecycle() {
+        let (_d, db) = temp_db();
+        let me = std::process::id() as i64;
+        db.session_start("/s", "claude", Some(me), 100).unwrap();
+        assert_eq!(status_of(&db, 101, "/s"), Some(Status::Working));
+        assert!(find(&db, "/s").is_some());
+        db.session_set("/s", "claude", Status::Waiting, 110).unwrap();
+        assert_eq!(status_of(&db, 111, "/s"), Some(Status::Waiting));
+        // A second start reuses the open session.
+        db.session_start("/s", "claude", None, 120).unwrap();
+        let all = db.sessions(121).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].status, all[0].shell_pid), (Status::Working, Some(me)));
+        db.session_end_pid(me, 130).unwrap();
+        assert_eq!(status_of(&db, 131, "/s"), Some(Status::Done));
+    }
+
+    #[test]
+    fn session_set_without_start() {
+        let (_d, db) = temp_db();
+        db.session_set("/h", "codex", Status::Waiting, 10).unwrap();
+        assert_eq!(status_of(&db, 11, "/h"), Some(Status::Waiting));
+        db.session_set("/h", "codex", Status::Done, 12).unwrap();
+        assert_eq!(status_of(&db, 13, "/h"), Some(Status::Done));
+        // Done for an unknown session inserts nothing.
+        db.session_set("/none", "codex", Status::Done, 14).unwrap();
+        assert_eq!(status_of(&db, 15, "/none"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_pid_is_done() {
+        let (_d, db) = temp_db();
+        db.session_start("/d", "claude", Some(999_999_999), 100).unwrap();
+        assert_eq!(status_of(&db, 101, "/d"), Some(Status::Done));
+    }
+
+    #[test]
+    fn stale_and_old_rules() {
+        let (_d, db) = temp_db();
+        db.session_set("/w", "claude", Status::Working, 0).unwrap();
+        assert_eq!(status_of(&db, 11 * 3600, "/w"), Some(Status::Working));
+        // Stale after 12 h, then visible as done for 30 min only.
+        assert_eq!(status_of(&db, 12 * 3600 + 1, "/w"), Some(Status::Done));
+        assert_eq!(status_of(&db, 12 * 3600 + 33 * 60, "/w"), None);
+        // Old done rows are pruned.
+        db.session_set("/x", "claude", Status::Waiting, 8 * 86400).unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM sessions WHERE path = '/w'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

@@ -100,9 +100,59 @@ pub fn tag_target(cwd: &str, target: Option<&str>) -> String {
     }
 }
 
+/// True if a process with this PID exists.
+#[cfg(unix)]
+pub fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 || pid > i32::MAX as i64 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe {
+        libc::kill(pid as i32, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+/// True if a process with this PID exists.
+#[cfg(windows)]
+pub fn pid_alive(pid: i64) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    if pid <= 0 || pid > u32::MAX as i64 {
+        return false;
+    }
+    // SAFETY: plain Win32 calls. The handle is closed before return.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        ok && code == STILL_ACTIVE
+    }
+}
+
+/// True if a process with this PID exists. Unknown platform: assume yes.
+#[cfg(not(any(unix, windows)))]
+pub fn pid_alive(_pid: i64) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_liveness() {
+        assert!(pid_alive(std::process::id() as i64));
+        assert!(!pid_alive(999_999_999));
+    }
 
     #[test]
     fn strips_verbatim_prefix() {

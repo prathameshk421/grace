@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0
+
+- Live sessions. The picker shows `● needs you`, `◐ working` or `✓ done` for CLI agents in each folder.
+- `grace sessions` opens a picker with live agents only. Agents that wait for you come first. `grace sessions -l` prints a list.
+- `grace setup claude` adds hooks to the Claude Code CLI settings. `grace setup codex` sets `notify` in the Codex CLI config. Both make a backup first, and `--remove` undoes them.
+- zsh and fish mark an AI CLI as working when it starts and done when it exits.
+- grace clears sessions whose terminal closed.
+
 ## 1.2.0
 
 - New README with a demo image, a logo and a feature tour.

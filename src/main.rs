@@ -5,6 +5,8 @@ mod model;
 mod picker;
 mod platform;
 mod rank;
+mod session;
+mod setup;
 mod shell;
 mod tools;
 
@@ -23,6 +25,8 @@ Examples:
   grace import          import folders from Claude Code and editors
   grace tool add kiro   track a new AI tool
   grace init zsh        print the shell setup code
+  grace sessions        see which agent works or waits in which folder
+  grace setup claude    let grace see the status of Claude Code
 
 Setup: run `grace init --help` to see the line for your shell.";
 
@@ -110,12 +114,74 @@ enum Cmd {
         #[command(subcommand)]
         action: ToolCmd,
     },
+    /// Show folders where a CLI agent runs, and whether it works or waits for you
+    Sessions {
+        /// Print a plain table instead of the picker
+        #[arg(short, long)]
+        list: bool,
+        /// Also print the launch command of the last tool used there
+        #[arg(short, long)]
+        open: bool,
+        /// Start the picker with this search text
+        query: Option<String>,
+    },
+    /// Connect the Claude Code CLI or the Codex CLI so grace sees their status
+    Setup {
+        /// claude or codex
+        target: String,
+        /// Undo the setup
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Live session tracking (used by shell and agent hooks)
+    #[command(hide = true)]
+    Session {
+        #[command(subcommand)]
+        action: SessionCmd,
+    },
     /// Print the shell setup code
     #[command(after_long_help = INIT_HELP, after_help = INIT_HELP)]
     Init {
         /// zsh, bash, fish, powershell (or pwsh)
         shell: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// A CLI agent starts in a folder
+    Start {
+        path: PathBuf,
+        tool: String,
+        /// PID of the shell that runs the agent
+        #[arg(long)]
+        pid: Option<i64>,
+    },
+    /// The shell finished the agent command
+    End {
+        #[arg(long)]
+        pid: i64,
+    },
+    /// Set the status of a session
+    Set {
+        path: PathBuf,
+        tool: String,
+        /// working, waiting or done
+        status: String,
+    },
+    /// Read a hook event of an agent CLI. Never fails, prints nothing.
+    Hook {
+        #[command(subcommand)]
+        agent: HookCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Claude Code CLI: the JSON comes on stdin
+    Claude,
+    /// Codex CLI notify: the JSON is the argument
+    Codex { json: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -159,8 +225,94 @@ fn load(db: &db::Db, reg: &tools::Registry, tag: Option<&str>) -> Result<Vec<mod
     Ok(entries)
 }
 
+/// Session commands: no first-run import, so they stay fast.
+fn run_session(action: SessionCmd) -> Result<()> {
+    if let SessionCmd::Hook { agent } = action {
+        // A hook must never fail loudly and never print to stdout.
+        let _ = run_hook(agent);
+        return Ok(());
+    }
+    let (db, _) = db::Db::open_default()?;
+    let reg = tools::Registry::from_db(&db)?;
+    let now = model::now();
+    match action {
+        SessionCmd::Start { path, tool, pid } => {
+            let tool = reg.normalize_tag(&tool);
+            let p = resolve(Some(path))?;
+            if reg.is_ai_tag(&tool) && !platform::ignored(&p) {
+                db.session_start(&p, &tool, pid, now)?;
+            }
+        }
+        SessionCmd::End { pid } => db.session_end_pid(pid, now)?,
+        SessionCmd::Set { path, tool, status } => {
+            let Some(status) = model::Status::parse(&status) else {
+                bail!("status must be working, waiting or done");
+            };
+            let tool = reg.normalize_tag(&tool);
+            let p = resolve(Some(path))?;
+            if reg.is_ai_tag(&tool) && !platform::ignored(&p) {
+                db.session_set(&p, &tool, status, now)?;
+            }
+        }
+        SessionCmd::Hook { .. } => {}
+    }
+    Ok(())
+}
+
+fn run_hook(agent: HookCmd) -> Result<()> {
+    use std::io::Read;
+    let (tool, status, cwd) = match agent {
+        HookCmd::Claude => {
+            let mut input = String::new();
+            std::io::stdin().take(1 << 20).read_to_string(&mut input)?;
+            let Some((status, cwd)) = session::parse_claude_hook(&input) else {
+                return Ok(());
+            };
+            ("claude", status, cwd)
+        }
+        HookCmd::Codex { json } => {
+            let Some(cwd) = json.and_then(|j| session::parse_codex_notify(&j)) else {
+                return Ok(());
+            };
+            ("codex", model::Status::Waiting, cwd)
+        }
+    };
+    let p = resolve(cwd.map(PathBuf::from))?;
+    if platform::ignored(&p) {
+        return Ok(());
+    }
+    let (db, _) = db::Db::open_default()?;
+    let tool = tools::Registry::from_db(&db)?.normalize_tag(tool);
+    db.session_set(&p, &tool, status, model::now())
+}
+
+/// Run the picker and print the chosen path (and the launch command with --open).
+fn travel(
+    reg: &tools::Registry,
+    entries: Vec<model::Entry>,
+    sessions: &[model::Session],
+    query: &str,
+    open: bool,
+    now: i64,
+) -> Result<()> {
+    if let Some(e) = picker::pick(entries, sessions, query, now)? {
+        println!("{}", e.path);
+        if open {
+            if let Some(cmd) = e.last_tool().and_then(|t| reg.launch_command(t)) {
+                println!("{cmd}");
+            }
+        }
+    } else {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Cmd::Session { action }) = cli.cmd {
+        return run_session(action);
+    }
     let (db, fresh) = db::Db::open_default()?;
     if fresh {
         // First run: fill the list from Claude Code and editor history.
@@ -175,17 +327,42 @@ fn main() -> Result<()> {
             if entries.is_empty() {
                 bail!("no folders yet. cd around a bit, or run `grace import`");
             }
-            if let Some(e) = picker::pick(entries, query.as_deref().unwrap_or(""), now)? {
-                println!("{}", e.path);
-                if open {
-                    if let Some(cmd) = e.last_tool().and_then(|t| reg.launch_command(t)) {
-                        println!("{cmd}");
-                    }
-                }
-            } else {
-                std::process::exit(1);
-            }
+            let sessions = db.sessions(now).unwrap_or_default();
+            travel(&reg, entries, &sessions, query.as_deref().unwrap_or(""), open, now)?;
         }
+        Cmd::Sessions { list, open, query } => {
+            let mut sessions = db.sessions(now)?;
+            session::sort_sessions(&mut sessions);
+            if list {
+                let home = platform::home_dir().map(|h| h.to_string_lossy().into_owned());
+                for s in &sessions {
+                    println!(
+                        "{:<8} {:<12} {}  {}",
+                        s.status.as_str(),
+                        s.tool,
+                        picker::display_path(&s.path, home.as_deref()),
+                        rank::time_ago(s.updated_at, now)
+                    );
+                }
+                return Ok(());
+            }
+            let best = picker::best_by_path(&sessions);
+            let mut entries: Vec<_> = load(&db, &reg, None)?
+                .into_iter()
+                .filter(|e| best.contains_key(&e.path))
+                .collect();
+            if entries.is_empty() {
+                bail!("no live sessions. Run `grace setup claude` or `grace setup codex`, then start the agent");
+            }
+            let key = |e: &model::Entry| {
+                let b = &best[&e.path];
+                (picker::urgency(b.status), b.updated_at)
+            };
+            entries.sort_by(|a, b| key(b).cmp(&key(a)));
+            travel(&reg, entries, &sessions, query.as_deref().unwrap_or(""), open, now)?;
+        }
+        Cmd::Setup { target, remove } => setup::run(&target, remove)?,
+        Cmd::Session { .. } => {}
         Cmd::Add { path } => {
             let p = resolve(Some(path))?;
             if !platform::ignored(&p) {
@@ -250,7 +427,7 @@ fn main() -> Result<()> {
             }
         },
         Cmd::Init { shell } => match shell::Shell::parse(&shell) {
-            Some(sh) => print!("{}", shell::init(sh, &reg.command_names())),
+            Some(sh) => print!("{}", shell::init(sh, &reg.command_names(), &reg.ai_command_names())),
             None => bail!("unsupported shell: {shell} (use zsh, bash, fish, powershell or pwsh)"),
         },
     }

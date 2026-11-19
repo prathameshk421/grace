@@ -159,6 +159,22 @@ impl Registry {
             .map(|t| t.launch.clone())
     }
 
+    /// Command names of AI and custom tools (no editors), for the session hooks.
+    pub fn ai_command_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|t| t.kind != Some(Kind::Editor))
+            .map(|t| t.command.clone())
+            .collect()
+    }
+
+    /// True if the canonical tag belongs to an AI or custom tool, not an editor.
+    /// Unknown tags count as AI, like custom tools.
+    pub fn is_ai_tag(&self, tag: &str) -> bool {
+        !self.tools.iter().any(|t| t.tag == tag && t.kind == Some(Kind::Editor))
+            || self.tools.iter().any(|t| t.tag == tag && t.kind != Some(Kind::Editor))
+    }
+
     /// All command names, for the shell script.
     pub fn command_names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.command.clone()).collect()

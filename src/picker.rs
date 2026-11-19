@@ -1,7 +1,8 @@
 //! Interactive TUI picker.
 //!
 //! The TUI draws on stderr, because the shell function captures stdout.
-use crate::model::Entry;
+use crate::model::{Entry, Session, Status};
+use std::collections::HashMap;
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -21,17 +22,70 @@ use ratatui::{
     Frame, Terminal,
 };
 
-fn haystack(e: &Entry) -> String {
+/// Sessions by folder, one per folder: the most urgent, then the newest.
+pub type Best = HashMap<String, Session>;
+
+/// Higher means more urgent: waiting, then working, then done.
+pub fn urgency(s: Status) -> u8 {
+    match s {
+        Status::Waiting => 2,
+        Status::Working => 1,
+        Status::Done => 0,
+    }
+}
+
+pub fn best_by_path(sessions: &[Session]) -> Best {
+    let mut map: Best = HashMap::new();
+    for s in sessions {
+        let better = match map.get(&s.path) {
+            None => true,
+            Some(o) => (urgency(s.status), s.updated_at) > (urgency(o.status), o.updated_at),
+        };
+        if better {
+            map.insert(s.path.clone(), s.clone());
+        }
+    }
+    map
+}
+
+/// Words that the search matches for a session status.
+fn status_words(s: Status) -> &'static str {
+    match s {
+        Status::Waiting => "waiting needs",
+        Status::Working => "working",
+        Status::Done => "done",
+    }
+}
+
+fn badge(s: Status) -> (&'static str, Style) {
+    match s {
+        Status::Waiting => (
+            "\u{25cf} needs you",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Status::Working => ("\u{25d0} working", Style::default().fg(Color::Cyan)),
+        Status::Done => (
+            "\u{2713} done",
+            Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+        ),
+    }
+}
+
+fn haystack(e: &Entry, best: &Best) -> String {
     let mut s = e.path.clone();
     for t in &e.tags {
         s.push(' ');
         s.push_str(&t.tool);
     }
+    if let Some(b) = best.get(&e.path) {
+        s.push(' ');
+        s.push_str(status_words(b.status));
+    }
     s
 }
 
 /// Return indices into `entries` that match `query`, best first.
-fn filter(entries: &[Entry], query: &str) -> Vec<usize> {
+fn filter(entries: &[Entry], best: &Best, query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
         return (0..entries.len()).collect();
     }
@@ -42,7 +96,7 @@ fn filter(entries: &[Entry], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
-            let h = haystack(e);
+            let h = haystack(e, best);
             pattern
                 .score(Utf32Str::new(&h, &mut buf), &mut matcher)
                 .map(|s| (s, i))
@@ -98,7 +152,7 @@ fn tag_color(tool: &str) -> Color {
     }
 }
 
-fn display_path(path: &str, home: Option<&str>) -> String {
+pub fn display_path(path: &str, home: Option<&str>) -> String {
     if let Some(h) = home.filter(|h| !h.is_empty()) {
         let h = crate::platform::trim_separators(h);
         let h = h.as_str();
@@ -117,6 +171,7 @@ fn display_path(path: &str, home: Option<&str>) -> String {
 
 struct State {
     entries: Vec<Entry>,
+    best: Best,
     query: String,
     matches: Vec<usize>,
     selected: usize,
@@ -128,7 +183,7 @@ struct State {
 
 impl State {
     fn refilter(&mut self) {
-        self.matches = filter(&self.entries, &self.query);
+        self.matches = filter(&self.entries, &self.best, &self.query);
         self.selected = 0;
         self.offset = 0;
     }
@@ -222,6 +277,12 @@ fn draw(f: &mut Frame, st: &mut State) {
             used += badge.chars().count();
             spans.push(Span::styled(badge, base.fg(tag_color(&t.tool))));
         }
+        if let Some(b) = st.best.get(&e.path) {
+            let (text, style) = badge(b.status);
+            let text = format!(" {text}");
+            used += text.chars().count();
+            spans.push(Span::styled(text, base.patch(style)));
+        }
         let ago = time_ago(st.now, e.last_visit);
         let pad = width.saturating_sub(used + ago.chars().count());
         spans.push(Span::styled(" ".repeat(pad.max(1)), base));
@@ -290,8 +351,14 @@ fn run(
     }
 }
 
-pub fn pick(entries: Vec<Entry>, query: &str, now: i64) -> Result<Option<Entry>> {
-    let matches = filter(&entries, query);
+pub fn pick(
+    entries: Vec<Entry>,
+    sessions: &[Session],
+    query: &str,
+    now: i64,
+) -> Result<Option<Entry>> {
+    let best = best_by_path(sessions);
+    let matches = filter(&entries, &best, query);
     // Fast travel: one match for a given query, so skip the UI.
     if !query.trim().is_empty() && matches.len() == 1 {
         return Ok(Some(entries[matches[0]].clone()));
@@ -299,6 +366,7 @@ pub fn pick(entries: Vec<Entry>, query: &str, now: i64) -> Result<Option<Entry>>
 
     let mut st = State {
         entries,
+        best,
         query: query.to_string(),
         matches,
         selected: 0,
@@ -355,22 +423,39 @@ mod tests {
 
     #[test]
     fn empty_query_keeps_order() {
-        assert_eq!(filter(&sample(), ""), vec![0, 1, 2]);
+        assert_eq!(filter(&sample(), &Best::new(), ""), vec![0, 1, 2]);
     }
 
     #[test]
     fn query_narrows() {
-        assert_eq!(filter(&sample(), "beta"), vec![1]);
+        assert_eq!(filter(&sample(), &Best::new(), "beta"), vec![1]);
     }
 
     #[test]
     fn tag_text_matches() {
-        assert_eq!(filter(&sample(), "claude"), vec![0]);
+        assert_eq!(filter(&sample(), &Best::new(), "claude"), vec![0]);
+    }
+
+    #[test]
+    fn status_word_matches() {
+        let s = Session {
+            id: 1,
+            path: "/home/u/beta".into(),
+            tool: "codex".into(),
+            status: Status::Waiting,
+            shell_pid: None,
+            started_at: 0,
+            updated_at: 5,
+        };
+        let done = Session { id: 2, status: Status::Done, updated_at: 9, ..s.clone() };
+        let best = best_by_path(&[done, s]);
+        assert_eq!(best["/home/u/beta"].status, Status::Waiting);
+        assert_eq!(filter(&sample(), &best, "needs"), vec![1]);
     }
 
     #[test]
     fn no_match_is_empty() {
-        assert!(filter(&sample(), "zzzqqq").is_empty());
+        assert!(filter(&sample(), &Best::new(), "zzzqqq").is_empty());
     }
 
     #[test]

@@ -30,28 +30,56 @@ const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
             break
           done
           command grace tag "$PWD" "$w" ${tgt:+"$tgt"} &>/dev/null &!
+          case $w in
+            @AI@)
+              # Live session: start now, end in precmd.
+              local sdir=$PWD
+              [[ -n $tgt && -d ${tgt/#\~/$HOME} ]] && sdir=${tgt/#\~/$HOME}
+              command grace session start "$sdir" "$w" --pid $$ &>/dev/null
+              typeset -g __grace_session=1
+              ;;
+          esac
           ;;
       esac
       break
     done
   }
 
+  __grace_precmd() {
+    [[ -n $__grace_session ]] || return
+    unset __grace_session
+    command grace session end --pid $$ &>/dev/null &!
+  }
+
   add-zsh-hook chpwd __grace_chpwd
   add-zsh-hook preexec __grace_preexec
+  add-zsh-hook precmd __grace_precmd
 
   # Record the folder where the shell starts.
   command grace add "$PWD" &>/dev/null &!
 
   grace() {
     case $1 in
-      add|tag|tool|list|pin|unpin|forget|import|init|help|-h|--help|-V|--version)
+      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|help|-h|--help|-V|--version)
         command grace "$@"
         return $?
         ;;
     esac
-    [[ $1 == pick ]] && shift
+    local sub=pick x
+    case $1 in
+      sessions)
+        shift
+        sub=sessions
+        for x in "$@"; do
+          case $x in
+            -l|--list|-h|--help) command grace sessions "$@"; return $? ;;
+          esac
+        done
+        ;;
+      pick) shift ;;
+    esac
     local out dir cmd
-    out="$(command grace pick "$@")" || return
+    out="$(command grace $sub "$@")" || return
     dir=${out%%$'\n'*}
     if [[ $out == *$'\n'* ]]; then
       cmd=${out#*$'\n'}
@@ -112,6 +140,9 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
     return $rc
   }
 
+  # Bash has no reliable preexec, so the shell side of live sessions is skipped here.
+  # The agent hooks (grace setup) still report the status.
+
   # Do not tag the last command of an older session.
   __GRACE_LAST_HIST=$(HISTTIMEFORMAT= history 1 2>/dev/null)
   __GRACE_LAST_HIST=${__GRACE_LAST_HIST#"${__GRACE_LAST_HIST%%[![:space:]]*}"}
@@ -129,16 +160,26 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
 
   grace() {
     case ${1-} in
-      add|tag|tool|list|pin|unpin|forget|import|init|help|-h|--help|-V|--version)
+      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|help|-h|--help|-V|--version)
         command grace "$@"
         return $?
         ;;
     esac
-    if [[ ${1-} == pick ]]; then
-      shift
-    fi
+    local sub=pick x
+    case ${1-} in
+      sessions)
+        shift
+        sub=sessions
+        for x in "$@"; do
+          case $x in
+            -l|--list|-h|--help) command grace sessions "$@"; return $? ;;
+          esac
+        done
+        ;;
+      pick) shift ;;
+    esac
     local out dir cmd=
-    out=$(command grace pick "$@") || return
+    out=$(command grace $sub "$@") || return
     dir=${out%%$'\n'*}
     if [[ $out == *$'\n'* ]]; then
       cmd=${out#*$'\n'}
@@ -187,9 +228,27 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
                     end
                     command grace tag $PWD $base $tgt >/dev/null 2>&1 &
                     disown 2>/dev/null
+                    if contains -- $base @AI@
+                        # Live session: start now, end in fish_postexec.
+                        set -l sdir $PWD
+                        if test -n "$tgt"
+                            set -l t (string replace -r -- '^~' $HOME $tgt)
+                            test -d "$t"; and set sdir $t
+                        end
+                        command grace session start $sdir $base --pid $fish_pid >/dev/null 2>&1
+                        disown 2>/dev/null
+                        set -g __grace_session 1
+                    end
             end
             break
         end
+    end
+
+    function __grace_postexec --on-event fish_postexec
+        set -q __grace_session; or return
+        set -e __grace_session
+        command grace session end --pid $fish_pid >/dev/null 2>&1 &
+        disown 2>/dev/null
     end
 
     # Record the folder where the shell starts.
@@ -197,14 +256,22 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
     disown 2>/dev/null
 
     function grace
-        if set -q argv[1]; and contains -- $argv[1] add tag tool list pin unpin forget import init help -h --help -V --version
+        if set -q argv[1]; and contains -- $argv[1] add tag tool list pin unpin forget import init setup session help -h --help -V --version
             command grace $argv
             return $status
         end
-        if set -q argv[1]; and test "$argv[1]" = pick
+        set -l sub pick
+        if set -q argv[1]; and test "$argv[1]" = sessions
+            set sub sessions
+            set -e argv[1]
+            if contains -- -l $argv; or contains -- --list $argv; or contains -- -h $argv; or contains -- --help $argv
+                command grace sessions $argv
+                return $status
+            end
+        else if set -q argv[1]; and test "$argv[1]" = pick
             set -e argv[1]
         end
-        set -l out (command grace pick $argv)
+        set -l out (command grace $sub $argv)
         or return
         set -l dir $out[1]
         test -n "$dir"; or return 1
@@ -281,16 +348,26 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
       Write-Error 'grace: the grace program is not on PATH'
       return
     }
-    $passthrough = @('add', 'tag', 'tool', 'list', 'pin', 'unpin', 'forget', 'import', 'init', 'help', '-h', '--help', '-V', '--version')
+    $passthrough = @('add', 'tag', 'tool', 'list', 'pin', 'unpin', 'forget', 'import', 'init', 'setup', 'session', 'help', '-h', '--help', '-V', '--version')
     if ($args.Count -gt 0 -and ($passthrough -ccontains [string]$args[0])) {
       & $exe @args
       return
     }
+    # No shell side for live sessions here: PowerShell has no reliable preexec.
+    # The agent hooks (grace setup) still report the status.
     $rest = @($args)
-    if ($rest.Count -gt 0 -and $rest[0] -ceq 'pick') {
+    $sub = 'pick'
+    if ($rest.Count -gt 0 -and $rest[0] -ceq 'sessions') {
+      $sub = 'sessions'
+      $rest = @($rest | Select-Object -Skip 1)
+      if (@($rest | Where-Object { $_ -in '-l', '--list', '-h', '--help' }).Count -gt 0) {
+        & $exe sessions @rest
+        return
+      }
+    } elseif ($rest.Count -gt 0 -and $rest[0] -ceq 'pick') {
       $rest = @($rest | Select-Object -Skip 1)
     }
-    $out = @(& $exe pick @rest)
+    $out = @(& $exe $sub @rest)
     if ($LASTEXITCODE -ne 0) { return }
     if ($out.Count -eq 0 -or -not $out[0]) { return }
     Set-Location -LiteralPath $out[0]
@@ -321,19 +398,26 @@ impl Shell {
 
 /// Build the script for `shell`. `names` are command names. Invalid names are
 /// skipped, so a bad database row cannot add shell code to the script.
-pub fn init(shell: Shell, names: &[String]) -> String {
-    let names: Vec<&str> = names
-        .iter()
-        .map(|n| n.as_str())
-        .filter(|n| tools::valid_name(n))
-        .collect();
-    let (template, joined) = match shell {
-        Shell::Zsh => (ZSH_TEMPLATE, names.join("|")),
-        Shell::Bash => (BASH_TEMPLATE, names.join("|")),
-        Shell::Fish => (FISH_TEMPLATE, names.join(" ")),
-        Shell::PowerShell => (POWERSHELL_TEMPLATE, names.join("','")),
+/// `ai_names` are the AI and custom commands (no editors) that start live sessions.
+pub fn init(shell: Shell, names: &[String], ai_names: &[String]) -> String {
+    let valid = |v: &[String]| -> Vec<String> {
+        v.iter().filter(|n| tools::valid_name(n)).cloned().collect()
     };
-    template.replace("@TOOLS@", &joined)
+    let (names, ai) = (valid(names), valid(ai_names));
+    let join = |v: &[String], sep: &str| -> String {
+        if v.is_empty() {
+            "__grace_none__".to_string()
+        } else {
+            v.join(sep)
+        }
+    };
+    let (template, joined, ai_joined) = match shell {
+        Shell::Zsh => (ZSH_TEMPLATE, join(&names, "|"), join(&ai, "|")),
+        Shell::Bash => (BASH_TEMPLATE, join(&names, "|"), join(&ai, "|")),
+        Shell::Fish => (FISH_TEMPLATE, join(&names, " "), join(&ai, " ")),
+        Shell::PowerShell => (POWERSHELL_TEMPLATE, join(&names, "','"), join(&ai, "','")),
+    };
+    template.replace("@TOOLS@", &joined).replace("@AI@", &ai_joined)
 }
 
 #[cfg(test)]
@@ -347,9 +431,18 @@ mod tests {
         names
     }
 
+    fn ai_names() -> Vec<String> {
+        let r = tools::Registry::new(&[("kiro".into(), "kiro".into(), "kiro".into())]);
+        r.ai_command_names()
+    }
+
+    fn script(sh: Shell) -> String {
+        init(sh, &names(), &ai_names())
+    }
+
     #[test]
     fn zsh_has_function_and_tools() {
-        let s = init(Shell::Zsh, &names());
+        let s = script(Shell::Zsh);
         assert!(s.contains("grace() {"));
         assert!(s.contains("claude|agy|antigravity"));
         assert!(s.contains("cursor-agent"));
@@ -357,6 +450,35 @@ mod tests {
         assert!(!s.contains("rm -rf"));
         assert!(s.contains("add|tag|tool|"));
         assert!(!s.contains("@TOOLS@"));
+        assert!(!s.contains("@AI@"));
+    }
+
+    #[test]
+    fn sessions_hooks_for_ai_only() {
+        let z = script(Shell::Zsh);
+        assert!(z.contains("session start"));
+        assert!(z.contains("session end"));
+        let (_, after) = z.split_once("case $w in\n            ").unwrap();
+        let ai_pat = after.lines().next().unwrap();
+        assert!(ai_pat.contains("claude|") && ai_pat.contains("kiro"), "{ai_pat}");
+        assert!(!ai_pat.contains("zed") && !ai_pat.contains("nvim"), "{ai_pat}");
+        let f = script(Shell::Fish);
+        assert!(f.contains("session start") && f.contains("fish_postexec"));
+        assert!(f.contains("contains -- $base claude"));
+        assert!(!f.contains("contains -- $base claude agy antigravity codex gemini cursor cursor-agent opencode aider copilot amp goose crush qwen t3 code"));
+    }
+
+    #[test]
+    fn sessions_routing_in_every_shell() {
+        for sh in [Shell::Zsh, Shell::Bash, Shell::Fish, Shell::PowerShell] {
+            let s = script(sh);
+            assert!(s.contains("sessions"), "{sh:?}");
+            assert!(s.contains("--list"), "{sh:?}");
+            assert!(s.contains("setup"), "{sh:?}");
+            assert!(s.contains("session"), "{sh:?}");
+        }
+        assert!(script(Shell::Zsh).contains("sessions)"));
+        assert!(script(Shell::Bash).contains("sessions)"));
     }
 
     #[test]
@@ -366,7 +488,7 @@ mod tests {
             (Shell::Fish, "function grace", "case claude agy"),
             (Shell::PowerShell, "function global:grace", "'claude','agy'"),
         ] {
-            let s = init(sh, &names());
+            let s = script(sh);
             assert!(s.contains(func), "{sh:?}");
             assert!(s.contains(tool), "{sh:?}");
             assert!(s.contains("kiro"), "{sh:?}");
