@@ -406,7 +406,8 @@ mod tests {
     #[test]
     fn builds_open_command() {
         let a = app("Code").unwrap();
-        assert_eq!(open_command(a, None, "/a b", true), "code '/a b'");
+        let want = if cfg!(windows) { "code \"/a b\"" } else { "code '/a b'" };
+        assert_eq!(open_command(a, None, "/a b", true), want);
     }
 
     #[test]
