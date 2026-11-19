@@ -58,7 +58,7 @@ printf 'import { Router } from "express";\nexport const refunds = Router();\n' >
 printf 'export const db = {} as any;\n' > src/db/client.ts
 printf '# payments-api\n\nA small payments service.\n' > README.md
 printf 'node_modules\n' > .gitignore
-printf '{ "name": "payments-api", "version": "0.4.0" }\n' > package.json
+printf '{\n  "version": "0.4.0",\n  "name": "payments-api",\n  "type": "module"\n}\n' > package.json
 printf 'test("charges", () => {});\n' > tests/charges.test.ts
 g add -A && g commit -qm init
 g commit -q --allow-empty -m "Add refunds route"
@@ -121,7 +121,7 @@ INSERT INTO tags VALUES
  ('$H/code/payments-api','claude',30,$now-60), ('$H/code/payments-api','cursor',8,$now-4000),
  ('$H/code/web-dashboard','codex',12,$now-300), ('$H/code/web-dashboard','vscode',20,$now-5000),
  ('$H/code/ml/churn-model','claude',10,$now-900), ('$H/code/ml/churn-model','gemini',3,$now-90000),
- ('$H/code/ml/embeddings','antigravity',5,$now-7200),
+ ('$H/code/ml/embeddings','gemini',5,$now-7200),
  ('$H/work/infra','opencode',4,$now-86400), ('$H/work/infra','zed',6,$now-86400),
  ('$H/notes','vscode',6,$now-259200),
  ('$H/dotfiles','neovim',3,$now-1728000);
@@ -129,7 +129,7 @@ INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at) VALU
  ('$H/code/payments-api','claude','waiting',NULL,$now-1500,$now-45),
  ('$H/code/web-dashboard','codex','working',NULL,$now-900,$now-10),
  ('$H/code/ml/churn-model','claude','ready',NULL,$now-4000,$now-600),
- ('$H/code/ml/embeddings','antigravity','done',NULL,$now-5000,$now-1200);
+ ('$H/code/ml/embeddings','gemini','done',NULL,$now-5000,$now-1200);
 EOF
 
 # shot <name> <cols> <rows> <command> <wait> <label> [keys...]
@@ -156,6 +156,6 @@ shot() {
 label_hub="The grace hub: a sidebar of agents and folders, a shell, a live diff and a file tree in one window"
 label_diff="grace diff: changed files on the left, the colored diff on the right"
 label_tree="grace tree: the files of a folder with git changes marked"
-shot hub 140 24 "grace hub" 4 "$label_hub" 'git log --oneline -3' Enter 'git status -s' Enter
+shot hub 120 26 "grace hub" 4 "$label_hub" 'git log --oneline -3' Enter 'git status -s' Enter
 shot diff 112 24 "grace diff" 2 "$label_diff" j
 shot tree 60 16 "grace tree" 2 "$label_tree" Enter j j Enter
