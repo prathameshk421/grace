@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0
+
+- New README with a demo image, a logo and a feature tour.
+- One-line installers: `install.sh` for macOS and Linux, `install.ps1` for Windows. Both check the SHA-256 of the download.
+- `grace --help` shows examples. It says that `grace` alone opens the picker.
+- `grace init --help` shows the setup line for each shell.
+- The hook commands `add` and `tag` no longer show in the help list. They still work.
+- CI runs both installers on macOS, Linux and Windows.
+
 ## 1.1.1
 
 - Add T3 Code as a built-in tool. The command is `t3` and the tag is `t3code`.

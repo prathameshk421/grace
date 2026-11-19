@@ -1,6 +1,6 @@
 [package]
 name = "grace"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 description = "Fast travel between your project folders, with tags for the AI tools you used there."
 license = "MIT"

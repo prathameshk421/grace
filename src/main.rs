@@ -12,8 +12,42 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+const AFTER_HELP: &str = "\
+Examples:
+  grace                 open the picker
+  grace knn             jump to the only match for \"knn\"
+  grace -t claude       only folders where you used Claude
+  grace -o              travel and start the last tool used there
+  grace pin             keep this folder at the top
+  grace list            print tracked folders, best first
+  grace import          import folders from Claude Code and editors
+  grace tool add kiro   track a new AI tool
+  grace init zsh        print the shell setup code
+
+Setup: run `grace init --help` to see the line for your shell.";
+
+const INIT_HELP: &str = "\
+Add one line to the config file of your shell:
+
+  zsh         ~/.zshrc
+              eval \"$(grace init zsh)\"
+  bash        ~/.bashrc
+              eval \"$(grace init bash)\"
+  fish        ~/.config/fish/config.fish
+              grace init fish | source
+  powershell  $PROFILE
+              Invoke-Expression (& grace init powershell | Out-String)
+
+Open a new terminal after you save the file.";
+
 #[derive(Parser)]
-#[command(name = "grace", version, about = "Fast travel between your project folders")]
+#[command(
+    name = "grace",
+    version,
+    about = "Fast travel between your project folders",
+    long_about = "Fast travel between your project folders.\nRun `grace` with no command to open the picker.",
+    after_help = AFTER_HELP
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -21,72 +55,85 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open the picker. Prints the chosen path (the shell function then runs cd).
+    /// Open the picker and print the chosen path
     Pick {
-        /// Show only folders with this tool tag, for example "claude".
+        /// Show only folders with this tool tag, for example "claude"
         #[arg(short, long)]
         tag: Option<String>,
-        /// Also print the launch command of the last tool used there, on a second line.
+        /// Also print the launch command of the last tool used there
         #[arg(short, long)]
         open: bool,
-        /// Start the picker with this search text.
+        /// Start the picker with this search text
         query: Option<String>,
     },
-    /// Record a visit to a folder (the shell hook calls this).
+    /// Record a visit to a folder (used by the shell hook)
+    #[command(hide = true)]
     Add { path: PathBuf },
-    /// Record that an AI tool ran in a folder (the shell hook calls this).
+    /// Record that an AI tool ran in a folder (used by the shell hook)
+    #[command(hide = true)]
     Tag {
-        /// The folder where the command ran.
+        /// The folder where the command ran
         path: PathBuf,
         tool: String,
-        /// Folder argument of the command. Relative to <path>. Used only if it is a folder.
+        /// Folder argument of the command, relative to <path>
         target: Option<String>,
     },
-    /// Print tracked folders, best first.
+    /// Print tracked folders, best first
     List {
+        /// Show only folders with this tool tag
         #[arg(short, long)]
         tag: Option<String>,
     },
-    /// Keep a folder at the top of the list. Default: the current folder.
-    Pin { path: Option<PathBuf> },
-    /// Remove the pin from a folder. Default: the current folder.
-    Unpin { path: Option<PathBuf> },
-    /// Remove a folder from grace. Default: the current folder.
-    Forget { path: Option<PathBuf> },
-    /// Import folders from Claude Code history and editor history (read-only).
+    /// Keep a folder at the top of the list
+    Pin {
+        /// Default: the current folder
+        path: Option<PathBuf>,
+    },
+    /// Remove the pin from a folder
+    Unpin {
+        /// Default: the current folder
+        path: Option<PathBuf>,
+    },
+    /// Remove a folder from grace
+    Forget {
+        /// Default: the current folder
+        path: Option<PathBuf>,
+    },
+    /// Import folders from Claude Code and editor history
     Import {
-        /// Where to import from. Default: all.
+        /// Where to import from
         #[arg(default_value = "all", value_parser = clap::builder::PossibleValuesParser::new(import_editors::SOURCES))]
         source: String,
     },
-    /// Add, remove or list AI tools.
+    /// Add, remove or list AI tools
     Tool {
         #[command(subcommand)]
         action: ToolCmd,
     },
-    /// Print the shell setup. Supported shells: zsh, bash, fish, powershell (or pwsh).
-    /// zsh: add `eval "$(grace init zsh)"` to ~/.zshrc. bash: same line in ~/.bashrc.
-    /// fish: add `grace init fish | source` to config.fish.
-    /// PowerShell: add `grace init powershell | Out-String | Invoke-Expression` to $PROFILE.
-    Init { shell: String },
+    /// Print the shell setup code
+    #[command(after_long_help = INIT_HELP, after_help = INIT_HELP)]
+    Init {
+        /// zsh, bash, fish, powershell (or pwsh)
+        shell: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum ToolCmd {
-    /// Register a command as an AI tool, for example `grace tool add kiro`.
+    /// Register a command as an AI tool, for example `grace tool add kiro`
     Add {
-        /// The command name you type in the shell.
+        /// The command name you type in the shell
         command: String,
-        /// Tag to show for this tool. Default: the command in lowercase.
+        /// Tag to show for this tool. Default: the command in lowercase
         #[arg(long)]
         tag: Option<String>,
-        /// Command that starts the tool. Default: the command.
+        /// Command that starts the tool. Default: the command
         #[arg(long)]
         launch: Option<String>,
     },
-    /// Remove a custom tool. Built-in tools cannot be removed.
+    /// Remove a custom tool (built-in tools stay)
     Rm { command: String },
-    /// Print all tools: command, tag, launch command, and kind (ai, editor or custom).
+    /// Print all tools: command, tag, launch command, kind
     List,
 }
 

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="328" viewBox="0 0 760 328" role="img" aria-label="grace picker listing folders with tags">
+<style>text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;white-space:pre}.d{opacity:.55}.b{font-weight:700}</style>
+<defs><linearGradient id="bar" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2d2f36"/><stop offset="1" stop-color="#25272d"/></linearGradient></defs>
+<rect x="0.5" y="0.5" width="759" height="327" rx="12" fill="#16171b" stroke="#3a3d46"/>
+<path d="M0.5 12.5 A12 12 0 0 1 12.5 0.5 H747.5 A12 12 0 0 1 759.5 12.5 V38 H0.5 Z" fill="url(#bar)"/>
+<line x1="0" y1="38.5" x2="760" y2="38.5" stroke="#3a3d46"/>
+<circle cx="22" cy="19.5" r="6" fill="#ff5f57"/>
+<circle cx="42" cy="19.5" r="6" fill="#febc2e"/>
+<circle cx="62" cy="19.5" r="6" fill="#28c840"/>
+<text x="380.0" y="24" text-anchor="middle" fill="#9a9ea8" style="font-size:12px">grace</text>
+<text x="28" y="68"><tspan fill="#4dd0e1" class="b">grace ❯ </tspan><tspan fill="#e6e6e6">ml</tspan><tspan fill="#e6e6e6" opacity=".55">█</tspan></text>
+<rect x="12" y="69" width="736" height="23" rx="4" fill="#3b3e47"/>
+<text x="28" y="86"><tspan fill="#ffd34d">★ </tspan><tspan fill="#e6e6e6" class="d">~/code/ai<tspan fill="#ffd34d" text-decoration="underline">m</tspan><tspan fill="#ffd34d" text-decoration="underline">l</tspan>/</tspan><tspan fill="#f5f5f5" class="b">k<tspan fill="#ffd34d" text-decoration="underline">m</tspan>eans</tspan><tspan fill="#ff6b6b"> [claude]</tspan></text>
+<text x="732" y="86" text-anchor="end" fill="#e6e6e6" class="d">12h</text>
+<text x="28" y="112"><tspan fill="#ffd34d">  </tspan><tspan fill="#e6e6e6" class="d">~/code/ai<tspan fill="#ffd34d" text-decoration="underline">m</tspan><tspan fill="#ffd34d" text-decoration="underline">l</tspan>/</tspan><tspan fill="#f5f5f5" class="b">knn</tspan><tspan fill="#5b8cff"> [antigravity]</tspan><tspan fill="#ff6b6b"> [claude]</tspan></text>
+<text x="732" y="112" text-anchor="end" fill="#e6e6e6" class="d">1d</text>
+<text x="28" y="138"><tspan fill="#ffd34d">  </tspan><tspan fill="#e6e6e6" class="d">~/code/ai<tspan fill="#ffd34d" text-decoration="underline">m</tspan><tspan fill="#ffd34d" text-decoration="underline">l</tspan>/</tspan><tspan fill="#f5f5f5" class="b">decision-tree</tspan><tspan fill="#3ddc84"> [codex]</tspan></text>
+<text x="732" y="138" text-anchor="end" fill="#e6e6e6" class="d">3d</text>
+<text x="28" y="164"><tspan fill="#ffd34d">  </tspan><tspan fill="#e6e6e6" class="d">~/work/</tspan><tspan fill="#f5f5f5" class="b"><tspan fill="#ffd34d" text-decoration="underline">m</tspan><tspan fill="#ffd34d" text-decoration="underline">l</tspan>-platform</tspan><tspan fill="#2f9bff"> [vscode]</tspan><tspan fill="#2ad4e0"> [cursor]</tspan></text>
+<text x="732" y="164" text-anchor="end" fill="#e6e6e6" class="d">5d</text>
+<text x="28" y="190"><tspan fill="#ffd34d">  </tspan><tspan fill="#e6e6e6" class="d">~/code/</tspan><tspan fill="#f5f5f5" class="b"><tspan fill="#ffd34d" text-decoration="underline">m</tspan><tspan fill="#ffd34d" text-decoration="underline">l</tspan>ops-pipelines</tspan><tspan fill="#a06eff"> [t3code]</tspan></text>
+<text x="732" y="190" text-anchor="end" fill="#e6e6e6" class="d">1w</text>
+<text x="28" y="216"><tspan fill="#ffd34d">  </tspan><tspan fill="#e6e6e6" class="d">~/oss/</tspan><tspan fill="#f5f5f5" class="b">ht<tspan fill="#ffd34d" text-decoration="underline">m</tspan><tspan fill="#ffd34d" text-decoration="underline">l</tspan>-tools</tspan><tspan fill="#ff8c28"> [zed]</tspan></text>
+<text x="732" y="216" text-anchor="end" fill="#e6e6e6" class="d">2w</text>
+<text x="28" y="242"><tspan fill="#ffd34d">  </tspan><tspan fill="#e6e6e6" class="d">~/notes/</tspan><tspan fill="#f5f5f5" class="b"><tspan fill="#ffd34d" text-decoration="underline">m</tspan><tspan fill="#ffd34d" text-decoration="underline">l</tspan>-papers</tspan></text>
+<text x="732" y="242" text-anchor="end" fill="#e6e6e6" class="d">3w</text>
+<text x="28" y="292" fill="#e6e6e6" class="d">↑↓ move · enter travel · esc cancel</text>
+<text x="732" y="292" text-anchor="end" fill="#e6e6e6" class="d">7/42</text>
+</svg>
