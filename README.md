@@ -236,6 +236,12 @@ irm https://raw.githubusercontent.com/prathameshk421/grace/main/install.ps1 | ie
 
 ### Other ways
 
+**Homebrew** (macOS and Linux).
+
+```sh
+brew install prathameshk421/grace/grace
+```
+
 **Download.** Get the archive for your system from the [Releases page](https://github.com/prathameshk421/grace/releases/latest). Asset names have the form `grace-<version>-<target>`.
 
 | Your system | Archive |
