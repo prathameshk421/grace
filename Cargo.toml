@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast travel between your project folders, with tags for the AI tools you used there."
 license = "MIT"
+repository = "https://github.com/prathameshk421/grace"
 
 [[bin]]
 name = "grace"

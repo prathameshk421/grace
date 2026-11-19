@@ -8,13 +8,17 @@ In Elden Ring, you rest at a Site of Grace and fast travel to any grace you foun
 grace ❯ knn
 ★ ~/Documents/Practicals/AIMLL/KMeans        [claude]          12h
   ~/Documents/Practicals/AIMLL/KNN           [antigravity]      1d
-  /Volumes/SSD/Projects/Personal/grace       [claude]          now
+  ~/Projects/grace                           [claude]          now
 ↑↓ move · enter travel · esc cancel                          3/31
 ```
 
 ## Install
 
+You need Rust and zsh.
+
 ```sh
+git clone https://github.com/prathameshk421/grace
+cd grace
 cargo install --path .
 echo 'eval "$(grace init zsh)"' >> ~/.zshrc
 ```
@@ -47,6 +51,10 @@ Each command that takes a folder also accepts a path, for example `grace forget 
 Known tools: `claude`, `agy` / `antigravity`, `codex`, `gemini`, `cursor` / `cursor-agent`, `opencode`, `aider`, `copilot`, `amp`, `goose`, `crush`, `qwen`. To add one, edit `src/tools.rs`.
 
 grace never tracks `/` or your home folder.
+
+## Built with Claude
+
+I built grace with [Claude Code](https://claude.com/claude-code). Claude Opus planned the design, wrote the shared skeleton and reviewed every part. Three Claude Sonnet agents wrote the modules in parallel: storage and ranking, the picker, and the shell integration. I gave the idea, the feature list and the final checks.
 
 ## License
 
