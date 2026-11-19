@@ -127,32 +127,30 @@ fn time_ago(now: i64, then: i64) -> String {
     }
 }
 
-/// Each tool's tag uses the main color of its brand.
+/// Each tool's tag uses the main color of its logo. Colors come from the
+/// official logo files. A logo that is only black and white gets a light gray.
 fn tag_color(tool: &str) -> Color {
+    const MONO: Color = Color::Rgb(220, 220, 220);
     match tool {
         // AI tools
-        "claude" => Color::Rgb(217, 119, 87),      // Anthropic orange
-        "antigravity" => Color::Rgb(66, 133, 244), // Google blue
-        "gemini" => Color::Rgb(142, 117, 255),     // Gemini blue-violet
-        "codex" => Color::Rgb(16, 163, 127),       // OpenAI green
-        "cursor" => Color::Rgb(230, 230, 230),     // Cursor white
-        "opencode" => Color::Rgb(250, 178, 131),   // OpenCode peach
-        "aider" => Color::Rgb(20, 180, 80),        // Aider green
-        "copilot" => Color::Rgb(163, 113, 247),    // GitHub Copilot purple
-        "amp" => Color::Rgb(243, 78, 63),          // Amp red
-        "goose" => Color::Rgb(255, 214, 0),        // Goose yellow
-        "crush" => Color::Rgb(255, 95, 210),       // Charm pink
-        "qwen" => Color::Rgb(97, 92, 237),         // Qwen indigo
+        "claude" => Color::Rgb(217, 119, 87),      // #D97757 Claude orange
+        "codex" => Color::Rgb(177, 167, 255),      // #B1A7FF Codex lavender
+        "antigravity" => Color::Rgb(49, 134, 255), // #3186FF Antigravity blue
+        "gemini" => Color::Rgb(179, 129, 221),     // #B381DD Gemini CLI violet
+        "aider" => Color::Rgb(60, 230, 130),       // Aider terminal green
+        "amp" => Color::Rgb(230, 228, 205),        // Amp cream
+        "crush" => Color::Rgb(107, 80, 255),       // Charm purple
+        "qwen" => Color::Rgb(90, 120, 255),        // #082DFF Qwen blue, lighter
         "t3code" => Color::Rgb(196, 202, 212),     // T3 silver
+        "cursor" | "opencode" | "copilot" | "goose" => MONO,
         // Editors
         "vscode" => Color::Rgb(31, 156, 240),      // VS Code blue
         "vscodium" => Color::Rgb(70, 190, 230),    // VSCodium light blue
-        "windsurf" => Color::Rgb(88, 229, 187),    // Windsurf teal
-        "zed" => Color::Rgb(84, 140, 255),         // Zed blue
         "neovim" => Color::Rgb(87, 161, 67),       // Neovim green
         "vim" => Color::Rgb(1, 152, 51),           // Vim green
         "sublime" => Color::Rgb(255, 152, 0),      // Sublime orange
         "jetbrains" => Color::Rgb(255, 49, 140),   // JetBrains magenta
+        "windsurf" | "zed" => MONO,
         _ => Color::Gray,
     }
 }
