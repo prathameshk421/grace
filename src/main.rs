@@ -1,6 +1,7 @@
 mod db;
 mod import;
 mod import_editors;
+mod integrations;
 mod model;
 mod picker;
 mod platform;
@@ -186,6 +187,9 @@ enum HookCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Other CLIs (see src/integrations): NAME ARGS...
+    #[command(external_subcommand)]
+    Other(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -284,6 +288,27 @@ fn run_hook(agent: HookCmd) -> Result<()> {
                 forward_codex(chained, json);
             }
             return own.unwrap_or(Ok(()));
+        }
+        HookCmd::Other(argv) => {
+            let Some(integ) = argv.first().and_then(|n| integrations::find(n)) else {
+                return Ok(());
+            };
+            let mut input = String::new();
+            if integ.reads_stdin {
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
+                }
+            }
+            let res = (integ.hook)(&argv[1..], &input);
+            // The CLI may parse our stdout: print what it expects, even if our update fails.
+            if !integ.stdout.is_empty() {
+                println!("{}", integ.stdout);
+            }
+            let Some(status) = res.status else {
+                return Ok(());
+            };
+            (integ.tool, status, res.cwd)
         }
     };
     set_hook_status(tool, status, cwd)

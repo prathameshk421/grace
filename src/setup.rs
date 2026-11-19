@@ -39,19 +39,29 @@ pub fn run(target: &str, remove: bool) -> Result<()> {
             };
             eprintln!("{msg}");
         }
+        other if crate::integrations::find(other).is_some() => {
+            let integ = crate::integrations::find(other).unwrap();
+            eprintln!("{}", (integ.setup)(&exe_string()?, remove)?);
+        }
         other => {
             let hint = if other.to_ascii_lowercase().starts_with("t3") {
                 " T3 Code has no hook system; if it runs the Claude Code CLI, your Claude hooks already report its sessions."
             } else {
                 ""
             };
-            bail!("unknown target '{other}'. grace can set up: claude, codex.{hint}")
+            {
+                let names: Vec<&str> = ["claude", "codex"]
+                    .into_iter()
+                    .chain(crate::integrations::all().into_iter().map(|i| i.name))
+                    .collect();
+                bail!("unknown target '{other}'. grace can set up: {}.{hint}", names.join(", "))
+            }
         }
     }
     Ok(())
 }
 
-fn env_dir(var: &str, default_sub: &str) -> Result<PathBuf> {
+pub(crate) fn env_dir(var: &str, default_sub: &str) -> Result<PathBuf> {
     if let Ok(v) = std::env::var(var) {
         if !v.is_empty() {
             return Ok(PathBuf::from(v));
@@ -77,7 +87,7 @@ pub fn exe_string() -> Result<String> {
 }
 
 /// Quote a path for the shell when it has special characters.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     let plain = s
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "/_-.:\\+@%".contains(c));
@@ -96,7 +106,7 @@ fn claude_command(exe: &str) -> String {
 
 /// Write a file atomically: temp file in the same folder, then rename.
 /// Copy the old file to `<name>.grace-backup` once, before the first write.
-fn write_atomic(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let dir = path.parent().ok_or_else(|| anyhow!("bad path {}", path.display()))?;
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -115,7 +125,7 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
     })
 }
 
-fn read_opt(path: &Path) -> Result<Option<String>> {
+pub(crate) fn read_opt(path: &Path) -> Result<Option<String>> {
     match fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -123,7 +133,7 @@ fn read_opt(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn parse_settings(path: &Path, text: Option<&str>) -> Result<Value> {
+pub(crate) fn parse_settings(path: &Path, text: Option<&str>) -> Result<Value> {
     match text {
         None => Ok(json!({})),
         Some(t) if t.trim().is_empty() => Ok(json!({})),
@@ -542,7 +552,7 @@ mod tests {
     #[test]
     fn unknown_target_hint() {
         let e = run("t3code", false).unwrap_err().to_string();
-        assert!(e.contains("grace can set up: claude, codex.") && e.contains("T3 Code"));
+        assert!(e.contains("grace can set up: claude, codex, gemini") && e.contains("T3 Code"));
         let e = run("foo", false).unwrap_err().to_string();
         assert!(!e.contains("T3"));
     }
