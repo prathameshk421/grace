@@ -60,6 +60,8 @@ pub struct Sidebar<'a> {
     rows: Vec<Row>,
     selected: usize,
     offset: usize,
+    /// The list height of the last draw. A new height scrolls back to the top.
+    last_h: usize,
     /// The folder of this workspace.
     current: String,
     home: Option<String>,
@@ -80,6 +82,7 @@ impl<'a> Sidebar<'a> {
             rows: Vec::new(),
             selected: 0,
             offset: 0,
+            last_h: 0,
             current: current.to_string(),
             home,
             theme,
@@ -270,6 +273,12 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
     }
 
     let h = list.height as usize;
+    // The pane starts small and grows when tmux resizes it. Start from the top again,
+    // so the agents above the selected folder come back into view.
+    if h != sb.last_h {
+        sb.last_h = h;
+        sb.offset = 0;
+    }
     sb.offset = picker::scroll(&to_picker_rows(&sb.rows), sb.selected, sb.offset, h);
     let frame = (sb.start.elapsed().as_millis() / 100) as usize;
     let mut lines = Vec::new();
@@ -471,5 +480,16 @@ mod tests {
         // Very narrow still draws.
         let out = tui::render_text(14, 6, |f| draw(f, &mut sb));
         assert!(out.lines().all(|l| l.chars().count() == 14), "{out}");
+    }
+
+    #[test]
+    fn agents_show_after_the_pane_grows() {
+        let mut sb = sidebar(Box::new(|_, _| Ok(())));
+        // A tiny pane scrolls down to the selected folder, so the agents go out of view.
+        let small = tui::render_text(30, 5, |f| draw(f, &mut sb));
+        assert!(!small.contains("NEEDS YOU"), "{small}");
+        // When tmux makes the pane taller, the agents come back.
+        let tall = tui::render_text(30, 14, |f| draw(f, &mut sb));
+        assert!(tall.contains("NEEDS YOU") && tall.contains("notes"), "{tall}");
     }
 }

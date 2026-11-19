@@ -14,6 +14,9 @@ use std::process::{Command, Stdio};
 
 /// The tmux session that holds all workspaces.
 pub const SESSION: &str = "grace";
+/// Field separator in tmux `-F` output. tmux 3.6 and newer print a tab as "_",
+/// so grace uses printable text that no pane id, role or number contains.
+const SEP: &str = "|g|";
 const LAYOUT_KEY: &str = "hub.layout";
 const SIZES_KEY: &str = "hub.sizes";
 
@@ -79,6 +82,9 @@ pub enum Toggle {
     Zoom,
     /// Go to the sidebar (bring it back if hidden).
     Focus,
+    /// Give the sidebar and the right column their saved widths again. A tmux hook
+    /// runs it when the window changes size, so the main pane gets the new space.
+    Fit,
 }
 
 impl Toggle {
@@ -90,6 +96,7 @@ impl Toggle {
             "right" => Toggle::Right,
             "zoom" => Toggle::Zoom,
             "focus" => Toggle::Focus,
+            "fit" => Toggle::Fit,
             _ => return None,
         })
     }
@@ -128,7 +135,7 @@ impl Layout {
                 l.tree = on;
             }
             Toggle::Focus => l.sidebar = true,
-            Toggle::Zoom => {}
+            Toggle::Zoom | Toggle::Fit => {}
         }
         l
     }
@@ -440,11 +447,11 @@ pub fn tag_args(pane: &str, role: Role) -> Vec<String> {
     a
 }
 
-/// Parse `list-panes -F "#{pane_id}\t#{@grace_role}\t#{pane_width}\t#{pane_height}"`.
+/// Parse `list-panes -F "#{pane_id}|g|#{@grace_role}|g|#{pane_width}|g|#{pane_height}"`.
 pub fn parse_panes(out: &str) -> Vec<Pane> {
     out.lines()
         .filter_map(|l| {
-            let mut f = l.split('\t');
+            let mut f = l.split(SEP);
             let id = f.next()?.to_string();
             if !id.starts_with('%') {
                 return None;
@@ -599,6 +606,10 @@ pub fn conf_text(c: &ConfCtx) -> String {
         let sh = format!("{env} {exe} {cmd} '#{{window_id}}'");
         line(&format!("bind -T grace {key} run-shell -b {}", tmux_quote(&sh)));
     }
+    // tmux scales every pane when the window changes size. Keep the side panes at
+    // their saved widths, so the main pane gets the new space.
+    let fit = format!("{env} {exe} hub toggle fit '#{{window_id}}'");
+    line(&format!("set-hook -g window-resized {}", tmux_quote(&format!("run-shell -b {}", tmux_quote(&fit)))));
     line("bind -T grace q detach-client");
     line("bind -T grace C-g send-keys C-g");
     if at_least(3, 2) {
@@ -673,16 +684,16 @@ impl Tmux {
     }
 
     pub fn panes(&self, window: &str) -> Result<Vec<Pane>> {
-        let f = "#{pane_id}\t#{@grace_role}\t#{pane_width}\t#{pane_height}";
+        let f = "#{pane_id}|g|#{@grace_role}|g|#{pane_width}|g|#{pane_height}";
         Ok(parse_panes(&self.run(&["list-panes", "-t", window, "-F", f])?))
     }
 
     /// Workspaces as (window id, folder).
     pub fn windows(&self) -> Result<Vec<(String, String)>> {
-        let out = self.run(&["list-windows", "-t", &format!("={SESSION}"), "-F", "#{window_id}\t#{@grace_path}"])?;
+        let out = self.run(&["list-windows", "-t", &format!("={SESSION}"), "-F", "#{window_id}|g|#{@grace_path}"])?;
         Ok(out
             .lines()
-            .filter_map(|l| l.split_once('\t'))
+            .filter_map(|l| l.split_once(SEP))
             .filter(|(_, p)| !p.is_empty())
             .map(|(w, p)| (w.to_string(), p.to_string()))
             .collect())
@@ -779,10 +790,12 @@ fn window_name(path: &str) -> String {
 
 /// Tag a new window and its main pane, then add the stateless panes.
 fn setup_window(t: &Tmux, ids: &str, path: &str, layout: Layout, sizes: &Sizes) -> Result<String> {
-    let (win, pane) = ids.split_once('\t').context("unexpected tmux output")?;
+    let (win, pane) = ids.split_once(SEP).context("unexpected tmux output")?;
     t.run(&["set-option", "-w", "-t", win, "@grace_path", path])?;
     t.run(&tag_args(pane, Role::Main))?;
     apply(t, win, path, layout, sizes)?;
+    // In a small window the saved sizes may not leave room for the main pane.
+    fit(t, win, &t.panes(win)?, sizes);
     Ok(win.to_string())
 }
 
@@ -795,7 +808,7 @@ pub fn switch(t: &Tmux, db: &Db, path: &str, resume: Option<&str>) -> Result<Str
         Some(w) => w,
         None => {
             let (layout, sizes) = load_layout(db);
-            let mut args: Vec<String> = ["new-window", "-d", "-P", "-F", "#{window_id}\t#{pane_id}", "-t"]
+            let mut args: Vec<String> = ["new-window", "-d", "-P", "-F", "#{window_id}|g|#{pane_id}", "-t"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -865,7 +878,7 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
     } else {
         let (w, h) = term_size();
         let (layout, sizes) = load_layout(db);
-        let mut args: Vec<String> = ["-f", &conf_s, "new-session", "-d", "-s", SESSION, "-P", "-F", "#{window_id}\t#{pane_id}"]
+        let mut args: Vec<String> = ["-f", &conf_s, "new-session", "-d", "-s", SESSION, "-P", "-F", "#{window_id}|g|#{pane_id}"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -914,6 +927,10 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
             let main = main_pane(&panes).context("no main pane here")?;
             t.run(&["resize-pane", "-Z", "-t", &main.id])?;
         }
+        Toggle::Fit => {
+            let (_, sizes) = load_layout(db);
+            fit(t, &win, &panes, &sizes);
+        }
         Toggle::Focus => {
             if Layout::of(&panes).sidebar {
                 let sb = panes.iter().find(|p| p.role == Some(Role::Sidebar)).unwrap();
@@ -943,6 +960,46 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Columns for a tmux size ("30" or "40%") in a window `total` columns wide.
+fn cols(size: &str, total: u16) -> u16 {
+    match size.strip_suffix('%') {
+        Some(p) => (p.parse::<u32>().unwrap_or(0) * total as u32 / 100) as u16,
+        None => size.parse().unwrap_or(0),
+    }
+}
+
+/// Widths for the sidebar and the right column in a window `total` columns wide.
+/// The main pane keeps at least 40% of the window, so the side panes shrink in a small window.
+pub fn fit_widths(sizes: &Sizes, total: u16, sidebar: bool, right: bool) -> (u16, u16) {
+    let mut sb = if sidebar { cols(&sizes.sidebar, total).max(1) } else { 0 };
+    let mut rt = if right { cols(&sizes.right, total).max(1) } else { 0 };
+    let room = total.saturating_sub(total * 2 / 5 + 2);
+    if sb + rt > room && sb + rt > 0 {
+        let k = room as u32;
+        let sum = (sb + rt) as u32;
+        sb = (sb as u32 * k / sum) as u16;
+        rt = (rt as u32 * k / sum) as u16;
+    }
+    (sb, rt)
+}
+
+/// Set the sidebar width and the right column width to the saved sizes.
+fn fit(t: &Tmux, win: &str, panes: &[Pane], sizes: &Sizes) {
+    let total: u16 = t.run(&["display-message", "-p", "-t", win, "#{window_width}"]).ok().and_then(|w| w.parse().ok()).unwrap_or(0);
+    if total == 0 {
+        return;
+    }
+    let sb = panes.iter().find(|p| p.role == Some(Role::Sidebar));
+    let rt = panes.iter().find(|p| matches!(p.role, Some(Role::Diff) | Some(Role::Tree)));
+    let (w_sb, w_rt) = fit_widths(sizes, total, sb.is_some(), rt.is_some());
+    if let Some(p) = sb {
+        let _ = t.run(&["resize-pane", "-t", &p.id, "-x", &w_sb.max(1).to_string()]);
+    }
+    if let Some(p) = rt {
+        let _ = t.run(&["resize-pane", "-t", &p.id, "-x", &w_rt.max(1).to_string()]);
+    }
 }
 
 /// `grace hub shell`: the main pane. Runs the user's shell, and closes the
@@ -981,13 +1038,13 @@ pub fn glyph(s: crate::model::Status, frame: usize) -> String {
 
 /// Show the agent status of each workspace in the status bar. One tmux call when something changed.
 fn sync_glyphs(t: &Tmux, best: &crate::picker::Best, frame: usize) {
-    let f = "#{window_id}\t#{@grace_path}\t#{@grace_glyph}";
+    let f = "#{window_id}|g|#{@grace_path}|g|#{@grace_glyph}";
     let Ok(out) = t.run(&["list-windows", "-t", &format!("={SESSION}"), "-F", f]) else {
         return;
     };
     let mut args: Vec<String> = Vec::new();
     for l in out.lines() {
-        let mut parts = l.split('\t');
+        let mut parts = l.split(SEP);
         let (Some(w), Some(p)) = (parts.next(), parts.next()) else { continue };
         let have = parts.next().unwrap_or("");
         let want = best.get(p).map(|s| glyph(s.status, frame)).unwrap_or_default();
@@ -1224,7 +1281,7 @@ mod tests {
 
     #[test]
     fn panes_parse() {
-        let p = parse_panes("%1\tmain\t100\t50\n%2\t\t80\t20\nbad line\n%3\tsidebar\t30\t50");
+        let p = parse_panes("%1|g|main|g|100|g|50\n%2|g||g|80|g|20\nbad line\n%3|g|sidebar|g|30|g|50");
         assert_eq!(p.len(), 3);
         assert_eq!(p[1].role, None);
         assert_eq!(p[2], pane("%3", Some(Role::Sidebar), 30, 50));
@@ -1305,5 +1362,20 @@ mod tests {
         assert_eq!(Toggle::parse("nope"), None);
         assert!(is_shell("zsh") && is_shell("-bash") && !is_shell("claude"));
         assert!(keys_line().contains("s sidebar"));
+    }
+
+    #[test]
+    fn fit_keeps_room_for_main() {
+        let d = Sizes::default();
+        // Wide window: the saved sizes as they are.
+        assert_eq!(fit_widths(&d, 200, true, true), (30, 80));
+        // Narrow window: the side panes shrink, the main pane keeps at least 40%.
+        let (sb, rt) = fit_widths(&d, 80, true, true);
+        assert!(80 - sb - rt >= 32, "{sb} {rt}");
+        // Hidden panes take no space.
+        assert_eq!(fit_widths(&d, 200, false, true), (0, 80));
+        let big = Sizes { sidebar: "74".into(), right: "65".into(), diff: 60 };
+        let (sb, rt) = fit_widths(&big, 120, true, true);
+        assert!(120 - sb - rt >= 48, "{sb} {rt}");
     }
 }
