@@ -12,7 +12,7 @@
 ![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 [![Built with Claude Opus 5.5](https://img.shields.io/badge/Built%20with-Claude%20Opus%205.5-D97757?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
 
-[Install](#install) · [Hub](#the-hub) · [Usage](#usage) · [Tools](#tools-and-import-sources) · [How it works](#how-it-works)
+[Quick start](#quick-start) · [Hub](#the-hub) · [Install](#install) · [Usage](#usage) · [Tools](#tools-and-import-sources) · [How it works](#how-it-works)
 
 <br>
 
@@ -25,6 +25,26 @@
 You have projects on many disks. You forget where they are. You switch between AI tools and lose track of which one you used where. grace remembers for you.
 
 In Elden Ring, you rest at a Site of Grace and fast travel to any grace you found. grace does the same for your terminal.
+
+## Quick start
+
+**1. Install.** Pick the line for your system.
+
+| System | Command |
+|---|---|
+| Linux, macOS | `curl -fsSL https://raw.githubusercontent.com/prathameshk421/grace/main/install.sh \| sh` |
+| Windows (PowerShell) | `irm https://raw.githubusercontent.com/prathameshk421/grace/main/install.ps1 \| iex` |
+| Homebrew (macOS, Linux) | `brew install prathameshk421/grace/grace` |
+
+**2. Connect your shell.** The installer prints the line for your shell. For zsh:
+
+```sh
+echo 'eval "$(grace init zsh)"' >> ~/.zshrc
+```
+
+**3. Open a new terminal and type `grace`.** The first run imports your Claude Code and editor history, so your list is full on day one.
+
+Other shells, downloads and source builds are in [Install](#install).
 
 ## Highlights
 
@@ -51,19 +71,9 @@ grace knn      # one match: go there now
 
 `grace hub` opens one terminal window for all your projects. It is built on tmux.
 
-```
-╭ grace ──────────────╮ ~/code/knn                  │ diff ──────────────────
-│ ❯ filter            │ $ claude                    │ M src/main.rs
-│ NEEDS YOU           │                             │ ?? notes.md
-│ ● svm         codex │                             │ @@ -1,3 +1,4 @@
-│ WORKING             │                             │ -old line
-│ ⠋ knn        claude │                             │ +new line
-│ FOLDERS             │                             │ tree ──────────────────
-│ api-server   cursor │                             │ ▾ src                •
-│ notes               │                             │     main.rs          M
-╰ enter go · ctrl-o … ╯                             │   README.md
- grace  1 knn ⠋  2 svm ●                                          ctrl-g ? keys
-```
+<p align="center">
+  <img src="assets/hub.svg" alt="The grace hub. The sidebar lists agents by status, then folders. The middle pane is a shell. A live diff and a file tree fill the right side." width="100%">
+</p>
 
 - **Left:** the sidebar. Live agents come first, grouped by status. Your folders follow, best first. Type to filter.
 - **Middle:** your own shell in the folder. Run claude, codex or any CLI as usual.
@@ -120,6 +130,13 @@ grace runs tmux on its own server (`tmux -L grace`) with its own config file. Yo
 ### Diff and tree without the hub
 
 `grace diff` and `grace tree` also work on their own, on all three systems.
+
+<table>
+  <tr>
+    <td width="64%"><img src="assets/diff.svg" alt="grace diff. Changed files on the left, the colored diff of the selected file on the right." width="100%"></td>
+    <td width="36%"><img src="assets/tree.svg" alt="grace tree. The files of the folder, with M for modified and A for added files." width="100%"></td>
+  </tr>
+</table>
 
 ```sh
 grace diff     # changed files and a colored diff. j/k move, tab switches focus, q quits.
@@ -222,11 +239,25 @@ grace stores everything in a local SQLite file. It sends nothing over the networ
 
 ## Install
 
-### macOS and Linux
+### Linux
+
+Works on x86_64 and ARM64. No root needed.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/prathameshk421/grace/main/install.sh | sh
 ```
+
+The script finds your CPU, downloads the latest release, checks its SHA-256 sum and puts `grace` in `~/.local/bin`. If that folder is not on your PATH, the script tells you the line to add. Set `GRACE_INSTALL_DIR` for another folder, or `GRACE_VERSION` for an older release.
+
+### macOS
+
+Use the same script as on Linux, or Homebrew:
+
+```sh
+brew install prathameshk421/grace/grace
+```
+
+Homebrew prints a short intro and the setup steps after the install. Run `brew upgrade grace` to update.
 
 ### Windows (PowerShell)
 
@@ -235,12 +266,6 @@ irm https://raw.githubusercontent.com/prathameshk421/grace/main/install.ps1 | ie
 ```
 
 ### Other ways
-
-**Homebrew** (macOS and Linux).
-
-```sh
-brew install prathameshk421/grace/grace
-```
 
 **Download.** Get the archive for your system from the [Releases page](https://github.com/prathameshk421/grace/releases/latest). Asset names have the form `grace-<version>-<target>`.
 
@@ -285,6 +310,13 @@ cargo install --git https://github.com/prathameshk421/grace
 | bash | `eval "$(grace init bash)"` | `~/.bashrc` |
 | fish | `grace init fish \| source` | `~/.config/fish/config.fish` |
 | PowerShell | `Invoke-Expression (& grace init powershell \| Out-String)` | `$PROFILE` |
+
+### Uninstall
+
+1. Remove the `grace init` line from your shell file.
+2. If you ran `grace setup`, run `grace setup <cli> --remove` for each CLI.
+3. Remove the program: `brew uninstall grace`, or delete `~/.local/bin/grace`. On Windows, delete `%LOCALAPPDATA%\grace\bin\grace.exe`.
+4. Optional: delete your data, `~/.local/share/grace` (Windows: `%LOCALAPPDATA%\grace`).
 
 ## Usage
 
@@ -334,6 +366,7 @@ With `all`, grace skips sources it cannot find. With a named source, it prints "
 - **Storage.** One SQLite file: `$GRACE_DATA_DIR`, else `$XDG_DATA_HOME/grace`, else `~/.local/share/grace/grace.db`.
 - **Imports.** grace opens editor databases read-only. It never tracks `/` or your home folder.
 - **Hub.** grace writes `tmux.conf` next to its database at each `grace hub` start. Each pane has a role (sidebar, diff, tree). `ctrl-g` keys run `grace hub toggle`, which removes a pane or splits it back. Sidebar, diff and tree hold no state, so a new copy is the same as the old one.
+- **Screenshots.** The images in this README are real captures, not mockups. `scripts/screens.sh` runs grace on demo data in a private tmux server and turns each screen into an SVG.
 
 ## Built with Claude
 
