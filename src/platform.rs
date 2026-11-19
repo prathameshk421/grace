@@ -67,6 +67,39 @@ pub fn same_path(a: &str, b: &str) -> bool {
     }
 }
 
+/// Folders we never track: filesystem roots (`/`, `C:\`) and the home folder.
+pub fn ignored(path: &str) -> bool {
+    if path.is_empty() || is_root(path) {
+        return true;
+    }
+    match home_dir() {
+        Some(h) => same_path(path, &clean_path_str(&h.to_string_lossy())),
+        None => false,
+    }
+}
+
+/// Pick the folder to tag. `cwd` is where the command ran. `target` is the first
+/// non-flag argument. A leading `~` means home. A relative target is relative to `cwd`.
+/// Existing folder: that folder. Existing file or anything else: `cwd`.
+pub fn tag_target(cwd: &str, target: Option<&str>) -> String {
+    let Some(t) = target.map(str::trim).filter(|t| !t.is_empty()) else {
+        return cwd.to_string();
+    };
+    let mut p = PathBuf::from(t);
+    if t == "~" || t.starts_with("~/") || t.starts_with("~\\") {
+        match home_dir() {
+            Some(h) => p = h.join(t[1..].trim_start_matches(['/', '\\'])),
+            None => return cwd.to_string(),
+        }
+    }
+    let full = Path::new(cwd).join(p);
+    if full.is_dir() {
+        normalize(&full)
+    } else {
+        cwd.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +121,21 @@ mod tests {
         assert!(is_root("d:"));
         assert!(!is_root(r"C:\x"));
         assert!(!is_root("/x"));
+    }
+
+    #[test]
+    fn tag_target_resolution() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = normalize(d.path());
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        std::fs::write(d.path().join("f.txt"), "x").unwrap();
+        let sub = normalize(&d.path().join("sub"));
+        assert_eq!(tag_target(&cwd, None), cwd);
+        assert_eq!(tag_target(&cwd, Some("")), cwd);
+        assert_eq!(tag_target(&cwd, Some("sub")), sub);
+        assert_eq!(tag_target(&cwd, Some("./sub/")), sub);
+        assert_eq!(tag_target(&cwd, Some(&sub)), sub);
+        assert_eq!(tag_target(&cwd, Some("f.txt")), cwd);
+        assert_eq!(tag_target(&cwd, Some("missing")), cwd);
     }
 }

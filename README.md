@@ -4,7 +4,7 @@
 
 Fast travel between your project folders.
 
-In Elden Ring, you rest at a Site of Grace and fast travel to any grace you found before. `grace` does the same for your terminal. It records every folder you `cd` into, and it tags each folder with the AI tools you ran there (`[claude]`, `[antigravity]`, `[codex]` and more). Type `grace`, choose a folder, and your shell goes there.
+In Elden Ring, you rest at a Site of Grace and fast travel to any grace you found before. `grace` does the same for your terminal. It records every folder you `cd` into, and it tags each folder with the AI tools and editors you used there (`[claude]`, `[vscode]`, `[zed]` and more). Type `grace`, choose a folder, and your shell goes there.
 
 ```
 grace ❯ knn
@@ -66,7 +66,7 @@ Add one line to your shell config.
 | fish | `grace init fish \| source` | `~/.config/fish/config.fish` |
 | PowerShell | `Invoke-Expression (& grace init powershell \| Out-String)` | `$PROFILE` |
 
-Open a new terminal. On the first run, grace imports the folders from your Claude Code history (`~/.claude.json`).
+Open a new terminal. On the first run, grace imports folders from your Claude Code history (`~/.claude.json`) and from your editors.
 
 ## Use
 
@@ -79,9 +79,25 @@ Open a new terminal. On the first run, grace imports the folders from your Claud
 | `grace list` | Print all folders, best first. |
 | `grace pin` / `grace unpin` | Keep the current folder at the top (or remove the pin). |
 | `grace forget` | Remove the current folder from grace. |
-| `grace import` | Import Claude Code history again. |
+| `grace import [source]` | Import history again. Sources: `all` (default), `claude`, `vscode`, `cursor`, `windsurf`, `antigravity`, `zed`. |
+| `grace tag <path> <tool> [target]` | Record a tool run. The shell hook calls this. |
 
 Each command that takes a folder also accepts a path, for example `grace forget ~/old-project`.
+
+## Import
+
+`grace import` reads the recent folders of your editors and prints one line per source, for example `vscode: 12 folders`.
+
+- `claude`: `~/.claude.json`.
+- `vscode`: VS Code, VS Code Insiders and VSCodium.
+- `cursor`, `windsurf`, `antigravity`: the VS Code family editors of the same name.
+- `zed`: the Zed workspace database.
+
+With `all`, grace skips sources it cannot find. With a named source, it prints "not found". grace opens editor databases read-only. It never changes your editor data. Remote folders are skipped.
+
+## Folder argument
+
+If you type `code ~/other` in `~/a`, grace tags `~/other`, not `~/a`. grace takes the first argument that does not start with `-`. A leading `~` and relative paths work. If the argument is a file or does not exist, grace tags the current folder.
 
 ## Add your own AI tool
 
@@ -101,12 +117,16 @@ Names use letters, digits, `.`, `_` and `-`, and are at most 64 characters long.
 ## How it works
 
 - A zsh `chpwd` hook runs `grace add "$PWD"` in the background each time you change folder.
-- A zsh `preexec` hook checks the first word of each command. For a known AI tool, it runs `grace tag`. For other commands, it starts no process.
+- A zsh `preexec` hook checks the first word of each command. For a known tool, it runs `grace tag` with the folder argument, if there is one. For other commands, it starts no process.
 - Folders rank by frecency: visits and AI tool runs, weighted by how recent they are. Pinned folders come first.
 - Folders that no longer exist (for example, on an unplugged SSD) are hidden, not deleted.
 - Data lives in one SQLite file: `$GRACE_DATA_DIR`, else `$XDG_DATA_HOME/grace`, else `~/.local/share/grace/grace.db`.
 
-Known tools: `claude`, `agy` / `antigravity`, `codex`, `gemini`, `cursor` / `cursor-agent`, `opencode`, `aider`, `copilot`, `amp`, `goose`, `crush`, `qwen`. To add one, run `grace tool add`.
+Known AI tools: `claude`, `agy` / `antigravity`, `codex`, `gemini`, `cursor` / `cursor-agent`, `opencode`, `aider`, `copilot`, `amp`, `goose`, `crush`, `qwen`.
+
+Known editors: `code` and `code-insiders` (tag `vscode`), `codium`, `windsurf`, `zed`, `nvim` (tag `neovim`), `vim`, `subl` (tag `sublime`), `idea`, `pycharm` and `webstorm` (tag `jetbrains`).
+
+`grace tool list` shows the kind of each tool: ai, editor or custom. To add a tool, run `grace tool add`.
 
 grace never tracks `/` or your home folder.
 

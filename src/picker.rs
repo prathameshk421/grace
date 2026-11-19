@@ -85,6 +85,14 @@ fn tag_color(tool: &str) -> Color {
         "codex" => Color::Green,
         "gemini" => Color::Magenta,
         "cursor" => Color::Cyan,
+        "vscode" => Color::Rgb(0, 122, 204),
+        "vscodium" => Color::Rgb(70, 190, 230),
+        "windsurf" => Color::Rgb(0, 200, 170),
+        "zed" => Color::Rgb(255, 140, 40),
+        "neovim" => Color::LightGreen,
+        "vim" => Color::Rgb(1, 152, 51),
+        "sublime" => Color::LightYellow,
+        "jetbrains" => Color::Rgb(255, 80, 140),
         _ => Color::Gray,
     }
 }

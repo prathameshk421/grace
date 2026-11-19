@@ -1,5 +1,6 @@
 mod db;
 mod import;
+mod import_editors;
 mod model;
 mod picker;
 mod platform;
@@ -34,7 +35,13 @@ enum Cmd {
     /// Record a visit to a folder (the shell hook calls this).
     Add { path: PathBuf },
     /// Record that an AI tool ran in a folder (the shell hook calls this).
-    Tag { path: PathBuf, tool: String },
+    Tag {
+        /// The folder where the command ran.
+        path: PathBuf,
+        tool: String,
+        /// Folder argument of the command. Relative to <path>. Used only if it is a folder.
+        target: Option<String>,
+    },
     /// Print tracked folders, best first.
     List {
         #[arg(short, long)]
@@ -46,8 +53,12 @@ enum Cmd {
     Unpin { path: Option<PathBuf> },
     /// Remove a folder from grace. Default: the current folder.
     Forget { path: Option<PathBuf> },
-    /// Import folders from Claude Code history (~/.claude.json).
-    Import,
+    /// Import folders from Claude Code history and editor history (read-only).
+    Import {
+        /// Where to import from. Default: all.
+        #[arg(default_value = "all", value_parser = clap::builder::PossibleValuesParser::new(import_editors::SOURCES))]
+        source: String,
+    },
     /// Add, remove or list AI tools.
     Tool {
         #[command(subcommand)]
@@ -75,7 +86,7 @@ enum ToolCmd {
     },
     /// Remove a custom tool. Built-in tools cannot be removed.
     Rm { command: String },
-    /// Print all tools: command, tag, launch command, and built-in or custom.
+    /// Print all tools: command, tag, launch command, and kind (ai, editor or custom).
     List,
 }
 
@@ -87,17 +98,6 @@ fn resolve(path: Option<PathBuf>) -> Result<String> {
         None => std::env::current_dir()?,
     };
     Ok(platform::normalize(&p))
-}
-
-/// Folders we never track: filesystem roots (`/`, `C:\`) and the home folder.
-fn ignored(path: &str) -> bool {
-    if path.is_empty() || platform::is_root(path) {
-        return true;
-    }
-    match platform::home_dir() {
-        Some(h) => platform::same_path(path, &platform::clean_path_str(&h.to_string_lossy())),
-        None => false,
-    }
 }
 
 fn load(db: &db::Db, reg: &tools::Registry, tag: Option<&str>) -> Result<Vec<model::Entry>> {
@@ -116,8 +116,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let (db, fresh) = db::Db::open_default()?;
     if fresh {
-        // First run: fill the list from Claude Code history.
-        let _ = import::import_claude(&db);
+        // First run: fill the list from Claude Code and editor history.
+        let _ = import_editors::import_all(&db);
     }
     let now = model::now();
     let reg = tools::Registry::from_db(&db)?;
@@ -141,13 +141,14 @@ fn main() -> Result<()> {
         }
         Cmd::Add { path } => {
             let p = resolve(Some(path))?;
-            if !ignored(&p) {
+            if !platform::ignored(&p) {
                 db.record_visit(&p, now)?;
             }
         }
-        Cmd::Tag { path, tool } => {
-            let p = resolve(Some(path))?;
-            if !ignored(&p) {
+        Cmd::Tag { path, tool, target } => {
+            let cwd = resolve(Some(path))?;
+            let p = platform::tag_target(&cwd, target.as_deref());
+            if !platform::ignored(&p) {
                 db.record_tool(&p, &reg.normalize_tag(&tool), now)?;
             }
         }
@@ -166,9 +167,17 @@ fn main() -> Result<()> {
         Cmd::Pin { path } => db.set_pinned(&resolve(path)?, true)?,
         Cmd::Unpin { path } => db.set_pinned(&resolve(path)?, false)?,
         Cmd::Forget { path } => db.forget(&resolve(path)?)?,
-        Cmd::Import => {
-            let n = import::import_claude(&db)?;
-            eprintln!("imported {n} folders from Claude Code history");
+        Cmd::Import { source } => {
+            if source == "all" {
+                for (name, n) in import_editors::import_all(&db) {
+                    println!("{name}: {n} folders");
+                }
+            } else {
+                match import_editors::import_source(&db, &source) {
+                    Some(n) => println!("{source}: {n} folders"),
+                    None => println!("{source}: not found"),
+                }
+            }
         }
         Cmd::Tool { action } => match action {
             ToolCmd::Add { command, tag, launch } => {
@@ -181,7 +190,7 @@ fn main() -> Result<()> {
             ToolCmd::Rm { command } => {
                 if db.remove_tool(&command)? {
                     eprintln!("removed {command}. Open a new terminal (or run: exec zsh) to stop tracking it.");
-                } else if tools::TOOLS.iter().any(|(c, _)| c.eq_ignore_ascii_case(&command)) {
+                } else if tools::TOOLS.iter().any(|(c, ..)| c.eq_ignore_ascii_case(&command)) {
                     bail!("{command} is a built-in tool and cannot be removed");
                 } else {
                     bail!("no custom tool named {command}");
@@ -189,8 +198,7 @@ fn main() -> Result<()> {
             }
             ToolCmd::List => {
                 for t in reg.tools() {
-                    let kind = if t.builtin { "built-in" } else { "custom" };
-                    println!("{:<16} {:<16} {:<24} {}", t.command, t.tag, t.launch, kind);
+                    println!("{:<16} {:<16} {:<24} {}", t.command, t.tag, t.launch, t.kind_label());
                 }
             }
         },

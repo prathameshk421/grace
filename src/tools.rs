@@ -2,42 +2,52 @@
 
 use anyhow::{bail, Result};
 
-/// (command name the user types, canonical tag)
-pub const TOOLS: &[(&str, &str)] = &[
-    ("claude", "claude"),
-    ("agy", "antigravity"),
-    ("antigravity", "antigravity"),
-    ("codex", "codex"),
-    ("gemini", "gemini"),
-    ("cursor", "cursor"),
-    ("cursor-agent", "cursor"),
-    ("opencode", "opencode"),
-    ("aider", "aider"),
-    ("copilot", "copilot"),
-    ("amp", "amp"),
-    ("goose", "goose"),
-    ("crush", "crush"),
-    ("qwen", "qwen"),
-];
-
-/// The built-in launch command for a canonical tag.
-fn builtin_launch(tag: &str) -> Option<&'static str> {
-    Some(match tag {
-        "claude" => "claude",
-        "antigravity" => "agy",
-        "codex" => "codex",
-        "gemini" => "gemini",
-        "cursor" => "cursor-agent",
-        "opencode" => "opencode",
-        "aider" => "aider",
-        "copilot" => "copilot",
-        "amp" => "amp",
-        "goose" => "goose",
-        "crush" => "crush",
-        "qwen" => "qwen",
-        _ => return None,
-    })
+/// What a built-in tool is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Kind {
+    Ai,
+    Editor,
 }
+
+impl Kind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Ai => "ai",
+            Kind::Editor => "editor",
+        }
+    }
+}
+
+use Kind::{Ai, Editor};
+
+/// (command name the user types, canonical tag, launch command, kind)
+pub const TOOLS: &[(&str, &str, &str, Kind)] = &[
+    ("claude", "claude", "claude", Ai),
+    ("agy", "antigravity", "agy", Ai),
+    ("antigravity", "antigravity", "agy", Ai),
+    ("codex", "codex", "codex", Ai),
+    ("gemini", "gemini", "gemini", Ai),
+    ("cursor", "cursor", "cursor-agent", Ai),
+    ("cursor-agent", "cursor", "cursor-agent", Ai),
+    ("opencode", "opencode", "opencode", Ai),
+    ("aider", "aider", "aider", Ai),
+    ("copilot", "copilot", "copilot", Ai),
+    ("amp", "amp", "amp", Ai),
+    ("goose", "goose", "goose", Ai),
+    ("crush", "crush", "crush", Ai),
+    ("qwen", "qwen", "qwen", Ai),
+    ("code", "vscode", "code .", Editor),
+    ("code-insiders", "vscode", "code-insiders .", Editor),
+    ("codium", "vscodium", "codium .", Editor),
+    ("windsurf", "windsurf", "windsurf .", Editor),
+    ("zed", "zed", "zed .", Editor),
+    ("nvim", "neovim", "nvim", Editor),
+    ("vim", "vim", "vim", Editor),
+    ("subl", "sublime", "subl .", Editor),
+    ("idea", "jetbrains", "idea .", Editor),
+    ("pycharm", "jetbrains", "pycharm .", Editor),
+    ("webstorm", "jetbrains", "webstorm .", Editor),
+];
 
 /// A command or tag name: `[A-Za-z0-9._-]`, starts with a letter or digit, max 64 chars.
 /// The command name goes into a zsh `case` pattern, so this check is a security check.
@@ -76,7 +86,14 @@ pub struct Tool {
     pub command: String,
     pub tag: String,
     pub launch: String,
-    pub builtin: bool,
+    /// None for custom tools.
+    pub kind: Option<Kind>,
+}
+
+impl Tool {
+    pub fn kind_label(&self) -> &'static str {
+        self.kind.map_or("custom", Kind::label)
+    }
 }
 
 /// Built-in tools plus custom tools from the database.
@@ -95,17 +112,17 @@ impl Registry {
                 command: c.clone(),
                 tag: t.to_lowercase(),
                 launch: l.clone(),
-                builtin: false,
+                kind: None,
             })
             .collect();
         let mut tools: Vec<Tool> = TOOLS
             .iter()
-            .filter(|(cmd, _)| !custom.iter().any(|c| c.command.eq_ignore_ascii_case(cmd)))
-            .map(|(cmd, tag)| Tool {
+            .filter(|(cmd, ..)| !custom.iter().any(|c| c.command.eq_ignore_ascii_case(cmd)))
+            .map(|(cmd, tag, launch, kind)| Tool {
                 command: cmd.to_string(),
                 tag: tag.to_string(),
-                launch: builtin_launch(tag).unwrap_or(cmd).to_string(),
-                builtin: true,
+                launch: launch.to_string(),
+                kind: Some(*kind),
             })
             .collect();
         tools.extend(custom);
@@ -136,7 +153,8 @@ impl Registry {
         self.tools
             .iter()
             .rev()
-            .find(|t| t.tag == tag)
+            .find(|t| t.tag == tag && t.kind.is_none())
+            .or_else(|| self.tools.iter().find(|t| t.tag == tag))
             .map(|t| t.launch.clone())
     }
 
@@ -160,6 +178,18 @@ mod tests {
         assert_eq!(r.normalize_tag("AGY"), "antigravity");
         assert_eq!(r.normalize_tag(" cursor-agent "), "cursor");
         assert_eq!(r.normalize_tag("Foo"), "foo");
+    }
+
+    #[test]
+    fn editors() {
+        let r = Registry::new(&[]);
+        assert_eq!(r.normalize_tag("code"), "vscode");
+        assert_eq!(r.normalize_tag("pycharm"), "jetbrains");
+        assert_eq!(r.launch_command("vscode").as_deref(), Some("code ."));
+        assert_eq!(r.launch_command("neovim").as_deref(), Some("nvim"));
+        assert_eq!(r.launch_command("jetbrains").as_deref(), Some("idea ."));
+        let t = r.tools().iter().find(|t| t.command == "zed").unwrap();
+        assert_eq!(t.kind_label(), "editor");
     }
 
     #[test]

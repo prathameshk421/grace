@@ -10,15 +10,26 @@ const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
   }
 
   __grace_preexec() {
-    local w
-    for w in ${(z)1}; do
+    local w a tgt i
+    local -a ws
+    ws=(${(z)1})
+    for (( i = 1; i <= $#ws; i++ )); do
+      w=${ws[i]}
       case $w in
         [A-Za-z_]*=*|sudo|command|nohup|exec|time|env|noglob) continue ;;
       esac
+      w=${(Q)w}
       w=${w:t}
       case $w in
         @TOOLS@)
-          command grace tag "$PWD" "$w" &>/dev/null &!
+          tgt=
+          for a in "${(@)ws[i+1,-1]}"; do
+            a=${(Q)a}
+            [[ $a == -* ]] && continue
+            tgt=$a
+            break
+          done
+          command grace tag "$PWD" "$w" ${tgt:+"$tgt"} &>/dev/null &!
           ;;
       esac
       break
@@ -61,7 +72,7 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
 
   __grace_hook() {
     local rc=$?
-    local line num rest w
+    local line num rest w a tgt i
     local -a words
     if [[ $PWD != "$__GRACE_LAST_PWD" ]]; then
       __GRACE_LAST_PWD=$PWD
@@ -76,14 +87,23 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
     if [[ -n $num && $num != "$__GRACE_LAST_HIST" ]]; then
       __GRACE_LAST_HIST=$num
       read -ra words <<<"$rest"
-      for w in "${words[@]}"; do
+      for ((i = 0; i < ${#words[@]}; i++)); do
+        w=${words[i]}
         case $w in
           [A-Za-z_]*=*|sudo|command|nohup|exec|time|env) continue ;;
         esac
         w=${w##*/}
         case $w in
           @TOOLS@)
-            (command grace tag "$PWD" "$w" &>/dev/null &)
+            tgt=
+            for a in "${words[@]:i+1}"; do
+              a=${a#[\"\']}
+              a=${a%[\"\']}
+              [[ -z $a || $a == -* ]] && continue
+              tgt=$a
+              break
+            done
+            (command grace tag "$PWD" "$w" ${tgt:+"$tgt"} &>/dev/null &)
             ;;
         esac
         break
@@ -141,8 +161,10 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
     end
 
     function __grace_preexec --on-event fish_preexec
-        for w in (string split ' ' -- $argv[1])
-            test -n "$w"; or continue
+        set -l ws (string split -n ' ' -- $argv[1])
+        set -l n (count $ws)
+        for i in (seq $n)
+            set -l w $ws[$i]
             switch $w
                 case sudo command nohup exec time env
                     continue
@@ -153,7 +175,17 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
             set -l base (string replace -r '^.*/' '' -- $w)
             switch $base
                 case @TOOLS@
-                    command grace tag $PWD $base >/dev/null 2>&1 &
+                    set -l tgt
+                    if test $i -lt $n
+                        for a in $ws[(math $i + 1)..-1]
+                            set a (string trim -c "\"'" -- $a)
+                            test -n "$a"; or continue
+                            string match -q -- '-*' $a; and continue
+                            set tgt $a
+                            break
+                        end
+                    end
+                    command grace tag $PWD $base $tgt >/dev/null 2>&1 &
                     disown 2>/dev/null
             end
             break
@@ -214,11 +246,20 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
           $h = Get-History -Count 1 -ErrorAction SilentlyContinue
           if ($h -and $h.Id -ne $global:__GraceLastId) {
             $global:__GraceLastId = $h.Id
-            foreach ($w in ($h.CommandLine.Trim() -split '\s+')) {
+            $ws = @($h.CommandLine.Trim() -split '\s+')
+            for ($i = 0; $i -lt $ws.Count; $i++) {
+              $w = $ws[$i]
               if ($w -eq '&' -or $w -eq '') { continue }
               $w = $w.Trim('"', "'") -replace '^.*[\\/]', '' -replace '\.(exe|cmd|ps1|bat)$', ''
               if ($global:__GraceTools -contains $w) {
-                & $exe tag $cwd $w *> $null
+                $tgt = $null
+                for ($j = $i + 1; $j -lt $ws.Count; $j++) {
+                  $a = $ws[$j].Trim('"', "'")
+                  if ($a -eq '' -or $a.StartsWith('-')) { continue }
+                  $tgt = $a
+                  break
+                }
+                if ($tgt) { & $exe tag $cwd $w $tgt *> $null } else { & $exe tag $cwd $w *> $null }
               }
               break
             }
@@ -331,6 +372,7 @@ mod tests {
             assert!(s.contains("kiro"), "{sh:?}");
             assert!(!s.contains("rm -rf"), "{sh:?}");
             assert!(!s.contains("@TOOLS@"), "{sh:?}");
+            assert!(s.contains("tgt"), "{sh:?}");
         }
     }
 

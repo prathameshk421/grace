@@ -19,13 +19,14 @@ pub fn claude_project_paths(json: &str) -> Vec<String> {
     }
 }
 
-pub fn import_claude(db: &Db) -> Result<usize> {
+/// Import folders from `~/.claude.json`. `None` means the file does not exist.
+pub fn import_claude(db: &Db) -> Result<Option<usize>> {
     let Some(home) = crate::platform::home_dir() else {
-        return Ok(0);
+        return Ok(None);
     };
     let home = crate::platform::clean_path_str(&home.to_string_lossy());
     let Ok(text) = std::fs::read_to_string(Path::new(&home).join(".claude.json")) else {
-        return Ok(0);
+        return Ok(None);
     };
     let mut count = 0;
     for path in claude_project_paths(&text) {
@@ -44,11 +45,10 @@ pub fn import_claude(db: &Db) -> Result<usize> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or_else(model::now);
-        if db.import_dir(&path, ts, Some("claude"))? {
-            count += 1;
-        }
+        db.import_dir(&path, ts, Some("claude"))?;
+        count += 1;
     }
-    Ok(count)
+    Ok(Some(count))
 }
 
 #[cfg(test)]
