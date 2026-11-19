@@ -21,19 +21,26 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
-      - name: Install zsh and fish
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zsh fish
-      - name: Check shell init scripts
-        if: runner.os == 'Linux'
+      # macOS has zsh and bash built in, so this needs no install.
+      - name: Check zsh and bash init scripts
+        if: runner.os == 'macOS'
         run: |
           ./target/debug/grace init bash > init.bash
           ./target/debug/grace init zsh > init.zsh
-          ./target/debug/grace init fish > init.fish
           bash -n init.bash
           zsh -n init.zsh
-          fish --no-execute init.fish
+      # The fish static binary downloads in seconds. apt took 2 to 5 minutes.
+      - name: Check fish init script
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo fish-shell/fish-shell --pattern 'fish-*-linux-x86_64.tar.xz' -O fish.tar.xz
+          mkdir fishbin && tar -xJf fish.tar.xz -C fishbin
+          ./target/debug/grace init fish > init.fish
+          "$(find fishbin -name fish -type f | head -1)" --no-execute init.fish
       - name: Check PowerShell init script parses
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $src = (& ./target/debug/grace init powershell | Out-String)
