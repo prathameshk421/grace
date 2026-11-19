@@ -16,7 +16,7 @@
 
 <br>
 
-<img src="assets/demo.svg" alt="The grace picker. It lists project folders with tags for the AI tools and editors used there." width="760">
+<img src="assets/demo.svg" alt="The grace picker. It lists project folders with tags for the AI tools and editors used there." width="820">
 
 </div>
 
@@ -54,7 +54,7 @@ Run Claude Code, Codex and other CLI agents in many projects at once. `grace ses
 grace ❯
   ~/code/aiml/knn        [claude]   ● needs you     2m
   ~/code/aiml/svm        [claude]   ○ your turn     5m
-  ~/work/api-server      [codex]    ◐ working       now
+  ~/work/api-server      [codex]    ⠋ working       now
   ~/code/aiml/kmeans     [agy]      ✓ done          12m
 ```
 
@@ -89,15 +89,19 @@ grace sessions -l      # plain list
 
 ## Tags show where you worked.
 
-Each folder shows the AI tools and editors you used in it. Filter by tag to see only the folders where you used one tool.
+Each folder shows the AI tools and editors you used in it. Each tag has the color of its tool's logo. Filter by tag to see only the folders where you used one tool.
 
 ```sh
 grace -t claude
 ```
 
+## Jump back to your editor.
+
+If VS Code, Cursor, Windsurf or Antigravity has a folder open, the picker marks it with `▣`. Press **ctrl-e** to bring that editor window to the front. Your shell stays where it is.
+
 ## Pick up where you stopped.
 
-`grace -o` travels to the folder and starts the AI tool you used there last.
+`grace -o`, or **ctrl-o** in the picker, travels to the folder and starts the AI tool you used there last.
 
 ```sh
 grace -o
@@ -202,6 +206,7 @@ cargo install --git https://github.com/prathameshk421/grace
 | `grace knn` | Start the picker with "knn". If only one folder matches, go there at once. |
 | `grace -t claude` | Show only folders where you used Claude. |
 | `grace -o` | Travel, then start the AI tool you used last in that folder. |
+| `grace --full` | Open the picker in full screen. |
 | `grace list` | Print all folders, best first. |
 | `grace pin` / `grace unpin` | Keep the current folder at the top (or remove the pin). |
 | `grace forget` | Remove the current folder from grace. |

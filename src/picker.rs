@@ -1443,6 +1443,93 @@ mod tests {
         Theme { color: true, truecolor: true }
     }
 
+    /// Writes assets/demo.svg from a real render. Run with:
+    /// cargo test demo_svg -- --ignored
+    #[test]
+    #[ignore]
+    fn demo_svg() {
+        fn hex(c: Color, d: &str) -> String {
+            match c {
+                Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                Color::Yellow => "#e5c07b".into(),
+                Color::Cyan => "#56b6c2".into(),
+                Color::Green => "#98c379".into(),
+                Color::Gray => "#abb2bf".into(),
+                Color::DarkGray => "#5c6370".into(),
+                Color::Red | Color::LightRed => "#e06c75".into(),
+                Color::White => "#f0f0f0".into(),
+                _ => d.into(),
+            }
+        }
+        fn esc(s: &str) -> String {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        }
+        let mut st = State::new(demo(), "", NOW, View::Folders, theme(), Some("/home/u".into()));
+        let (w, h) = (100u16, 10u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, &mut st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let (cw, lh, px, py) = (8.4f64, 21.0f64, 18.0f64, 18.0f64);
+        let width = (w as f64 * cw + 2.0 * px).ceil();
+        let height = (py + 34.0 + (h as f64 - 1.0) * lh + 20.0).ceil();
+        let mut o = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="The grace picker with live agent status and tool tags">
+<style>text{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;white-space:pre}}</style>
+<rect x="0.5" y="0.5" width="{}" height="{}" rx="12" fill="#16171b" stroke="#3a3d46"/>
+<circle cx="22" cy="19" r="6" fill="#ff5f57"/><circle cx="42" cy="19" r="6" fill="#febc2e"/><circle cx="62" cy="19" r="6" fill="#28c840"/>
+<text x="{}" y="24" text-anchor="middle" fill="#9a9ea8" style="font-size:12px">~ ❯ grace</text>
+"##,
+            width - 1.0, height - 1.0, width / 2.0
+        );
+        let top = py + 34.0;
+        for y in 0..h {
+            let base_y = top + y as f64 * lh;
+            // Backgrounds.
+            for x in 0..w {
+                let c = &buf[(x, y)];
+                if c.bg != Color::Reset {
+                    o += &format!(
+                        "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{lh}\" fill=\"{}\"/>\n",
+                        px + x as f64 * cw, base_y - 15.0, cw + 0.3, hex(c.bg, "#282c34")
+                    );
+                }
+            }
+            // Text, one <text> per cell run with the same style, placed per cell for exact columns.
+            let mut x = 0u16;
+            while x < w {
+                let c = &buf[(x, y)];
+                let sym = c.symbol().to_string();
+                if sym.trim().is_empty() {
+                    x += 1;
+                    continue;
+                }
+                let mut run = String::new();
+                let start = x;
+                let style = (c.fg, c.modifier);
+                while x < w && (buf[(x, y)].fg, buf[(x, y)].modifier) == style && !buf[(x, y)].symbol().is_empty() {
+                    run.push_str(buf[(x, y)].symbol());
+                    x += 1;
+                }
+                let mut attrs = format!("fill=\"{}\"", hex(style.0, "#d7dae0"));
+                if style.1.contains(Modifier::BOLD) {
+                    attrs += " font-weight=\"700\"";
+                }
+                if style.1.contains(Modifier::DIM) {
+                    attrs += " opacity=\".55\"";
+                }
+                if style.1.contains(Modifier::UNDERLINED) {
+                    attrs += " text-decoration=\"underline\"";
+                }
+                o += &format!(
+                    "<text x=\"{:.1}\" y=\"{:.1}\" textLength=\"{:.1}\" lengthAdjust=\"spacingAndGlyphs\" {attrs}>{}</text>\n",
+                    px + start as f64 * cw, base_y, (x - start) as f64 * cw, esc(&run)
+                );
+            }
+        }
+        o += "</svg>\n";
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/demo.svg"), o).unwrap();
+    }
+
     #[test]
     fn render_folders() {
         let mut st = State::new(demo(), "", NOW, View::Folders, theme(), Some("/home/u".into()));

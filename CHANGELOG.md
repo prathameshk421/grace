@@ -9,6 +9,12 @@
 - `grace setup` also supports Gemini CLI, Qwen Code, GitHub Copilot CLI, OpenCode, Antigravity CLI, Crush, Goose, Amp and Aider. Each one gets the statuses its CLI reports.
 - zsh and fish mark an AI CLI as working when it starts and done when it exits.
 - grace clears sessions whose terminal closed.
+- New picker design. It opens in a box under your prompt, not in full screen. `grace --full` gives the full-screen picker.
+- The picker shows columns for status, name, parent folder, tags and time. A spinner shows agents that are working.
+- Tags use the color of each tool's logo, for example Claude orange and VS Code blue.
+- Open editor windows. The picker marks folders that VS Code, Cursor, Windsurf or Antigravity has open with `▣`. ctrl-e brings that window to the front.
+- ctrl-o in the picker travels and starts the last AI tool used in that folder.
+- grace imports editor history again every 10 minutes, so new folders show without `grace import`.
 
 ## 1.2.0
 
