@@ -55,6 +55,9 @@ Open a new terminal after you save the file.";
     after_help = AFTER_HELP
 )]
 struct Cli {
+    /// Draw the picker on the full screen, not below the prompt (or set GRACE_FULLSCREEN=1)
+    #[arg(long, global = true)]
+    full: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -337,24 +340,101 @@ fn set_hook_status(tool: &str, status: model::Status, cwd: Option<String>) -> Re
     db.session_set(&p, &tool, status, model::now())
 }
 
-/// Run the picker and print the chosen path (and the launch command with --open).
-fn travel(
+/// Quote a path for the shell that runs line 2 of the output.
+fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("'{}'", s.replace('\'', "''"))
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// The ctrl-e command: focus the open editor window, or start the editor used last there.
+fn editor_command(
     reg: &tools::Registry,
-    entries: Vec<model::Entry>,
-    sessions: &[model::Session],
+    e: &model::Entry,
+    open: Option<&editors_live::OpenEditor>,
+) -> Option<String> {
+    if let Some(o) = open {
+        return Some(o.open_cmd.clone());
+    }
+    // Tags are sorted newest first.
+    let tag = e.tags.iter().find(|t| !reg.is_ai_tag(&t.tool))?;
+    let launch = reg.launch_command(&tag.tool)?;
+    let base = launch.strip_suffix(" .").unwrap_or(&launch);
+    Some(format!("{base} {}", shell_quote(&e.path)))
+}
+
+/// Folders with a live session, most urgent first, and the sessions.
+fn session_data(
+    db: &db::Db,
+    reg: &tools::Registry,
+    now: i64,
+) -> Result<(Vec<model::Entry>, Vec<model::Session>)> {
+    let mut sessions = db.sessions(now)?;
+    session::sort_sessions(&mut sessions);
+    let best = picker::best_by_path(&sessions);
+    let mut entries: Vec<_> =
+        load(db, reg, None)?.into_iter().filter(|e| best.contains_key(&e.path)).collect();
+    let key = |e: &model::Entry| {
+        let b = &best[&e.path];
+        (picker::urgency(b.status), b.updated_at)
+    };
+    entries.sort_by(|a, b| key(b).cmp(&key(a)));
+    Ok((entries, sessions))
+}
+
+/// Run the picker and print the result for the shell function.
+/// Line 1 is the folder to cd to (empty: stay). Line 2, if present, is a command to run.
+fn travel(
+    db: &db::Db,
+    reg: &tools::Registry,
+    data: picker::Data,
+    view: picker::View,
+    tag: Option<&str>,
     query: &str,
     open: bool,
-    now: i64,
+    full: bool,
 ) -> Result<()> {
-    if let Some(e) = picker::pick(entries, sessions, query, now)? {
-        println!("{}", e.path);
-        if open {
-            if let Some(cmd) = e.last_tool().and_then(|t| reg.launch_command(t)) {
-                println!("{cmd}");
+    let reload = move || {
+        let now = model::now();
+        let (entries, sessions) = match view {
+            picker::View::Folders => {
+                (load(db, reg, tag).ok()?, db.sessions(now).unwrap_or_default())
+            }
+            picker::View::Sessions => session_data(db, reg, now).ok()?,
+        };
+        Some(picker::Data { entries, sessions, editors: editors_live::open_editors() })
+    };
+    let opts = picker::Opts {
+        view,
+        fullscreen: full,
+        editor_cmd: Box::new(|e, o| editor_command(reg, e, o)),
+        // Editor history import can take ~100 ms, so it runs after the first frame.
+        after_first_frame: Some(Box::new(|| editors_live::refresh_if_stale(db))),
+        reload: Some(Box::new(reload)),
+        reload_every: match view {
+            picker::View::Folders => None,
+            picker::View::Sessions => Some(std::time::Duration::from_secs(1)),
+        },
+    };
+    let Some(choice) = picker::pick(data, query, model::now(), opts)? else {
+        std::process::exit(1);
+    };
+    let e = &choice.entry;
+    match choice.action {
+        picker::Action::Editor(cmd) => {
+            println!();
+            println!("{cmd}");
+        }
+        action => {
+            println!("{}", e.path);
+            if open || action == picker::Action::Resume {
+                if let Some(cmd) = e.last_tool().and_then(|t| reg.launch_command(t)) {
+                    println!("{cmd}");
+                }
             }
         }
-    } else {
-        std::process::exit(1);
     }
     Ok(())
 }
@@ -371,20 +451,23 @@ fn main() -> Result<()> {
     }
     let now = model::now();
     let reg = tools::Registry::from_db(&db)?;
+    let full = cli.full || std::env::var("GRACE_FULLSCREEN").is_ok_and(|v| v == "1");
 
     match cli.cmd.unwrap_or(Cmd::Pick { tag: None, open: false, query: None }) {
         Cmd::Pick { tag, open, query } => {
-            let entries = load(&db, &reg, tag.as_deref())?;
-            if entries.is_empty() {
-                bail!("no folders yet. cd around a bit, or run `grace import`");
-            }
-            let sessions = db.sessions(now).unwrap_or_default();
-            travel(&reg, entries, &sessions, query.as_deref().unwrap_or(""), open, now)?;
+            // open_editors is fast (< 30 ms), so it may run before the first frame.
+            let data = picker::Data {
+                entries: load(&db, &reg, tag.as_deref())?,
+                sessions: db.sessions(now).unwrap_or_default(),
+                editors: editors_live::open_editors(),
+            };
+            let q = query.as_deref().unwrap_or("");
+            travel(&db, &reg, data, picker::View::Folders, tag.as_deref(), q, open, full)?;
         }
         Cmd::Sessions { list, open, query } => {
-            let mut sessions = db.sessions(now)?;
-            session::sort_sessions(&mut sessions);
             if list {
+                let mut sessions = db.sessions(now)?;
+                session::sort_sessions(&mut sessions);
                 let home = platform::home_dir().map(|h| h.to_string_lossy().into_owned());
                 for s in &sessions {
                     println!(
@@ -397,20 +480,13 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            let best = picker::best_by_path(&sessions);
-            let mut entries: Vec<_> = load(&db, &reg, None)?
-                .into_iter()
-                .filter(|e| best.contains_key(&e.path))
-                .collect();
+            let (entries, sessions) = session_data(&db, &reg, now)?;
             if entries.is_empty() {
                 bail!("no live sessions. Run `grace setup claude` or `grace setup codex`, then start the agent");
             }
-            let key = |e: &model::Entry| {
-                let b = &best[&e.path];
-                (picker::urgency(b.status), b.updated_at)
-            };
-            entries.sort_by(|a, b| key(b).cmp(&key(a)));
-            travel(&reg, entries, &sessions, query.as_deref().unwrap_or(""), open, now)?;
+            let data = picker::Data { entries, sessions, editors: editors_live::open_editors() };
+            let q = query.as_deref().unwrap_or("");
+            travel(&db, &reg, data, picker::View::Sessions, None, q, open, full)?;
         }
         Cmd::Setup { target, remove } => setup::run(&target, remove)?,
         Cmd::Session { .. } => {}

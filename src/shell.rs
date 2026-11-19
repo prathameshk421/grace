@@ -84,10 +84,13 @@ const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
     if [[ $out == *$'\n'* ]]; then
       cmd=${out#*$'\n'}
     fi
-    [[ -n $dir ]] || return 1
-    builtin cd -- "$dir" || return
+    # An empty line 1 means: stay here, only run line 2.
+    [[ -n $dir || -n $cmd ]] || return 1
+    if [[ -n $dir ]]; then
+      builtin cd -- "$dir" || return
+    fi
     if [[ -n $cmd ]]; then
-      ${=cmd}
+      eval "$cmd"
     fi
   }
 fi
@@ -184,8 +187,11 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
     if [[ $out == *$'\n'* ]]; then
       cmd=${out#*$'\n'}
     fi
-    [[ -n $dir ]] || return 1
-    builtin cd -- "$dir" || return
+    # An empty line 1 means: stay here, only run line 2.
+    [[ -n $dir || -n $cmd ]] || return 1
+    if [[ -n $dir ]]; then
+      builtin cd -- "$dir" || return
+    fi
     if [[ -n $cmd ]]; then
       eval "$cmd"
     fi
@@ -274,8 +280,12 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
         set -l out (command grace $sub $argv)
         or return
         set -l dir $out[1]
-        test -n "$dir"; or return 1
-        builtin cd -- $dir; or return
+        # An empty line 1 means: stay here, only run line 2.
+        if test -n "$dir"
+            builtin cd -- $dir; or return
+        else if not set -q out[2]; or test -z "$out[2]"
+            return 1
+        end
         if set -q out[2]; and test -n "$out[2]"
             eval $out[2]
         end
@@ -369,8 +379,9 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
     }
     $out = @(& $exe $sub @rest)
     if ($LASTEXITCODE -ne 0) { return }
-    if ($out.Count -eq 0 -or -not $out[0]) { return }
-    Set-Location -LiteralPath $out[0]
+    if ($out.Count -eq 0) { return }
+    # An empty line 1 means: stay here, only run line 2.
+    if ($out[0]) { Set-Location -LiteralPath $out[0] }
     if ($out.Count -gt 1 -and $out[1]) { Invoke-Expression $out[1] }
   }
 }

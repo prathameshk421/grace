@@ -19,7 +19,7 @@ fn vscode_apps(source: &str) -> &'static [(&'static str, &'static str)] {
         "vscode" => &[("Code", "vscode"), ("Code - Insiders", "vscode"), ("VSCodium", "vscodium")],
         "cursor" => &[("Cursor", "cursor")],
         "windsurf" => &[("Windsurf", "windsurf")],
-        "antigravity" => &[("Antigravity", "antigravity")],
+        "antigravity" => &[("Antigravity", "antigravity"), ("Antigravity IDE", "antigravity")],
         _ => &[],
     }
 }
@@ -32,6 +32,14 @@ pub fn import_source(db: &Db, source: &str) -> Option<usize> {
         "t3code" => import_t3code(db),
         s => import_vscode_family(db, s),
     }
+}
+
+/// Import all editor sources (not Claude history). Prints nothing. Returns the folder count.
+pub fn import_editors_quiet(db: &Db) -> usize {
+    ALL.iter()
+        .filter(|s| **s != "claude")
+        .filter_map(|s| import_source(db, s))
+        .sum()
 }
 
 /// Import every source. Returns `(source, count)` for sources that exist.
@@ -48,7 +56,7 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 }
 
 /// Folder that holds the app data of editors (`Application Support`, `%APPDATA%`, `~/.config`).
-fn config_root() -> Option<PathBuf> {
+pub(crate) fn config_root() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         platform::home_dir().map(|h| h.join("Library").join("Application Support"))
     } else if cfg!(windows) {

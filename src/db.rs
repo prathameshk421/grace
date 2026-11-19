@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS sessions(
     updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_path_tool ON sessions(path, tool);
+CREATE TABLE IF NOT EXISTS meta(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 /// Seconds a done session stays visible.
@@ -310,6 +314,26 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Read a value from the `meta` table.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(r.get(0)?),
+            None => None,
+        })
+    }
+
+    /// Write a value to the `meta` table.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// Insert a dir only if missing. Returns true if inserted.
     /// With `tool`, also add a tag with count 1 (only when the dir was inserted).
     pub fn import_dir(&self, path: &str, ts: i64, tool: Option<&str>) -> Result<bool> {
@@ -447,6 +471,15 @@ mod tests {
             .query_row("SELECT count(*) FROM sessions WHERE path = '/w'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn meta_round_trip() {
+        let (_d, db) = temp_db();
+        assert_eq!(db.get_meta("k").unwrap(), None);
+        db.set_meta("k", "1").unwrap();
+        db.set_meta("k", "2").unwrap();
+        assert_eq!(db.get_meta("k").unwrap().as_deref(), Some("2"));
     }
 
     #[test]
