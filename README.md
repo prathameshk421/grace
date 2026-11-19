@@ -67,6 +67,24 @@ grace sessions         # picker with live agents only
 grace sessions -l      # plain list
 ```
 
+`grace setup <cli>` connects 11 CLI agents:
+
+| CLI | Setup | needs you | your turn | working | done |
+|---|---|:-:|:-:|:-:|:-:|
+| Claude Code | `grace setup claude` | ✓ | ✓ | ✓ | ✓ |
+| Qwen Code | `grace setup qwen` | ✓ | ✓ | ✓ | ✓ |
+| GitHub Copilot CLI | `grace setup copilot` | ✓ | ✓ | ✓ | ✓ |
+| Crush | `grace setup crush` | ✓ | ✓ | ✓ | ✓ |
+| OpenCode | `grace setup opencode` | ✓ | ✓ | ✓ | ✓ |
+| Gemini CLI | `grace setup gemini` | ✓ | ✓ | ✓ | ✓ |
+| Antigravity CLI | `grace setup agy`, then `agy plugin enable grace` | | ✓ | ✓ | shell |
+| Goose | `grace setup goose` | | ✓ | ✓ | ✓ |
+| Amp | `grace setup amp` | | ✓ | ✓ | shell |
+| Codex CLI | `grace setup codex` | | ✓ | shell | shell |
+| Aider | `grace setup aider` | | ✓ | shell | shell |
+
+"shell" means the zsh or fish hook covers it. A blank cell means the CLI does not report it. Cursor CLI and T3 Code show working and done through the shell hook.
+
 `grace setup` makes a backup of the config first. `--remove` undoes it. If Codex already has a `notify` program, `grace setup codex` keeps it and forwards each event to it. In zsh and fish, grace also sees every AI CLI start and exit, with no setup.
 
 ## Tags show where you worked.

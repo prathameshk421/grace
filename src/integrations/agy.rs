@@ -55,7 +55,7 @@ fn hooks_json(exe: &str) -> String {
     let mut hooks = serde_json::Map::new();
     hooks.insert("enabled".into(), json!(true));
     for ev in EVENTS {
-        let handler = json!({"type": "command", "command": format!("{exe} session hook agy {ev}"), "timeout": 10});
+        let handler = json!({"type": "command", "command": format!("{} session hook agy {ev}", super::gemini::quote_once(exe)), "timeout": 10});
         // PostToolUse takes matcher entries, the others take handlers directly.
         let entry = if ev == "PostToolUse" {
             json!([{"matcher": ".*", "hooks": [handler]}])

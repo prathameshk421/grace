@@ -6,6 +6,7 @@
 - `grace sessions` opens a picker with live agents only. Agents that need you come first. `grace sessions -l` prints a list.
 - `grace setup claude` adds hooks to the Claude Code CLI settings. `grace setup codex` sets `notify` in the Codex CLI config. Both make a backup first, and `--remove` undoes them.
 - `grace setup codex` keeps an existing Codex `notify` program and forwards each event to it. `--remove` restores it.
+- `grace setup` also supports Gemini CLI, Qwen Code, GitHub Copilot CLI, OpenCode, Antigravity CLI, Crush, Goose, Amp and Aider. Each one gets the statuses its CLI reports.
 - zsh and fish mark an AI CLI as working when it starts and done when it exits.
 - grace clears sessions whose terminal closed.
 
