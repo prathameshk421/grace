@@ -124,6 +124,7 @@ impl Db {
     pub fn forget(&self, path: &str) -> Result<()> {
         self.conn.execute("DELETE FROM tags WHERE path = ?1", params![path])?;
         self.conn.execute("DELETE FROM dirs WHERE path = ?1", params![path])?;
+        self.conn.execute("DELETE FROM sessions WHERE path = ?1", params![path])?;
         Ok(())
     }
 
