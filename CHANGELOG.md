@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.1
+
+The program is the same as 2.0.0. This release is about install and docs.
+
+- New: Homebrew tap. Run `brew install prathameshk421/grace/grace`. After the install, brew shows what grace does and how to set it up.
+- Each release now updates the Homebrew formula on its own.
+- README: a quick start at the top, real screenshots of the hub, `grace diff` and `grace tree`, Linux install details and uninstall steps.
+- `scripts/screens.sh` makes the README screenshots from real grace runs on demo data.
+
 ## 2.0.0
 
 - New: `grace hub`. It opens one terminal window on tmux. The sidebar is on the left, your shell is in the middle, and a live diff and a file tree are on the right.
