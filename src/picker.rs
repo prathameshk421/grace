@@ -143,7 +143,7 @@ fn tag_color(tool: &str) -> Color {
         "goose" => Color::Rgb(255, 214, 0),        // Goose yellow
         "crush" => Color::Rgb(255, 95, 210),       // Charm pink
         "qwen" => Color::Rgb(97, 92, 237),         // Qwen indigo
-        "t3code" => Color::Rgb(236, 72, 153),      // T3 pink
+        "t3code" => Color::Rgb(196, 202, 212),     // T3 silver
         // Editors
         "vscode" => Color::Rgb(31, 156, 240),      // VS Code blue
         "vscodium" => Color::Rgb(70, 190, 230),    // VSCodium light blue
