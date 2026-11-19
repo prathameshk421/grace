@@ -68,6 +68,7 @@ impl Status {
     pub fn label(self) -> &'static str {
         match self {
             Status::Ready => "your turn",
+            Status::Waiting => "needs you",
             other => other.as_str(),
         }
     }
