@@ -12,7 +12,7 @@
 ![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 [![Built with Claude Opus 5.5](https://img.shields.io/badge/Built%20with-Claude%20Opus%205.5-D97757?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
 
-[Install](#install) · [Usage](#usage) · [Tools](#tools-and-import-sources) · [How it works](#how-it-works)
+[Install](#install) · [Hub](#the-hub) · [Usage](#usage) · [Tools](#tools-and-import-sources) · [How it works](#how-it-works)
 
 <br>
 
@@ -35,6 +35,7 @@ In Elden Ring, you rest at a Site of Grace and fast travel to any grace you foun
 | **3 systems, 4 shells** | macOS, Linux, Windows. zsh, bash, fish, PowerShell. |
 | **7 sources** | Claude Code, VS Code, Cursor, Windsurf, Antigravity, Zed and T3 Code history. |
 | **0 config** | Install, add one line to your shell, and go. |
+| **1 window** | `grace hub` puts your agents, shell, diff and file tree side by side. |
 | **1 binary** | Written in Rust. Local SQLite. Nothing leaves your machine. |
 
 ## Fast travel.
@@ -45,6 +46,75 @@ Type `grace` to open the picker. Type to filter, press Enter, and your shell mov
 grace          # open the picker
 grace knn      # one match: go there now
 ```
+
+## The hub
+
+`grace hub` opens one terminal window for all your projects. It is built on tmux.
+
+```
+╭ grace ──────────────╮ ~/code/knn                  │ diff ──────────────────
+│ ❯ filter            │ $ claude                    │ M src/main.rs
+│ NEEDS YOU           │                             │ ?? notes.md
+│ ● svm         codex │                             │ @@ -1,3 +1,4 @@
+│ WORKING             │                             │ -old line
+│ ⠋ knn        claude │                             │ +new line
+│ FOLDERS             │                             │ tree ──────────────────
+│ api-server   cursor │                             │ ▾ src                •
+│ notes               │                             │     main.rs          M
+╰ enter go · ctrl-o … ╯                             │   README.md
+ grace  1 knn ⠋  2 svm ●                                          ctrl-g ? keys
+```
+
+- **Left:** the sidebar. Live agents come first, grouped by status. Your folders follow, best first. Type to filter.
+- **Middle:** your own shell in the folder. Run claude, codex or any CLI as usual.
+- **Right:** a live git diff on top and a file tree below. Both follow the folder of the window.
+
+Each folder gets its own workspace: a tmux window with its own shell. Agents keep running when you switch. Press Enter on a folder in the sidebar to switch to it. Press ctrl-o to switch and start the AI tool you used there last. The status bar shows each workspace with the status of its agent.
+
+```sh
+grace hub              # open the hub in this folder
+grace hub ~/code/knn   # open the hub, or switch to that folder
+```
+
+### Keys
+
+Press **ctrl-g**, then one key. No tmux prefix needed.
+
+| Key | What it does |
+|---|---|
+| `s` | Show or hide the sidebar |
+| `d` | Show or hide the diff |
+| `t` | Show or hide the file tree |
+| `r` | Show or hide the whole right side |
+| `z` | Zoom the main pane, or zoom out |
+| `g` | Go to the sidebar |
+| `q` | Detach. Run `grace hub` to come back. |
+| `?` | Show all keys |
+| `ctrl-g` | Send ctrl-g to the program |
+
+A pane that comes back takes its old place and size. grace remembers which panes you show and uses that for new workspaces and the next start. The mouse works too: click a pane to focus it, drag a border to resize it.
+
+### Requirements
+
+The hub needs tmux 3.2 or newer. It works on macOS and Linux. On Windows, run grace inside WSL.
+
+```sh
+brew install tmux          # macOS
+sudo apt install tmux      # Debian, Ubuntu
+```
+
+grace runs tmux on its own server (`tmux -L grace`) with its own config file. Your tmux server and `~/.tmux.conf` stay as they are. The hub also works inside another tmux.
+
+### Diff and tree without the hub
+
+`grace diff` and `grace tree` also work on their own, on all three systems.
+
+```sh
+grace diff     # changed files and a colored diff. j/k move, tab switches focus, q quits.
+grace tree     # files with git changes marked. enter opens a folder, o opens a file.
+```
+
+`grace diff` shows untracked files as added. It cuts very long diffs. `grace tree` hides the files that `.gitignore` lists. Outside a git repository, it skips `.git`, `node_modules` and `target`.
 
 ## See which agent needs you.
 
@@ -207,6 +277,9 @@ cargo install --git https://github.com/prathameshk421/grace
 | `grace -t claude` | Show only folders where you used Claude. |
 | `grace -o` | Travel, then start the AI tool you used last in that folder. |
 | `grace --full` | Open the picker in full screen. |
+| `grace hub [path]` | Open the hub on tmux: sidebar, shell, diff and file tree. Inside the hub, switch to the folder. |
+| `grace diff [path]` | Show the changed files of a git repository and a colored diff. |
+| `grace tree [path]` | Show the files of a folder as a tree, with git changes marked. |
 | `grace list` | Print all folders, best first. |
 | `grace pin` / `grace unpin` | Keep the current folder at the top (or remove the pin). |
 | `grace forget` | Remove the current folder from grace. |
@@ -242,6 +315,7 @@ With `all`, grace skips sources it cannot find. With a named source, it prints "
 - **Folder argument.** If you type `code ~/other` in `~/a`, grace tags `~/other`, not `~/a`. If the argument is a file or does not exist, grace tags the current folder.
 - **Storage.** One SQLite file: `$GRACE_DATA_DIR`, else `$XDG_DATA_HOME/grace`, else `~/.local/share/grace/grace.db`.
 - **Imports.** grace opens editor databases read-only. It never tracks `/` or your home folder.
+- **Hub.** grace writes `tmux.conf` next to its database at each `grace hub` start. Each pane has a role (sidebar, diff, tree). `ctrl-g` keys run `grace hub toggle`, which removes a pane or splits it back. Sidebar, diff and tree hold no state, so a new copy is the same as the old one.
 
 ## Built with Claude
 
