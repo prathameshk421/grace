@@ -1,5 +1,7 @@
 # grace
 
+![CI](https://github.com/prathameshk421/grace/actions/workflows/ci.yml/badge.svg)
+
 Fast travel between your project folders.
 
 In Elden Ring, you rest at a Site of Grace and fast travel to any grace you found before. `grace` does the same for your terminal. It records every folder you `cd` into, and it tags each folder with the AI tools you ran there (`[claude]`, `[antigravity]`, `[codex]` and more). Type `grace`, choose a folder, and your shell goes there.
@@ -14,14 +16,55 @@ grace ❯ knn
 
 ## Install
 
-You need Rust and zsh.
+Platforms: macOS, Linux and Windows. Shells: zsh, bash, fish and PowerShell.
+
+### Download
+
+Get the archive for your system from the [Releases page](https://github.com/prathameshk421/grace/releases/latest).
+
+| Your system | Archive |
+|---|---|
+| macOS Apple Silicon | `grace-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `grace-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `grace-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `grace-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `grace-<version>-x86_64-pc-windows-msvc.zip` |
+
+macOS and Linux: extract the archive and move `grace` into a folder on your PATH, such as `~/.local/bin` or `/usr/local/bin`.
+
+```sh
+tar -xzf grace-*.tar.gz
+mv grace-*/grace ~/.local/bin/
+```
+
+The macOS binary is not signed. If macOS blocks it, run this:
+
+```sh
+xattr -d com.apple.quarantine ~/.local/bin/grace
+```
+
+Windows: extract `grace.exe` into a folder on your PATH, for example `%USERPROFILE%\bin`. Add that folder to PATH if it is not there yet.
+
+### Build from source
+
+You need Rust.
 
 ```sh
 git clone https://github.com/prathameshk421/grace
 cd grace
 cargo install --path .
-echo 'eval "$(grace init zsh)"' >> ~/.zshrc
 ```
+
+### Shell setup
+
+Add one line to your shell config.
+
+| Shell | Line | File |
+|---|---|---|
+| zsh | `eval "$(grace init zsh)"` | `~/.zshrc` |
+| bash | `eval "$(grace init bash)"` | `~/.bashrc` |
+| fish | `grace init fish \| source` | `~/.config/fish/config.fish` |
+| PowerShell | `Invoke-Expression (& grace init powershell \| Out-String)` | `$PROFILE` |
 
 Open a new terminal. On the first run, grace imports the folders from your Claude Code history (`~/.claude.json`).
 

@@ -39,8 +39,13 @@ fn data_dir() -> Result<PathBuf> {
     if let Some(d) = non_empty("XDG_DATA_HOME") {
         return Ok(PathBuf::from(d).join("grace"));
     }
-    let home = non_empty("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/grace"))
+    if cfg!(windows) {
+        if let Some(d) = non_empty("LOCALAPPDATA") {
+            return Ok(PathBuf::from(d).join("grace"));
+        }
+    }
+    let home = crate::platform::home_dir().context("HOME is not set")?;
+    Ok(home.join(".local").join("share").join("grace"))
 }
 
 impl Db {

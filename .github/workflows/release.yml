@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (macOS and Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          T: ${{ matrix.target }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then VERSION=dev; fi
+          NAME="grace-${VERSION}-${T}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${T}/release/grace" README.md LICENSE "dist/${NAME}/"
+          tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
+          cd dist
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          else
+            sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          T: ${{ matrix.target }}
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev' }
+          $name = "grace-$version-$env:T"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/$env:T/release/grace.exe", README.md, LICENSE -Destination "dist/$name"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText("$PWD/dist/$name.zip.sha256", "$hash  $name.zip`n")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grace-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<EOF
+          grace is a fast travel tool for your terminal. It lists your project folders and tags each one with the AI tools you ran there.
+
+          | Your system | Download |
+          |---|---|
+          | macOS Apple Silicon | \`grace-${TAG}-aarch64-apple-darwin.tar.gz\` |
+          | macOS Intel | \`grace-${TAG}-x86_64-apple-darwin.tar.gz\` |
+          | Linux x86_64 | \`grace-${TAG}-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Linux ARM64 | \`grace-${TAG}-aarch64-unknown-linux-gnu.tar.gz\` |
+          | Windows x86_64 | \`grace-${TAG}-x86_64-pc-windows-msvc.zip\` |
+
+          Put \`grace\` (or \`grace.exe\`) in a folder on your PATH. Check the download with the \`.sha256\` file.
+
+          Shell setup, one line per shell:
+
+          - zsh: \`eval "\$(grace init zsh)"\` in ~/.zshrc
+          - bash: \`eval "\$(grace init bash)"\` in ~/.bashrc
+          - fish: \`grace init fish | source\` in ~/.config/fish/config.fish
+          - PowerShell: \`Invoke-Expression (& grace init powershell | Out-String)\` in \$PROFILE
+          EOF
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" --title "grace $TAG" --notes-file notes.md --verify-tag dist/*
+          fi

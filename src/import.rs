@@ -12,7 +12,7 @@ pub fn claude_project_paths(json: &str) -> Vec<String> {
     match v.get("projects").and_then(|p| p.as_object()) {
         Some(map) => map
             .keys()
-            .map(|k| k.trim_end_matches('/').to_string())
+            .map(|k| crate::platform::clean_path_str(k))
             .filter(|k| !k.is_empty())
             .collect(),
         None => Vec::new(),
@@ -20,16 +20,16 @@ pub fn claude_project_paths(json: &str) -> Vec<String> {
 }
 
 pub fn import_claude(db: &Db) -> Result<usize> {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = crate::platform::home_dir() else {
         return Ok(0);
     };
-    let home = home.trim_end_matches('/').to_string();
+    let home = crate::platform::clean_path_str(&home.to_string_lossy());
     let Ok(text) = std::fs::read_to_string(Path::new(&home).join(".claude.json")) else {
         return Ok(0);
     };
     let mut count = 0;
     for path in claude_project_paths(&text) {
-        if path == "/" || path == home {
+        if crate::platform::is_root(&path) || crate::platform::same_path(&path, &home) {
             continue;
         }
         let Ok(meta) = std::fs::metadata(&path) else {

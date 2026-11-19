@@ -2,6 +2,7 @@ mod db;
 mod import;
 mod model;
 mod picker;
+mod platform;
 mod rank;
 mod shell;
 mod tools;
@@ -52,7 +53,10 @@ enum Cmd {
         #[command(subcommand)]
         action: ToolCmd,
     },
-    /// Print the shell setup. Add `eval "$(grace init zsh)"` to ~/.zshrc.
+    /// Print the shell setup. Supported shells: zsh, bash, fish, powershell (or pwsh).
+    /// zsh: add `eval "$(grace init zsh)"` to ~/.zshrc. bash: same line in ~/.bashrc.
+    /// fish: add `grace init fish | source` to config.fish.
+    /// PowerShell: add `grace init powershell | Out-String | Invoke-Expression` to $PROFILE.
     Init { shell: String },
 }
 
@@ -82,14 +86,18 @@ fn resolve(path: Option<PathBuf>) -> Result<String> {
         Some(p) => p,
         None => std::env::current_dir()?,
     };
-    let p = std::fs::canonicalize(&p).unwrap_or(p);
-    Ok(p.to_string_lossy().trim_end_matches('/').to_string())
+    Ok(platform::normalize(&p))
 }
 
-/// Folders we never track: the filesystem root and the home folder.
+/// Folders we never track: filesystem roots (`/`, `C:\`) and the home folder.
 fn ignored(path: &str) -> bool {
-    let home = std::env::var("HOME").unwrap_or_default();
-    path.is_empty() || path == "/" || path == home.trim_end_matches('/')
+    if path.is_empty() || platform::is_root(path) {
+        return true;
+    }
+    match platform::home_dir() {
+        Some(h) => platform::same_path(path, &platform::clean_path_str(&h.to_string_lossy())),
+        None => false,
+    }
 }
 
 fn load(db: &db::Db, reg: &tools::Registry, tag: Option<&str>) -> Result<Vec<model::Entry>> {
@@ -186,9 +194,9 @@ fn main() -> Result<()> {
                 }
             }
         },
-        Cmd::Init { shell } => match shell.as_str() {
-            "zsh" => print!("{}", shell::init_zsh(&reg.command_names())),
-            other => bail!("unsupported shell: {other} (only zsh for now)"),
+        Cmd::Init { shell } => match shell::Shell::parse(&shell) {
+            Some(sh) => print!("{}", shell::init(sh, &reg.command_names())),
+            None => bail!("unsupported shell: {shell} (use zsh, bash, fish, powershell or pwsh)"),
         },
     }
     Ok(())

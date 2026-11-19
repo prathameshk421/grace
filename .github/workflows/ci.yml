@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Install zsh and fish
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+      - name: Check shell init scripts
+        if: runner.os == 'Linux'
+        run: |
+          ./target/debug/grace init bash > init.bash
+          ./target/debug/grace init zsh > init.zsh
+          ./target/debug/grace init fish > init.fish
+          bash -n init.bash
+          zsh -n init.zsh
+          fish --no-execute init.fish
+      - name: Check PowerShell init script parses
+        shell: pwsh
+        run: |
+          $src = (& ./target/debug/grace init powershell | Out-String)
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$errs)
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
+      - name: PowerShell smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:GRACE_DATA_DIR = Join-Path $env:RUNNER_TEMP 'gracedata'
+          $env:PATH = "$PWD\target\debug;$env:PATH"
+          Invoke-Expression (& grace init powershell | Out-String)
+          $dir = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'proj one')
+          Set-Location $dir
+          prompt | Out-Null
+          grace tag $dir.FullName agy
+          $list = grace list | Out-String
+          Write-Output $list
+          if ($list -notmatch 'proj one') { Write-Error 'folder not recorded'; exit 1 }
+          if ($list -notmatch '\[antigravity\]') { Write-Error 'tag not recorded'; exit 1 }
+          if ($list -match '\\\\\?\\') { Write-Error 'verbatim prefix leaked'; exit 1 }

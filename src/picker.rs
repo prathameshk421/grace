@@ -91,11 +91,14 @@ fn tag_color(tool: &str) -> Color {
 
 fn display_path(path: &str, home: Option<&str>) -> String {
     if let Some(h) = home.filter(|h| !h.is_empty()) {
-        if path == h {
+        let h = crate::platform::trim_separators(h);
+        let h = h.as_str();
+        if crate::platform::same_path(path, h) {
             return "~".into();
         }
-        if let Some(rest) = path.strip_prefix(h) {
-            if rest.starts_with('/') {
+        if let (Some(pre), Some(rest)) = (path.get(..h.len()), path.get(h.len()..)) {
+            let sep = rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\'));
+            if sep && crate::platform::same_path(pre, h) {
                 return format!("~{rest}");
             }
         }
@@ -168,7 +171,7 @@ fn draw(f: &mut Frame, st: &mut State) {
         };
 
         let shown = display_path(&e.path, st.home.as_deref());
-        let (parent, name) = match shown.rfind('/') {
+        let (parent, name) = match shown.rfind(|c| c == '/' || (cfg!(windows) && c == '\\')) {
             Some(p) if p + 1 < shown.len() => (&shown[..=p], &shown[p + 1..]),
             _ => ("", shown.as_str()),
         };
@@ -245,7 +248,7 @@ fn run(
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if key.kind == KeyEventKind::Release {
+        if key.kind != KeyEventKind::Press {
             continue;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -292,7 +295,7 @@ pub fn pick(entries: Vec<Entry>, query: &str, now: i64) -> Result<Option<Entry>>
         selected: 0,
         offset: 0,
         now,
-        home: std::env::var("HOME").ok(),
+        home: crate::platform::home_dir().map(|h| h.to_string_lossy().into_owned()),
         matcher: Matcher::new(Config::DEFAULT.match_paths()),
     };
 
