@@ -250,7 +250,7 @@ impl Db {
             params![path, tool, status.as_str(), ts],
         )?;
         if n == 0 && status != Status::Done {
-            self.ensure_dir(path, ts)?;
+            self.record_tool(path, tool, ts)?; // a session always tags its folder
             self.conn.execute(
                 "INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at)
                  VALUES(?1, ?2, ?3, NULL, ?4, ?4)",
@@ -459,5 +459,21 @@ mod tests {
         assert!(db.remove_tool("kiro").unwrap());
         assert!(!db.remove_tool("kiro").unwrap());
         assert_eq!(db.custom_tools().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod session_tag_tests {
+    use super::*;
+    use crate::model::Status;
+
+    #[test]
+    fn hook_session_tags_the_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("g.db")).unwrap();
+        db.session_set("/p", "claude", Status::Waiting, 100).unwrap();
+        let e = db.list_entries().unwrap();
+        assert_eq!(e.len(), 1);
+        assert!(e[0].has_tag("claude"));
     }
 }
