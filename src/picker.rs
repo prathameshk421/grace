@@ -127,22 +127,32 @@ fn time_ago(now: i64, then: i64) -> String {
     }
 }
 
+/// Each tool's tag uses the main color of its brand.
 fn tag_color(tool: &str) -> Color {
     match tool {
-        "claude" => Color::LightRed,
-        "antigravity" => Color::Rgb(180, 150, 255),
-        "codex" => Color::Green,
-        "gemini" => Color::Magenta,
-        "cursor" => Color::Cyan,
-        "vscode" => Color::Rgb(0, 122, 204),
-        "vscodium" => Color::Rgb(70, 190, 230),
-        "windsurf" => Color::Rgb(0, 200, 170),
-        "t3code" => Color::Rgb(160, 110, 255),
-        "zed" => Color::Rgb(255, 140, 40),
-        "neovim" => Color::LightGreen,
-        "vim" => Color::Rgb(1, 152, 51),
-        "sublime" => Color::LightYellow,
-        "jetbrains" => Color::Rgb(255, 80, 140),
+        // AI tools
+        "claude" => Color::Rgb(217, 119, 87),      // Anthropic orange
+        "antigravity" => Color::Rgb(66, 133, 244), // Google blue
+        "gemini" => Color::Rgb(142, 117, 255),     // Gemini blue-violet
+        "codex" => Color::Rgb(16, 163, 127),       // OpenAI green
+        "cursor" => Color::Rgb(230, 230, 230),     // Cursor white
+        "opencode" => Color::Rgb(250, 178, 131),   // OpenCode peach
+        "aider" => Color::Rgb(20, 180, 80),        // Aider green
+        "copilot" => Color::Rgb(163, 113, 247),    // GitHub Copilot purple
+        "amp" => Color::Rgb(243, 78, 63),          // Amp red
+        "goose" => Color::Rgb(255, 214, 0),        // Goose yellow
+        "crush" => Color::Rgb(255, 95, 210),       // Charm pink
+        "qwen" => Color::Rgb(97, 92, 237),         // Qwen indigo
+        "t3code" => Color::Rgb(236, 72, 153),      // T3 pink
+        // Editors
+        "vscode" => Color::Rgb(31, 156, 240),      // VS Code blue
+        "vscodium" => Color::Rgb(70, 190, 230),    // VSCodium light blue
+        "windsurf" => Color::Rgb(88, 229, 187),    // Windsurf teal
+        "zed" => Color::Rgb(84, 140, 255),         // Zed blue
+        "neovim" => Color::Rgb(87, 161, 67),       // Neovim green
+        "vim" => Color::Rgb(1, 152, 51),           // Vim green
+        "sublime" => Color::Rgb(255, 152, 0),      // Sublime orange
+        "jetbrains" => Color::Rgb(255, 49, 140),   // JetBrains magenta
         _ => Color::Gray,
     }
 }
@@ -839,11 +849,9 @@ fn compose_row(rv: &RowView, cols: &Cols, selected: bool, ctx: &Ctx, width: usiz
             if k > 0 {
                 b.push(" · ".into(), base.add_modifier(Modifier::DIM));
             }
-            let s = if *open {
-                t.fg(base, OPEN_BLUE).add_modifier(Modifier::BOLD)
-            } else {
-                t.fg(base, tag_color(tag))
-            };
+            // An open editor keeps its brand color, in bold.
+            let s = t.fg(base, tag_color(tag));
+            let s = if *open { s.add_modifier(Modifier::BOLD) } else { s };
             b.push(tag.clone(), s);
         }
         if more {
