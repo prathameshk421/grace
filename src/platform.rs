@@ -100,6 +100,21 @@ pub fn tag_target(cwd: &str, target: Option<&str>) -> String {
     }
 }
 
+/// Open a file or folder with the system opener, in the background. False if it fails to start.
+pub fn open_path(p: &Path) -> bool {
+    use std::process::{Command, Stdio};
+    let mut c = if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    } else {
+        Command::new("xdg-open")
+    };
+    c.arg(p).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok()
+}
+
 /// True if a process with this PID exists.
 #[cfg(unix)]
 pub fn pid_alive(pid: i64) -> bool {

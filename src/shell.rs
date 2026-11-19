@@ -60,7 +60,7 @@ const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
 
   grace() {
     case $1 in
-      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|help|-h|--help|-V|--version)
+      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|hub|diff|tree|help|-h|--help|-V|--version)
         command grace "$@"
         return $?
         ;;
@@ -163,7 +163,7 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
 
   grace() {
     case ${1-} in
-      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|help|-h|--help|-V|--version)
+      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|hub|diff|tree|help|-h|--help|-V|--version)
         command grace "$@"
         return $?
         ;;
@@ -262,7 +262,7 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
     disown 2>/dev/null
 
     function grace
-        if set -q argv[1]; and contains -- $argv[1] add tag tool list pin unpin forget import init setup session help -h --help -V --version
+        if set -q argv[1]; and contains -- $argv[1] add tag tool list pin unpin forget import init setup session hub diff tree help -h --help -V --version
             command grace $argv
             return $status
         end
@@ -358,7 +358,7 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
       Write-Error 'grace: the grace program is not on PATH'
       return
     }
-    $passthrough = @('add', 'tag', 'tool', 'list', 'pin', 'unpin', 'forget', 'import', 'init', 'setup', 'session', 'help', '-h', '--help', '-V', '--version')
+    $passthrough = @('add', 'tag', 'tool', 'list', 'pin', 'unpin', 'forget', 'import', 'init', 'setup', 'session', 'hub', 'diff', 'tree', 'help', '-h', '--help', '-V', '--version')
     if ($args.Count -gt 0 -and ($passthrough -ccontains [string]$args[0])) {
       & $exe @args
       return
@@ -388,6 +388,7 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
 "##;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Shell {
     Zsh,
     Bash,
@@ -507,6 +508,14 @@ mod tests {
             assert!(!s.contains("@TOOLS@"), "{sh:?}");
             assert!(s.contains("tgt"), "{sh:?}");
         }
+    }
+
+    #[test]
+    fn hub_diff_tree_pass_through() {
+        assert!(script(Shell::Zsh).contains("session|hub|diff|tree|help"));
+        assert!(script(Shell::Bash).contains("session|hub|diff|tree|help"));
+        assert!(script(Shell::Fish).contains("session hub diff tree help"));
+        assert!(script(Shell::PowerShell).contains("'session', 'hub', 'diff', 'tree', 'help'"));
     }
 
     #[test]

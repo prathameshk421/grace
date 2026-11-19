@@ -1,5 +1,8 @@
 mod db;
+mod diffview;
 mod editors_live;
+mod git;
+mod hub;
 mod import;
 mod import_editors;
 mod integrations;
@@ -10,7 +13,10 @@ mod rank;
 mod session;
 mod setup;
 mod shell;
+mod sidebar;
 mod tools;
+mod treeview;
+mod tui;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -29,6 +35,10 @@ Examples:
   grace init zsh        print the shell setup code
   grace sessions        see which agent works or waits in which folder
   grace setup claude    let grace see the status of Claude Code
+  grace hub             open the hub: sidebar, shell, diff and tree (needs tmux)
+  grace hub ~/code/knn  open the hub on that folder
+  grace diff            see the git changes of this folder
+  grace tree            browse the files of this folder
 
 Setup: run `grace init --help` to see the line for your shell.";
 
@@ -144,11 +154,56 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionCmd,
     },
+    /// Open the hub: a sidebar, your shell, a live diff and a file tree in one tmux window
+    #[command(args_conflicts_with_subcommands = true, after_help = HUB_HELP)]
+    Hub {
+        #[command(subcommand)]
+        action: Option<HubCmd>,
+        /// Folder for the workspace. Default: the current folder
+        path: Option<PathBuf>,
+        /// Make the hub, but do not attach to it
+        #[arg(long, hide = true)]
+        no_attach: bool,
+    },
+    /// Show the git changes of a folder, with a colored diff
+    Diff {
+        /// Default: the current folder
+        path: Option<PathBuf>,
+    },
+    /// Show the files of a folder as a tree, with git changes marked
+    Tree {
+        /// Default: the current folder
+        path: Option<PathBuf>,
+    },
     /// Print the shell setup code
     #[command(after_long_help = INIT_HELP, after_help = INIT_HELP)]
     Init {
         /// zsh, bash, fish, powershell (or pwsh)
         shell: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HubCmd {
+    /// Show or hide a pane: sidebar, diff, tree, right, zoom or focus
+    #[command(hide = true)]
+    Toggle {
+        what: String,
+        /// tmux window id. Default: the window of this pane
+        window: Option<String>,
+    },
+    /// The sidebar pane
+    #[command(hide = true)]
+    Sidebar { path: PathBuf },
+    /// The main pane: runs your shell
+    #[command(hide = true)]
+    Shell,
+    /// Print the keys of the hub
+    #[command(hide = true)]
+    Keys {
+        /// Wait for a key before exit
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -215,6 +270,17 @@ enum ToolCmd {
     List,
 }
 
+const HUB_HELP: &str = "\
+The hub uses tmux on its own server, so your tmux setup stays as it is.
+
+Keys: press ctrl-g, then
+  s  sidebar      d  diff         t  tree
+  r  right side   z  zoom main    g  go to sidebar
+  q  detach       ?  all keys
+
+In the sidebar, type to filter. Enter opens the folder in its own workspace.
+ctrl-o also starts the AI tool you used there last.";
+
 const NEW_TERMINAL: &str = "Open a new terminal (or run: exec zsh) to start tracking it.";
 
 fn resolve(path: Option<PathBuf>) -> Result<String> {
@@ -225,13 +291,13 @@ fn resolve(path: Option<PathBuf>) -> Result<String> {
     Ok(platform::normalize(&p))
 }
 
-fn load(db: &db::Db, reg: &tools::Registry, tag: Option<&str>) -> Result<Vec<model::Entry>> {
+pub(crate) fn load(db: &db::Db, reg: &tools::Registry, tag: Option<&str>) -> Result<Vec<model::Entry>> {
     let now = model::now();
     let mut entries: Vec<_> = db
         .list_entries()?
         .into_iter()
         .filter(|e| std::path::Path::new(&e.path).is_dir())
-        .filter(|e| tag.map_or(true, |t| e.has_tag(&reg.normalize_tag(t))))
+        .filter(|e| tag.is_none_or(|t| e.has_tag(&reg.normalize_tag(t))))
         .collect();
     rank::sort_entries(&mut entries, now);
     Ok(entries)
@@ -380,12 +446,13 @@ fn session_data(
         let b = &best[&e.path];
         (picker::urgency(b.status), b.updated_at)
     };
-    entries.sort_by(|a, b| key(b).cmp(&key(a)));
+    entries.sort_by_key(|e| std::cmp::Reverse(key(e)));
     Ok((entries, sessions))
 }
 
 /// Run the picker and print the result for the shell function.
 /// Line 1 is the folder to cd to (empty: stay). Line 2, if present, is a command to run.
+#[allow(clippy::too_many_arguments)]
 fn travel(
     db: &db::Db,
     reg: &tools::Registry,
@@ -441,8 +508,19 @@ fn travel(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(Cmd::Session { action }) = cli.cmd {
-        return run_session(action);
+    match cli.cmd {
+        Some(Cmd::Session { action }) => return run_session(action),
+        Some(Cmd::Diff { path }) => {
+            let p = resolve(path)?;
+            return tui::run(&mut diffview::DiffView::new(p.into(), picker::Theme::from_env()));
+        }
+        Some(Cmd::Tree { path }) => {
+            let p = resolve(path)?;
+            return tui::run(&mut treeview::TreeView::new(p.into(), picker::Theme::from_env()));
+        }
+        Some(Cmd::Hub { action: Some(HubCmd::Shell), .. }) => return hub::shell(),
+        Some(Cmd::Hub { action: Some(HubCmd::Keys { wait }), .. }) => return hub::keys(wait),
+        _ => {}
     }
     let (db, fresh) = db::Db::open_default()?;
     if fresh {
@@ -489,7 +567,13 @@ fn main() -> Result<()> {
             travel(&db, &reg, data, picker::View::Sessions, None, q, open, full)?;
         }
         Cmd::Setup { target, remove } => setup::run(&target, remove)?,
-        Cmd::Session { .. } => {}
+        Cmd::Session { .. } | Cmd::Diff { .. } | Cmd::Tree { .. } => {}
+        Cmd::Hub { action, path, no_attach } => match action {
+            None => hub::start(&db, &resolve(path)?, !no_attach)?,
+            Some(HubCmd::Toggle { what, window }) => hub::toggle(&db, &what, window.as_deref())?,
+            Some(HubCmd::Sidebar { path }) => hub::run_sidebar(&db, &reg, &resolve(Some(path))?)?,
+            Some(HubCmd::Shell) | Some(HubCmd::Keys { .. }) => {}
+        },
         Cmd::Add { path } => {
             let p = resolve(Some(path))?;
             if !platform::ignored(&p) {
