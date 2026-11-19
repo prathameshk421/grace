@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.2
 
 - Fix: with Homebrew, `grace setup` saved the versioned Cellar path in the CLI hooks. The next `brew upgrade` deleted that folder, and Claude Code showed "SessionStart hook failed". grace now saves the stable `/opt/homebrew/bin/grace`. The hub's ctrl-g keys use it too. Run `grace setup <cli>` again to update an older setup.
 
