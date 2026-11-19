@@ -57,7 +57,7 @@ pub fn best_by_path(sessions: &[Session]) -> Best {
 }
 
 /// Words that the search matches for a session status.
-fn status_words(s: Status) -> &'static str {
+pub(crate) fn status_words(s: Status) -> &'static str {
     match s {
         Status::Waiting => "waiting needs",
         Status::Ready => "ready your turn",
@@ -66,7 +66,7 @@ fn status_words(s: Status) -> &'static str {
     }
 }
 
-fn haystack(e: &Entry, best: &Best) -> String {
+pub(crate) fn haystack(e: &Entry, best: &Best) -> String {
     let mut s = e.path.clone();
     for t in &e.tags {
         s.push(' ');
@@ -80,7 +80,7 @@ fn haystack(e: &Entry, best: &Best) -> String {
 }
 
 /// Return indices into `entries` that match `query`, best first.
-fn filter(entries: &[Entry], best: &Best, query: &str) -> Vec<usize> {
+pub(crate) fn filter(entries: &[Entry], best: &Best, query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
         return (0..entries.len()).collect();
     }
@@ -98,7 +98,7 @@ fn filter(entries: &[Entry], best: &Best, query: &str) -> Vec<usize> {
         })
         .collect();
     // Stable sort keeps the original order for equal scores.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
@@ -114,7 +114,7 @@ fn match_positions(path: &str, query: &str, matcher: &mut Matcher) -> Vec<u32> {
     idx
 }
 
-fn time_ago(now: i64, then: i64) -> String {
+pub(crate) fn time_ago(now: i64, then: i64) -> String {
     let d = (now - then).max(0);
     match d {
         0..=59 => "now".into(),
@@ -129,7 +129,7 @@ fn time_ago(now: i64, then: i64) -> String {
 
 /// Each tool's tag uses the main color of its logo. Colors come from the
 /// official logo files. A logo that is only black and white gets a light gray.
-fn tag_color(tool: &str) -> Color {
+pub(crate) fn tag_color(tool: &str) -> Color {
     const MONO: Color = Color::Rgb(220, 220, 220);
     match tool {
         // AI tools
@@ -228,14 +228,14 @@ pub struct Opts<'a> {
 // Theme
 
 /// Grace gold.
-const GOLD: Color = Color::Rgb(232, 185, 74);
+pub(crate) const GOLD: Color = Color::Rgb(232, 185, 74);
 const SEL_BG: Color = Color::Rgb(40, 44, 52);
 const OPEN_BLUE: Color = Color::Rgb(97, 175, 239);
 const MAX_WIDTH: u16 = 110;
 const NAME_MAX: usize = 28;
 const TAGS_MAX: usize = 32;
 const PARENT_MAX: usize = 30;
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub(crate) const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FLASH_FOR: Duration = Duration::from_millis(1500);
 const TICK: Duration = Duration::from_millis(100);
 const HINTS: [(&str, &str); 4] =
@@ -251,7 +251,7 @@ pub struct Theme {
 
 impl Theme {
     pub fn from_env() -> Theme {
-        let color = std::env::var_os("NO_COLOR").map_or(true, |v| v.is_empty());
+        let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
         let truecolor = std::env::var("COLORTERM")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "truecolor" | "24bit"))
             .unwrap_or(false);
@@ -259,7 +259,7 @@ impl Theme {
     }
 
     /// Map a color to what the terminal can show. None means no color.
-    fn map(&self, c: Color) -> Option<Color> {
+    pub(crate) fn map(&self, c: Color) -> Option<Color> {
         if !self.color {
             return None;
         }
@@ -269,14 +269,14 @@ impl Theme {
         }
     }
 
-    fn fg(&self, s: Style, c: Color) -> Style {
+    pub(crate) fn fg(&self, s: Style, c: Color) -> Style {
         match self.map(c) {
             Some(c) => s.fg(c),
             None => s,
         }
     }
 
-    fn accent(&self) -> Color {
+    pub(crate) fn accent(&self) -> Color {
         if self.truecolor {
             GOLD
         } else {
@@ -284,7 +284,7 @@ impl Theme {
         }
     }
 
-    fn sel_bg(&self) -> Option<Color> {
+    pub(crate) fn sel_bg(&self) -> Option<Color> {
         if !self.color {
             None
         } else if self.truecolor {
@@ -295,7 +295,7 @@ impl Theme {
     }
 
     /// Apply the theme rules (NO_COLOR, 256 colors) to a style that may hold a color.
-    fn apply(&self, s: Style) -> Style {
+    pub(crate) fn apply(&self, s: Style) -> Style {
         let mut out = Style::default().add_modifier(s.add_modifier).remove_modifier(s.sub_modifier);
         if let Some(c) = s.fg.and_then(|c| self.map(c)) {
             out = out.fg(c);
@@ -318,7 +318,7 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
     16 + 36 * q(r) + 6 * q(g) + q(b)
 }
 
-fn dim() -> Style {
+pub(crate) fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
@@ -331,7 +331,7 @@ fn cw(c: char) -> usize {
     Span::raw(&*c.encode_utf8(&mut b)).width()
 }
 
-fn sw(s: &str) -> usize {
+pub(crate) fn sw(s: &str) -> usize {
     Span::raw(s).width()
 }
 
@@ -727,7 +727,7 @@ struct RowView {
     time: String,
 }
 
-fn tags_width(tags: &[(String, bool)]) -> usize {
+pub(crate) fn tags_width(tags: &[(String, bool)]) -> usize {
     if tags.is_empty() {
         0
     } else {
@@ -742,7 +742,7 @@ struct Ctx {
 }
 
 /// Glyph, word and style for a status.
-fn status_look(s: Status, frame: usize) -> (char, &'static str, Style) {
+pub(crate) fn status_look(s: Status, frame: usize) -> (char, &'static str, Style) {
     match s {
         Status::Waiting => ('●', "needs you", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Status::Ready => ('○', "your turn", Style::default()),

@@ -52,7 +52,7 @@ const STALE_AFTER: i64 = 12 * 3600;
 const PRUNE_AFTER: i64 = 7 * 86400;
 
 /// Directory that holds the database file.
-fn data_dir() -> Result<PathBuf> {
+pub fn data_dir() -> Result<PathBuf> {
     let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     if let Some(d) = non_empty("GRACE_DATA_DIR") {
         return Ok(PathBuf::from(d));

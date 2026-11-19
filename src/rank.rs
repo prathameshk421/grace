@@ -24,7 +24,7 @@ pub fn score(e: &Entry, now: i64) -> f64 {
     base * mult
 }
 
-pub fn sort_entries(entries: &mut Vec<Entry>, now: i64) {
+pub fn sort_entries(entries: &mut [Entry], now: i64) {
     entries.sort_by(|a, b| {
         b.pinned
             .cmp(&a.pinned)
