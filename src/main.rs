@@ -166,7 +166,7 @@ enum SessionCmd {
     Set {
         path: PathBuf,
         tool: String,
-        /// working, waiting or done
+        /// working, waiting, ready or done
         status: String,
     },
     /// Read a hook event of an agent CLI. Never fails, prints nothing.
@@ -246,7 +246,7 @@ fn run_session(action: SessionCmd) -> Result<()> {
         SessionCmd::End { pid } => db.session_end_pid(pid, now)?,
         SessionCmd::Set { path, tool, status } => {
             let Some(status) = model::Status::parse(&status) else {
-                bail!("status must be working, waiting or done");
+                bail!("status must be working, waiting, ready or done");
             };
             let tool = reg.normalize_tag(&tool);
             let p = resolve(Some(path))?;
@@ -274,7 +274,7 @@ fn run_hook(agent: HookCmd) -> Result<()> {
             let Some(cwd) = json.and_then(|j| session::parse_codex_notify(&j)) else {
                 return Ok(());
             };
-            ("codex", model::Status::Waiting, cwd)
+            ("codex", model::Status::Ready, cwd)
         }
     };
     let p = resolve(cwd.map(PathBuf::from))?;
@@ -337,8 +337,8 @@ fn main() -> Result<()> {
                 let home = platform::home_dir().map(|h| h.to_string_lossy().into_owned());
                 for s in &sessions {
                     println!(
-                        "{:<8} {:<12} {}  {}",
-                        s.status.as_str(),
+                        "{:<9} {:<12} {}  {}",
+                        s.status.label(),
                         s.tool,
                         picker::display_path(&s.path, home.as_deref()),
                         rank::time_ago(s.updated_at, now)

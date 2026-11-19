@@ -47,8 +47,10 @@ pub fn now() -> i64 {
 pub enum Status {
     /// The agent is working on a turn.
     Working,
-    /// The agent waits for the user (a question, a permission, or its turn ended).
+    /// The agent is blocked on the user (a permission prompt or a question).
     Waiting,
+    /// The agent finished its turn or just started. It is ready for the next prompt.
+    Ready,
     /// The CLI exited.
     Done,
 }
@@ -58,13 +60,22 @@ impl Status {
         match self {
             Status::Working => "working",
             Status::Waiting => "waiting",
+            Status::Ready => "ready",
             Status::Done => "done",
+        }
+    }
+    /// Text for people, for example in `grace sessions -l`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Ready => "your turn",
+            other => other.as_str(),
         }
     }
     pub fn parse(s: &str) -> Option<Status> {
         match s {
             "working" => Some(Status::Working),
             "waiting" => Some(Status::Waiting),
+            "ready" => Some(Status::Ready),
             "done" => Some(Status::Done),
             _ => None,
         }
@@ -84,4 +95,19 @@ pub struct Session {
     pub started_at: i64,
     /// Last status change.
     pub updated_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_round_trip() {
+        for s in [Status::Working, Status::Waiting, Status::Ready, Status::Done] {
+            assert_eq!(Status::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(Status::Ready.as_str(), "ready");
+        assert_eq!(Status::Ready.label(), "your turn");
+        assert_eq!(Status::parse("bogus"), None);
+    }
 }

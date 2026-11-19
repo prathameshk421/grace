@@ -42,7 +42,7 @@ CREATE INDEX IF NOT EXISTS sessions_path_tool ON sessions(path, tool);
 
 /// Seconds a done session stays visible.
 const DONE_VISIBLE: i64 = 30 * 60;
-/// Seconds without update before a working or waiting session counts as done.
+/// Seconds without update before a working, waiting or ready session counts as done.
 const STALE_AFTER: i64 = 12 * 3600;
 /// Seconds before a done row is deleted.
 const PRUNE_AFTER: i64 = 7 * 86400;
@@ -438,6 +438,8 @@ mod tests {
         assert_eq!(status_of(&db, 12 * 3600 + 1, "/w"), Some(Status::Done));
         assert_eq!(status_of(&db, 12 * 3600 + 33 * 60, "/w"), None);
         // Old done rows are pruned.
+        db.session_set("/r", "claude", Status::Ready, 0).unwrap();
+        assert_eq!(status_of(&db, 12 * 3600 + 1, "/r"), Some(Status::Done));
         db.session_set("/x", "claude", Status::Waiting, 8 * 86400).unwrap();
         let n: i64 = db
             .conn

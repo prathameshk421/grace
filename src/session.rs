@@ -5,7 +5,8 @@ use serde_json::Value;
 /// Map a Claude Code CLI hook event to a status. None means ignore the event.
 pub fn claude_status(event: &str) -> Option<Status> {
     match event {
-        "SessionStart" | "Notification" | "Stop" => Some(Status::Waiting),
+        "SessionStart" | "Stop" => Some(Status::Ready),
+        "Notification" => Some(Status::Waiting),
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(Status::Working),
         "SessionEnd" => Some(Status::Done),
         _ => None,
@@ -33,7 +34,7 @@ pub fn parse_codex_notify(json: &str) -> Option<Option<String>> {
     Some(non_empty_str(&v, "cwd"))
 }
 
-/// Sort key: waiting first, then working, then done. Newest first inside each group.
+/// Sort key: waiting first, then ready, then working, then done. Newest first inside each group.
 pub fn sort_sessions(list: &mut [Session]) {
     list.sort_by(|a, b| {
         crate::picker::urgency(b.status)
@@ -49,12 +50,12 @@ mod tests {
 
     #[test]
     fn claude_events() {
-        assert_eq!(claude_status("SessionStart"), Some(Status::Waiting));
+        assert_eq!(claude_status("SessionStart"), Some(Status::Ready));
         assert_eq!(claude_status("UserPromptSubmit"), Some(Status::Working));
         assert_eq!(claude_status("PreToolUse"), Some(Status::Working));
         assert_eq!(claude_status("PostToolUse"), Some(Status::Working));
         assert_eq!(claude_status("Notification"), Some(Status::Waiting));
-        assert_eq!(claude_status("Stop"), Some(Status::Waiting));
+        assert_eq!(claude_status("Stop"), Some(Status::Ready));
         assert_eq!(claude_status("SubagentStop"), None);
         assert_eq!(claude_status("SessionEnd"), Some(Status::Done));
         assert_eq!(claude_status("Other"), None);
@@ -66,7 +67,7 @@ mod tests {
         assert_eq!(parse_claude_hook(j), Some((Status::Waiting, Some("/tmp/x".into()))));
         assert_eq!(
             parse_claude_hook(r#"{"hook_event_name":"Stop"}"#),
-            Some((Status::Waiting, None))
+            Some((Status::Ready, None))
         );
         assert_eq!(parse_claude_hook(r#"{"hook_event_name":"SubagentStop"}"#), None);
         assert_eq!(parse_claude_hook("not json"), None);
@@ -99,9 +100,11 @@ mod tests {
             s(3, Status::Waiting, 10),
             s(4, Status::Waiting, 20),
             s(5, Status::Working, 60),
+            s(6, Status::Ready, 5),
+            s(7, Status::Ready, 15),
         ];
         sort_sessions(&mut v);
         let ids: Vec<_> = v.iter().map(|x| x.id).collect();
-        assert_eq!(ids, vec![4, 3, 5, 2, 1]);
+        assert_eq!(ids, vec![4, 3, 7, 6, 5, 2, 1]);
     }
 }

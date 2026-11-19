@@ -25,10 +25,11 @@ use ratatui::{
 /// Sessions by folder, one per folder: the most urgent, then the newest.
 pub type Best = HashMap<String, Session>;
 
-/// Higher means more urgent: waiting, then working, then done.
+/// Higher means more urgent: waiting, then ready, then working, then done.
 pub fn urgency(s: Status) -> u8 {
     match s {
-        Status::Waiting => 2,
+        Status::Waiting => 3,
+        Status::Ready => 2,
         Status::Working => 1,
         Status::Done => 0,
     }
@@ -52,6 +53,7 @@ pub fn best_by_path(sessions: &[Session]) -> Best {
 fn status_words(s: Status) -> &'static str {
     match s {
         Status::Waiting => "waiting needs",
+        Status::Ready => "ready your turn",
         Status::Working => "working",
         Status::Done => "done",
     }
@@ -63,6 +65,7 @@ fn badge(s: Status) -> (&'static str, Style) {
             "\u{25cf} needs you",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
+        Status::Ready => ("\u{25cb} your turn", Style::default()),
         Status::Working => ("\u{25d0} working", Style::default().fg(Color::Cyan)),
         Status::Done => (
             "\u{2713} done",
@@ -451,6 +454,25 @@ mod tests {
         let best = best_by_path(&[done, s]);
         assert_eq!(best["/home/u/beta"].status, Status::Waiting);
         assert_eq!(filter(&sample(), &best, "needs"), vec![1]);
+    }
+
+    #[test]
+    fn ready_badge_and_search() {
+        let s = Session {
+            id: 1,
+            path: "/home/u/beta".into(),
+            tool: "codex".into(),
+            status: Status::Ready,
+            shell_pid: None,
+            started_at: 0,
+            updated_at: 5,
+        };
+        let work = Session { id: 2, status: Status::Working, updated_at: 9, ..s.clone() };
+        let best = best_by_path(&[work, s]);
+        assert_eq!(best["/home/u/beta"].status, Status::Ready);
+        assert!(urgency(Status::Waiting) > urgency(Status::Ready));
+        assert!(urgency(Status::Ready) > urgency(Status::Working));
+        assert_eq!(filter(&sample(), &best, "turn"), vec![1]);
     }
 
     #[test]

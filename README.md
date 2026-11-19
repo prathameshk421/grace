@@ -48,14 +48,17 @@ grace knn      # one match: go there now
 
 ## See which agent needs you.
 
-Run Claude Code, Codex and other CLI agents in many projects at once. `grace sessions` lists the live ones. The agents that wait for your answer come first.
+Run Claude Code, Codex and other CLI agents in many projects at once. `grace sessions` lists the live ones. The agents that need you come first.
 
 ```
 grace ❯
   ~/code/aiml/knn        [claude]   ● needs you     2m
+  ~/code/aiml/svm        [claude]   ○ your turn     5m
   ~/work/api-server      [codex]    ◐ working       now
   ~/code/aiml/kmeans     [agy]      ✓ done          12m
 ```
+
+"Needs you" means the agent is blocked on a question or a permission. "Your turn" means it finished.
 
 ```sh
 grace setup claude     # Claude Code CLI reports its status to grace
