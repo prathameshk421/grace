@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.1.0
+
+### Highlights & UI/UX ("Site of Grace")
+
+- **Unified adaptive theme**: Consistent Dark, Light, 256-color, `NO_COLOR`, and ASCII modes (`src/theme.rs`, auto-detecting `COLORTERM`, `WT_SESSION`, `Apple_Terminal`, `COLORFGBG`).
+- **Interactive Picker overhaul**:
+  - `Tab` / `Shift-Tab` switches live between **Folders** and **Sessions** tabs (or click tabs with the mouse).
+  - `Alt-i` toggles an inline **Inspector** panel with git status/ahead-behind, tool counts, pinned state, and active session details.
+  - Direct actions inside the picker: `Alt-p` pin/unpin, `Ctrl-d` forget (with confirmation), `Ctrl-y` copy path (native clipboard + OSC 52), `Ctrl-g` open in `grace hub`, `?` keybind modal (and `a` / `i` to add current folder or import history when empty).
+  - Zero-subprocess git branch & worktree discovery integrated into picker search & Inspector (plus active/open `◆` / `◇` hub workspace badges in the hub sidebar).
+- **Frameless Hub (`grace hub`)**:
+  - Focus-dimmed active borders, live `@grace_meta` headers (changed file counts, branch status), clickable panes/rows, `l` to cycle layout presets (`full` / `code+diff` / `sidebar+main` / `zen`), `P` to restore saved pane widths, `i` in `grace tree` to paste path to main pane, `n`/`p`/`Tab`/`w`/`1–9` workspace keys, and clear `✦ CTRL-G` command-mode indicator.
+- **Diff & Tree upgrades**:
+  - `grace diff`: old/new file line numbers, subtle green/red line washes, hunk jumping (`]`/`[`), stage/unstage (`s`/`u`), diff scope toggle (`S`: `all` / `unstaged` / `staged`), search (`/`, `n`/`N`), clickable file list & diff scroll.
+  - `grace tree`: crisp tree indent guides, `/` live filename filter, `c` changed-only toggle, `E`/`C` expand/collapse all, `y` copy path, `i` insert path into hub shell.
+- **Branded CLI help**: Clean colorized CLI output (respecting `NO_COLOR`/`CLICOLOR`/`TERM=dumb`), `grace --full <cmd>` anywhere before `--`, and `grace -t claude` / `grace -o <query>` direct picker flags.
+
+### New Commands & Configuration
+
+- `grace doctor [--fix]` — checks binary/PATH, shell integration, database permissions & `PRAGMA quick_check`, all 11 agent hooks, tmux hub readiness, and editor stores (with `--fix` auto-repair).
+- `grace prune [--dry-run] [--older-than DAYS]` — clean up tracked folders that no longer exist on disk.
+- `grace stats` — usage dashboard across tracked folders, visits, AI tools, and live sessions.
+- `grace setup` — shows a status overview board across all 11 CLI agents; add `--all` to configure (or remove) every detected agent in one command.
+- `grace list --json` & `grace sessions --json` — machine-readable JSON output for scripts.
+- `grace completions <shell>` — tab completions for `zsh`, `bash`, `fish`, and `powershell`.
+- Optional config file (`~/.config/grace/config.toml`, `%APPDATA%\grace\config.toml`, or `$GRACE_CONFIG`) for `theme`, `editor`, `ignore` globs, `ascii`, and `hub_layout`.
+
+### Security & Cross-Platform Reliability
+
+- Owner-only database directory (`0700`) and SQLite file (`0600`) permissions on Unix, SQLite `SQLITE_DBCONFIG_DEFENSIVE` + `trusted_schema = OFF`, `BEGIN IMMEDIATE` write locking, schema migrations, and improved session matching by `session_id` and `tmux_pane`.
+- Eliminated shell `eval` for GUI editor launching and `cmd /C start` on Windows (now uses argv-safe `Command` / Win32 `ShellExecuteW`), sanitized all display strings against ANSI/BiDi control injection, and rejected line breaks/NULs before stdout emission.
+- Atomic `0600` symlink-safe config writes across all 11 agent integrations, user-filtered live editor detection, capped file/subprocess reads, and zero-eval Bash history tokenizer + Fish empty-Enter fix + PowerShell async prompt preserving `$?`/`$LASTEXITCODE`.
+- Expanded release binaries to **8 targets**, adding static `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and `aarch64-pc-windows-msvc` (Windows ARM64), alongside hardened `install.sh` / `install.ps1` with SHA-256 and archive-path validation.
+
 ## 2.0.2
 
 - Fix: with Homebrew, `grace setup` saved the versioned Cellar path in the CLI hooks. The next `brew upgrade` deleted that folder, and Claude Code showed "SessionStart hook failed". grace now saves the stable `/opt/homebrew/bin/grace`. The hub's ctrl-g keys use it too. Run `grace setup <cli>` again to update an older setup.

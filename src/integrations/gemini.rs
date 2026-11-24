@@ -1,33 +1,18 @@
 //! gemini: Gemini CLI. Hooks go in `~/.gemini/settings.json` (Claude-style `hooks` map).
-//!
-//! Verified in the docs (https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/hooks/reference.md
-//! and docs/hooks/index.md in the same repo):
-//! - User settings file: `~/.gemini/settings.json` (index.md, "Configuration").
-//! - Config: `hooks.<Event>: [{ "matcher"?, "hooks": [{ "type": "command", "command": "..." }] }]`.
-//! - Input is JSON on stdin with `hook_event_name` and `cwd`.
-//! - Events used: BeforeAgent, BeforeTool, AfterTool, AfterAgent, SessionStart, SessionEnd, Notification.
-//! - `Notification` has `notification_type`. The docs list only "ToolPermission".
-//! - Stdout: on exit 0 "stdout is parsed as JSON", and plain text is not allowed. So we print
-//!   `{}` (no decision = allow, every output field is optional).
-//!
-//! Assumed (not in the docs): a group without `matcher` matches every tool and lifecycle event.
-//! A notification type that contains "idle" would mean Ready. Any other type means Waiting.
-//! `GRACE_GEMINI_DIR` replaces `~/.gemini` (grace only, not an official variable).
-//! We only touch `settings.json`. The agy hooks under `~/.gemini/config/` stay as they are.
-//!
-//! `json_hooks_add`, `json_hooks_remove` and `parse_event_json` are shared with qwen.rs
-//! (same Claude-style format).
-use super::{HookResult, Integration};
+use super::{HookResult, HookStatus, Integration};
 use crate::model::Status;
-use crate::setup::{env_dir, parse_settings, read_opt, shell_quote, write_atomic};
+use crate::platform;
+use crate::setup::{env_dir, parse_settings, read_opt, write_atomic};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 pub static INTEGRATION: Integration = Integration {
     name: "gemini",
+    label: "Gemini CLI",
     tool: "gemini",
     setup,
+    check,
     reads_stdin: true,
     hook,
     stdout: "{}",
@@ -57,6 +42,13 @@ fn setup(exe: &str, remove: bool) -> Result<String> {
     }
 }
 
+fn check(exe: &str) -> HookStatus {
+    let Ok(path) = settings_path() else {
+        return HookStatus::NotInstalled;
+    };
+    json_hooks_check(&path, exe, "gemini", EVENTS)
+}
+
 fn status_for(event: &str, ntype: &str) -> Option<Status> {
     match event {
         "BeforeAgent" | "BeforeTool" | "AfterTool" => Some(Status::Working),
@@ -72,32 +64,87 @@ fn hook(_args: &[String], stdin: &str) -> HookResult {
     parse_event_json(stdin, status_for)
 }
 
-/// Parse a Claude-style hook JSON (`hook_event_name`, `cwd`, `notification_type`).
+/// Parse a Claude-style hook JSON (`hook_event_name`, `cwd`, `notification_type`, `session_id`, `tool_name`).
 /// Bad JSON or an unknown event gives status None.
-pub(super) fn parse_event_json(
-    stdin: &str,
-    map: fn(&str, &str) -> Option<Status>,
-) -> HookResult {
+pub(super) fn parse_event_json(stdin: &str, map: fn(&str, &str) -> Option<Status>) -> HookResult {
     let Ok(v) = serde_json::from_str::<Value>(stdin) else {
         return HookResult::default();
     };
     let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
-    let status = map(text("hook_event_name"), text("notification_type"));
-    let cwd = Some(text("cwd")).filter(|s| !s.is_empty()).map(String::from);
-    HookResult { status, cwd }
-}
-
-/// Quote the exe for the shell, unless the caller already quoted it.
-pub(super) fn quote_once(exe: &str) -> String {
-    if exe.starts_with(['\'', '"']) {
-        exe.to_string()
-    } else {
-        shell_quote(exe)
+    let ev = text("hook_event_name");
+    let ntype = text("notification_type");
+    let status = map(ev, ntype);
+    let cwd = Some(text("cwd"))
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let session_id = Some(text("session_id"))
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let detail = match status {
+        Some(Status::Waiting) if !ntype.is_empty() => Some(platform::sanitize_display(ntype)),
+        Some(Status::Working) => {
+            let tn = text("tool_name");
+            (!tn.is_empty()).then(|| platform::sanitize_display(tn))
+        }
+        _ => None,
+    };
+    HookResult {
+        status,
+        cwd,
+        session_id,
+        detail,
     }
 }
 
 fn is_ours(hook: &Value, mark: &str) -> bool {
-    hook.get("command").and_then(Value::as_str).is_some_and(|c| c.contains(mark))
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|c| c.contains(mark))
+}
+
+pub(super) fn json_hooks_check(path: &Path, exe: &str, name: &str, events: &[&str]) -> HookStatus {
+    let Ok(Some(text)) = read_opt(path) else {
+        if path.parent().is_some_and(|p| p.is_dir()) || crate::tools::on_path(name) {
+            return HookStatus::Available(path.to_path_buf());
+        }
+        return HookStatus::NotInstalled;
+    };
+    let Ok(root) = parse_settings(path, Some(&text)) else {
+        return HookStatus::Conflict(path.to_path_buf(), "invalid JSON".into());
+    };
+    let mark = format!("session hook {name}");
+    let want = format!("{} {mark}", platform::quote_posix(exe));
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return HookStatus::Available(path.to_path_buf());
+    };
+    let mut has_ours = false;
+    let mut matches_all = true;
+    for event in events {
+        let found = hooks
+            .get(*event)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .find(|h| is_ours(h, &mark));
+        match found {
+            Some(h) => {
+                has_ours = true;
+                if h.get("command").and_then(Value::as_str) != Some(want.as_str()) {
+                    matches_all = false;
+                }
+            }
+            None => matches_all = false,
+        }
+    }
+    if has_ours && matches_all {
+        HookStatus::Connected(path.to_path_buf())
+    } else if has_ours {
+        HookStatus::OutdatedPath(path.to_path_buf())
+    } else {
+        HookStatus::Available(path.to_path_buf())
+    }
 }
 
 /// Add or update our command hooks in a Claude-style settings file.
@@ -109,7 +156,7 @@ pub(super) fn json_hooks_add(
     label: &str,
 ) -> Result<String> {
     let mark = format!("session hook {name}");
-    let cmd = format!("{} {mark}", quote_once(exe));
+    let cmd = format!("{} {mark}", platform::quote_posix(exe));
     let text = read_opt(path)?;
     let mut root = parse_settings(path, text.as_deref())?;
     let hooks = root
@@ -118,7 +165,12 @@ pub(super) fn json_hooks_add(
         .entry("hooks")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| anyhow!("'hooks' in {} is not an object. Nothing changed", path.display()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "'hooks' in {} is not an object. Nothing changed",
+                path.display()
+            )
+        })?;
     let (mut added, mut updated) = (vec![], vec![]);
     for event in events {
         let groups = hooks
@@ -126,11 +178,16 @@ pub(super) fn json_hooks_add(
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| {
-                anyhow!("hooks.{event} in {} is not an array. Nothing changed", path.display())
+                anyhow!(
+                    "hooks.{event} in {} is not an array. Nothing changed",
+                    path.display()
+                )
             })?;
         let (mut found, mut changed) = (false, false);
         for g in groups.iter_mut() {
-            let Some(list) = g.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
+            let Some(list) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
             for h in list.iter_mut().filter(|h| is_ours(h, &mark)) {
                 found = true;
                 if h["command"].as_str() != Some(&cmd) {
@@ -141,7 +198,10 @@ pub(super) fn json_hooks_add(
         }
         if !found {
             let mut g = Map::new();
-            g.insert("hooks".into(), json!([{ "type": "command", "command": cmd }]));
+            g.insert(
+                "hooks".into(),
+                json!([{ "type": "command", "command": cmd }]),
+            );
             groups.push(Value::Object(g));
             added.push(*event);
         } else if changed {
@@ -149,7 +209,10 @@ pub(super) fn json_hooks_add(
         }
     }
     if added.is_empty() && updated.is_empty() {
-        return Ok(format!("{}: grace hooks already set up. Nothing to do.", path.display()));
+        return Ok(format!(
+            "{}: grace hooks already set up. Nothing to do.",
+            path.display()
+        ));
     }
     let mut out = serde_json::to_string_pretty(&root)?;
     out.push('\n');
@@ -161,7 +224,9 @@ pub(super) fn json_hooks_add(
     if !updated.is_empty() {
         msg.push_str(&format!("\n  updated path: {}", updated.join(", ")));
     }
-    msg.push_str(&format!("\nRestart running {label} sessions to pick this up."));
+    msg.push_str(&format!(
+        "\nRestart running {label} sessions to pick this up."
+    ));
     Ok(msg)
 }
 
@@ -177,7 +242,9 @@ pub(super) fn json_hooks_remove(path: &Path, name: &str, label: &str) -> Result<
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         let events: Vec<String> = hooks.keys().cloned().collect();
         for ev in events {
-            let Some(groups) = hooks.get_mut(&ev).and_then(Value::as_array_mut) else { continue };
+            let Some(groups) = hooks.get_mut(&ev).and_then(Value::as_array_mut) else {
+                continue;
+            };
             let mut n = 0;
             for g in groups.iter_mut() {
                 if let Some(list) = g.get_mut("hooks").and_then(Value::as_array_mut) {
@@ -188,7 +255,9 @@ pub(super) fn json_hooks_remove(path: &Path, name: &str, label: &str) -> Result<
             }
             if n > 0 {
                 groups.retain(|g| {
-                    g.get("hooks").and_then(Value::as_array).is_none_or(|l| !l.is_empty())
+                    g.get("hooks")
+                        .and_then(Value::as_array)
+                        .is_none_or(|l| !l.is_empty())
                 });
                 removed.push(ev.clone());
                 if groups.is_empty() {
@@ -201,7 +270,10 @@ pub(super) fn json_hooks_remove(path: &Path, name: &str, label: &str) -> Result<
         }
     }
     if removed.is_empty() {
-        return Ok(format!("{}: no grace hooks found. Nothing to do.", path.display()));
+        return Ok(format!(
+            "{}: no grace hooks found. Nothing to do.",
+            path.display()
+        ));
     }
     let mut out = serde_json::to_string_pretty(&root)?;
     out.push('\n');
@@ -245,7 +317,9 @@ mod tests {
         assert!(p.with_file_name("settings.json.grace-backup").exists());
         assert!(add(&p, EXE).ends_with("already set up. Nothing to do."));
         assert!(add(&p, "/new/grace").contains("updated path"));
-        assert!(fs::read_to_string(&p).unwrap().contains("/new/grace session hook gemini"));
+        assert!(fs::read_to_string(&p)
+            .unwrap()
+            .contains("/new/grace session hook gemini"));
         assert!(!fs::read_to_string(&p).unwrap().contains(EXE));
         run(&p, |p| json_hooks_remove(p, "gemini", "Gemini CLI"));
         assert_eq!(read(&p), other);
@@ -273,15 +347,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn exe_quoted_once() {
+    fn exe_quoted_cleanly() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("settings.json");
         add(&p, "/a b/grace");
         let v = read(&p);
-        assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["command"], "'/a b/grace' session hook gemini");
-        assert!(add(&p, "'/a b/grace'").ends_with("Nothing to do."));
-        assert_eq!(quote_once("/x/grace"), "/x/grace");
+        assert_eq!(
+            v["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            "'/a b/grace' session hook gemini"
+        );
+        assert!(add(&p, "/a b/grace").ends_with("Nothing to do."));
     }
 
     #[test]
@@ -300,9 +375,14 @@ mod tests {
 
     #[test]
     fn hook_parse() {
-        let r = hook(&[], r#"{"hook_event_name":"BeforeTool","cwd":"/p/x","session_id":"1"}"#);
+        let r = hook(
+            &[],
+            r#"{"hook_event_name":"BeforeTool","cwd":"/p/x","session_id":"1","tool_name":"shell"}"#,
+        );
         assert_eq!(r.status, Some(Status::Working));
         assert_eq!(r.cwd.as_deref(), Some("/p/x"));
+        assert_eq!(r.session_id.as_deref(), Some("1"));
+        assert_eq!(r.detail.as_deref(), Some("shell"));
         assert_eq!(hook(&[], "not json"), HookResult::default());
         assert_eq!(hook(&[], "").status, None);
         assert_eq!(hook(&[], "[1]").status, None);

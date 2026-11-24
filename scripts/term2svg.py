@@ -3,7 +3,7 @@
 
 Usage: term2svg.py <capture.txt> <out.svg> "<window title>" "<aria label>"
 
-The style matches assets/demo.svg: same font, cell size, colors and frame.
+Matches assets/demo.svg: font, cell geometry, Site of Grace palette, and frame.
 """
 import html
 import re
@@ -17,7 +17,12 @@ ANSI = [
 ]
 
 
+def clamp_byte(v):
+    return max(0, min(255, int(v)))
+
+
 def c256(n):
+    n = max(0, min(255, int(n)))
     if n < 16:
         return ANSI[n]
     if n < 232:
@@ -29,7 +34,9 @@ def c256(n):
 
 
 def sgr(params, st):
-    p = [int(x) if x else 0 for x in params.split(";")] if params else [0]
+    p = [int(x) if x else 0 for x in params.split(";") if x == "" or x.isdigit()] if params else [0]
+    if not p:
+        p = [0]
     i = 0
     while i < len(p):
         n = p[i]
@@ -72,7 +79,7 @@ def sgr(params, st):
                 st[key] = c256(p[i + 2])
                 i += 2
             elif p[i + 1] == 2 and i + 4 < len(p):
-                st[key] = "#%02x%02x%02x" % tuple(p[i + 2 : i + 5])
+                st[key] = "#%02x%02x%02x" % tuple(clamp_byte(v) for v in p[i + 2 : i + 5])
                 i += 4
         i += 1
 
@@ -102,7 +109,7 @@ def colors(s):
 
 def render(rows, title, label):
     w = max((len(r) for r in rows), default=1)
-    h = len(rows)
+    h = max(1, len(rows))
     width = int(w * CW + 2 * PX + 0.999)
     height = int(PY + 34 + (h - 1) * LH + 20 + 0.999)
     o = [
@@ -119,13 +126,23 @@ def render(rows, title, label):
     top = PY + 34
     for y, row in enumerate(rows):
         base = top + y * LH
-        for x, (ch, s) in enumerate(row):
-            _, bg = colors(s)
+        # Coalesce adjacent background cells of the same color into single rects.
+        x = 0
+        while x < len(row):
+            _, bg = colors(row[x][1])
             if bg and bg != BG:
+                start = x
+                while x < len(row) and colors(row[x][1])[1] == bg:
+                    x += 1
+                rw = (x - start) * CW + 0.3
                 o.append(
-                    f'<rect x="{PX + x * CW:.1f}" y="{base - 15:.1f}" width="{CW + 0.3:.1f}" '
+                    f'<rect x="{PX + start * CW:.1f}" y="{base - 15:.1f}" width="{rw:.1f}" '
                     f'height="{LH}" fill="{bg}"/>'
                 )
+            else:
+                x += 1
+
+        # Coalesce adjacent visible text glyphs with matching attributes into single <text> spans.
         x = 0
         while x < len(row):
             ch, s = row[x]
@@ -135,8 +152,11 @@ def render(rows, title, label):
             key = (colors(s)[0], s.get("bold"), s.get("dim"), s.get("ul"), s.get("italic"))
             start, run = x, ""
             while x < len(row) and row[x][0].strip() and (
-                colors(row[x][1])[0], row[x][1].get("bold"), row[x][1].get("dim"),
-                row[x][1].get("ul"), row[x][1].get("italic"),
+                colors(row[x][1])[0],
+                row[x][1].get("bold"),
+                row[x][1].get("dim"),
+                row[x][1].get("ul"),
+                row[x][1].get("italic"),
             ) == key:
                 run += row[x][0]
                 x += 1

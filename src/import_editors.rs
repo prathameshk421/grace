@@ -2,24 +2,63 @@
 use crate::db::Db;
 use crate::model;
 use crate::platform;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{config::DbConfig, Connection, OpenFlags};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+const MAX_WORKSPACE_JSON_BYTES: usize = 2 << 20;
+
 /// Valid values for `grace import [source]`.
-pub const SOURCES: &[&str] = &["all", "claude", "vscode", "cursor", "windsurf", "antigravity", "zed", "t3code"];
+pub const SOURCES: &[&str] = &[
+    "all",
+    "claude",
+    "vscode",
+    "cursor",
+    "windsurf",
+    "antigravity",
+    "zed",
+    "t3code",
+];
 
 /// The sources that `all` runs, in order.
-const ALL: &[&str] = &["claude", "vscode", "cursor", "windsurf", "antigravity", "zed", "t3code"];
+const ALL: &[&str] = &[
+    "claude",
+    "vscode",
+    "cursor",
+    "windsurf",
+    "antigravity",
+    "zed",
+    "t3code",
+];
 
 /// (app folder name, tag) for each source of the VS Code family.
 fn vscode_apps(source: &str) -> &'static [(&'static str, &'static str)] {
     match source {
-        "vscode" => &[("Code", "vscode"), ("Code - Insiders", "vscode"), ("VSCodium", "vscodium")],
+        "vscode" => &[
+            ("Code", "vscode"),
+            ("Code - Insiders", "vscode"),
+            ("VSCodium", "vscodium"),
+        ],
         "cursor" => &[("Cursor", "cursor")],
         "windsurf" => &[("Windsurf", "windsurf")],
-        "antigravity" => &[("Antigravity", "antigravity"), ("Antigravity IDE", "antigravity")],
+        "antigravity" => &[
+            ("Antigravity", "antigravity"),
+            ("Antigravity IDE", "antigravity"),
+        ],
+        _ => &[],
+    }
+}
+
+/// Flatpak app IDs for VS Code family on Linux.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn flatpak_apps(source: &str) -> &'static [(&'static str, &'static str, &'static str)] {
+    match source {
+        "vscode" => &[
+            ("com.visualstudio.code", "Code", "vscode"),
+            ("com.visualstudio.code-oss", "Code - OSS", "vscode"),
+            ("com.vscodium.codium", "VSCodium", "vscodium"),
+        ],
         _ => &[],
     }
 }
@@ -49,10 +88,46 @@ pub fn import_all(db: &Db) -> Vec<(&'static str, usize)> {
         .collect()
 }
 
+/// List configured import source paths that exist on this machine (for `grace doctor`).
+pub fn detected_sources() -> Vec<(&'static str, PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(h) = platform::home_dir() {
+        let p = h.join(".claude.json");
+        if p.is_file() {
+            out.push(("claude", p));
+        }
+    }
+    if let Some(root) = config_root() {
+        for src in ["vscode", "cursor", "windsurf", "antigravity"] {
+            for (app, _) in vscode_apps(src) {
+                let p = root.join(app);
+                if p.is_dir() {
+                    out.push((src, p));
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(p) = zed_db_path() {
+        if p.is_file() {
+            out.push(("zed", p));
+        }
+    }
+    if let Some(p) = t3code_db_path() {
+        if p.is_file() {
+            out.push(("t3code", p));
+        }
+    }
+    out
+}
+
 // ---------- locations ----------
 
 fn env_dir(key: &str) -> Option<PathBuf> {
-    std::env::var(key).ok().filter(|v| !v.is_empty()).map(PathBuf::from)
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Folder that holds the app data of editors (`Application Support`, `%APPDATA%`, `~/.config`).
@@ -62,7 +137,9 @@ pub(crate) fn config_root() -> Option<PathBuf> {
     } else if cfg!(windows) {
         env_dir("APPDATA")
     } else {
-        env_dir("XDG_CONFIG_HOME").or_else(|| platform::home_dir().map(|h| h.join(".config")))
+        env_dir("XDG_CONFIG_HOME")
+            .filter(|p| p.is_absolute())
+            .or_else(|| platform::home_dir().map(|h| h.join(".config")))
     }
 }
 
@@ -73,10 +150,18 @@ fn zed_db_path() -> Option<PathBuf> {
         env_dir("LOCALAPPDATA")?.join("Zed")
     } else {
         env_dir("XDG_DATA_HOME")
+            .filter(|p| p.is_absolute())
             .or_else(|| platform::home_dir().map(|h| h.join(".local/share")))?
             .join("zed")
     };
-    Some(base.join("db").join("0-stable").join("db.sqlite"))
+    let db_dir = base.join("db");
+    for channel in ["0-stable", "0-preview", "0-nightly"] {
+        let p = db_dir.join(channel).join("db.sqlite");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    Some(db_dir.join("0-stable").join("db.sqlite"))
 }
 
 fn mtime(p: &Path) -> Option<i64> {
@@ -135,8 +220,41 @@ fn file_uri_to_path(uri: &str) -> Option<String> {
     uri_to_path(uri, cfg!(windows))
 }
 
-/// The `folderUri` values with the `file:` scheme, in order, from the value of
-/// `history.recentlyOpenedPathsList`.
+/// Folder paths decoded from `history.recentlyOpenedPathsList`, including `.code-workspace` files.
+pub fn parse_recent_folders(json: &str, windows: bool) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("entries").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in arr {
+        if let Some(u) = entry.get("folderUri").and_then(|u| u.as_str()) {
+            if let Some(p) = uri_to_path(u, windows) {
+                out.push(p);
+            }
+            continue;
+        }
+        if let Some(cfg) = entry
+            .get("workspace")
+            .and_then(|w| w.get("configPath"))
+            .and_then(|c| c.as_str())
+        {
+            if let Some(file) = uri_to_path(cfg, windows) {
+                if let Some((dir, name)) = file.rsplit_once(['/', '\\']) {
+                    if name.ends_with(".code-workspace") && !dir.is_empty() {
+                        out.push(platform::clean_path_str(dir));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `folderUri` values with the `file:` scheme, in order, from `history.recentlyOpenedPathsList`.
+#[cfg(test)]
 pub fn parse_recent_folder_uris(json: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
@@ -164,31 +282,71 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// Parse "YYYY-MM-DD HH:MM:SS" (UTC) into Unix seconds.
+/// Parse "YYYY-MM-DD HH:MM:SS" or ISO-8601 timestamp (including `+HH:MM` / `-HH:MM` offsets) into Unix seconds.
 pub fn parse_zed_timestamp(s: &str) -> Option<i64> {
     let s = s.trim();
-    let (date, time) = s.split_once([' ', 'T'])?;
+    let (date, time_raw) = s.split_once([' ', 'T'])?;
     let mut d = date.split('-');
     let (y, mo, da) = (d.next()?, d.next()?, d.next()?);
-    let time = time.split(['.', '+', 'Z']).next()?;
+    if d.next().is_some() {
+        return None;
+    }
+    // Strip optional trailing Z or +HH:MM / -HH:MM timezone offset.
+    let (time_no_tz, tz_offset_secs) = split_tz_offset(time_raw.trim());
+    let time = time_no_tz.split('.').next()?;
     let mut t = time.split(':');
     let (h, mi, se) = (t.next()?, t.next()?, t.next()?);
     let n = |x: &str| x.parse::<i64>().ok();
     let (y, mo, da, h, mi, se) = (n(y)?, n(mo)?, n(da)?, n(h)?, n(mi)?, n(se)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || h > 23 || mi > 59 || se > 60 {
+    if !(1970..=9999).contains(&y)
+        || !(1..=12).contains(&mo)
+        || !(1..=31).contains(&da)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&mi)
+        || !(0..=60).contains(&se)
+    {
         return None;
     }
-    Some(days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se)
+    let utc = days_from_civil(y, mo, da)
+        .saturating_mul(86400)
+        .saturating_add(h * 3600 + mi * 60 + se);
+    Some(utc.saturating_sub(tz_offset_secs))
 }
 
-/// Parse "YYYY-MM-DDTHH:MM:SS(.fff)?Z" (UTC) into Unix seconds.
+fn split_tz_offset(s: &str) -> (&str, i64) {
+    if let Some(base) = s.strip_suffix('Z') {
+        return (base, 0);
+    }
+    if let Some(pos) = s.rfind(['+', '-']) {
+        if pos >= 8 {
+            let sign = if s.as_bytes()[pos] == b'-' { -1 } else { 1 };
+            let off = &s[pos + 1..];
+            if let Some((hh, mm)) = off.split_once(':') {
+                if let (Ok(h), Ok(m)) = (hh.parse::<i64>(), mm.parse::<i64>()) {
+                    if (0..=23).contains(&h) && (0..=59).contains(&m) {
+                        return (&s[..pos], sign * (h * 3600 + m * 60));
+                    }
+                }
+            } else if off.is_ascii() && off.len() == 4 {
+                if let (Ok(h), Ok(m)) = (off[..2].parse::<i64>(), off[2..].parse::<i64>()) {
+                    if (0..=23).contains(&h) && (0..=59).contains(&m) {
+                        return (&s[..pos], sign * (h * 3600 + m * 60));
+                    }
+                }
+            }
+        }
+    }
+    (s, 0)
+}
+
+/// Parse "YYYY-MM-DDTHH:MM:SS(.fff)?(Z|±HH:MM)?" into Unix seconds.
 pub fn parse_iso_timestamp(s: &str) -> Option<i64> {
     parse_zed_timestamp(s)
 }
 
 /// Build a `file:` URI for SQLite from a path. Special characters are percent-encoded.
 pub fn sqlite_uri(path: &str, query: &str) -> String {
-    let p = path.replace('\\', "/");
+    let p = platform::strip_verbatim(path).replace('\\', "/");
     let mut out = String::from("file:");
     if !p.starts_with('/') {
         out.push('/');
@@ -208,8 +366,16 @@ pub fn sqlite_uri(path: &str, query: &str) -> String {
 // ---------- readers ----------
 
 fn open_ro(path: &Path) -> Option<Connection> {
-    let uri = sqlite_uri(&path.to_string_lossy(), "immutable=1");
-    Connection::open_with_flags(uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI).ok()
+    let raw = path.to_string_lossy();
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let conn = Connection::open_with_flags(sqlite_uri(&raw, "mode=ro"), flags)
+        .or_else(|_| Connection::open_with_flags(sqlite_uri(&raw, "immutable=1"), flags))
+        .ok()?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
+    let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
+    let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false);
+    let _ = conn.execute_batch("PRAGMA trusted_schema = OFF;");
+    Some(conn)
 }
 
 fn recent_from_state_db(db_path: &Path) -> Vec<(String, i64)> {
@@ -229,10 +395,10 @@ fn recent_from_state_db(db_path: &Path) -> Vec<(String, i64)> {
         _ => return Vec::new(),
     };
     let base = mtime(db_path).unwrap_or_else(model::now);
-    parse_recent_folder_uris(&json)
-        .iter()
+    parse_recent_folders(&json, cfg!(windows))
+        .into_iter()
         .enumerate()
-        .filter_map(|(i, u)| file_uri_to_path(u).map(|p| (p, base - i as i64)))
+        .map(|(i, p)| (p, base.saturating_sub(i as i64)))
         .collect()
 }
 
@@ -243,13 +409,19 @@ fn recent_from_workspace_storage(dir: &Path) -> Vec<(String, i64)> {
     let mut out = Vec::new();
     for e in rd.flatten() {
         let sub = e.path();
-        let Ok(text) = std::fs::read_to_string(sub.join("workspace.json")) else {
+        let Ok(text) =
+            platform::read_to_string_capped(&sub.join("workspace.json"), MAX_WORKSPACE_JSON_BYTES)
+        else {
             continue;
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
-        let Some(path) = v.get("folder").and_then(|f| f.as_str()).and_then(file_uri_to_path) else {
+        let Some(path) = v
+            .get("folder")
+            .and_then(|f| f.as_str())
+            .and_then(file_uri_to_path)
+        else {
             continue;
         };
         out.push((path, mtime(&sub).unwrap_or_else(model::now)));
@@ -257,36 +429,62 @@ fn recent_from_workspace_storage(dir: &Path) -> Vec<(String, i64)> {
     out
 }
 
-/// Add folders to the database. Returns how many different folders were valid.
+/// Add folders to the database using canonicalized paths. Returns how many different folders were valid.
 fn store(db: &Db, found: Vec<(String, i64)>, tag: &str, seen: &mut HashSet<String>) -> usize {
-    let mut n = 0;
-    for (path, ts) in found {
-        if platform::ignored(&path) || !Path::new(&path).is_dir() || !seen.insert(path.clone()) {
+    let mut items = Vec::new();
+    for (raw, ts) in found {
+        if raw.is_empty() || platform::has_line_break_or_nul(&raw) {
             continue;
         }
-        if db.import_dir(&path, ts, Some(tag)).is_ok() {
-            n += 1;
+        let dir = Path::new(&raw);
+        if !dir.is_dir() {
+            continue;
         }
+        let path = platform::normalize(dir);
+        if platform::ignored(&path) || !seen.insert(path.clone()) {
+            continue;
+        }
+        items.push((path, ts));
     }
-    n
+    db.import_dirs_batch(&items, Some(tag)).unwrap_or(0)
 }
 
 fn import_vscode_family(db: &Db, source: &str) -> Option<usize> {
-    let root = config_root()?;
-    let mut found_any = false;
+    let mut roots: Vec<(PathBuf, &str)> = Vec::new();
+    if let Some(root) = config_root() {
+        for (app, tag) in vscode_apps(source) {
+            let p = root.join(app);
+            if p.is_dir() {
+                roots.push((p, tag));
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(home) = platform::home_dir() {
+        for (app_id, dir_name, tag) in flatpak_apps(source) {
+            let p = home
+                .join(".var/app")
+                .join(app_id)
+                .join("config")
+                .join(dir_name);
+            if p.is_dir() {
+                roots.push((p, tag));
+            }
+        }
+    }
+    if roots.is_empty() {
+        return None;
+    }
     let mut seen = HashSet::new();
     let mut count = 0;
-    for (app, tag) in vscode_apps(source) {
-        let app_root = root.join(app);
-        if !app_root.is_dir() {
-            continue;
-        }
-        found_any = true;
+    for (app_root, tag) in roots {
         let mut all = recent_from_state_db(&app_root.join("User/globalStorage/state.vscdb"));
-        all.extend(recent_from_workspace_storage(&app_root.join("User/workspaceStorage")));
+        all.extend(recent_from_workspace_storage(
+            &app_root.join("User/workspaceStorage"),
+        ));
         count += store(db, all, tag, &mut seen);
     }
-    found_any.then_some(count)
+    Some(count)
 }
 
 fn zed_rows(conn: &Connection) -> Vec<(String, Option<String>)> {
@@ -299,7 +497,10 @@ fn zed_rows(conn: &Connection) -> Vec<(String, Option<String>)> {
             continue;
         };
         let Ok(rows) = stmt.query_map([], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
         }) else {
             continue;
         };
@@ -328,7 +529,12 @@ fn import_zed(db: &Db) -> Option<usize> {
 }
 
 fn t3code_db_path() -> Option<PathBuf> {
-    Some(platform::home_dir()?.join(".t3").join("userdata").join("statev2.sqlite"))
+    Some(
+        platform::home_dir()?
+            .join(".t3")
+            .join("userdata")
+            .join("statev2.sqlite"),
+    )
 }
 
 /// Live projects `(workspace_root, updated_at)`. Archived projects are kept.
@@ -339,11 +545,16 @@ fn t3code_rows(conn: &Connection) -> Vec<(String, Option<String>)> {
         return Vec::new();
     };
     let Ok(rows) = stmt.query_map([], |r| {
-        Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+        ))
     }) else {
         return Vec::new();
     };
-    rows.flatten().filter_map(|(p, t)| p.map(|p| (p, t))).collect()
+    rows.flatten()
+        .filter_map(|(p, t)| p.map(|p| (p, t)))
+        .collect()
 }
 
 fn import_t3code(db: &Db) -> Option<usize> {
@@ -368,11 +579,23 @@ mod tests {
 
     #[test]
     fn decodes_uris() {
-        assert_eq!(uri_to_path("file:///Users/me/My%20Project", false).unwrap(), "/Users/me/My Project");
+        assert_eq!(
+            uri_to_path("file:///Users/me/My%20Project", false).unwrap(),
+            "/Users/me/My Project"
+        );
         assert_eq!(uri_to_path("file:///a/b%3Ac/", false).unwrap(), "/a/b:c");
-        assert_eq!(uri_to_path("file:///a/%C3%A9%E2%82%AC", false).unwrap(), "/a/\u{e9}\u{20ac}");
-        assert_eq!(uri_to_path("file:///c%3A/Users/x", true).unwrap(), r"c:\Users\x");
-        assert_eq!(uri_to_path("file:///c:/Users/My%20App", true).unwrap(), r"c:\Users\My App");
+        assert_eq!(
+            uri_to_path("file:///a/%C3%A9%E2%82%AC", false).unwrap(),
+            "/a/\u{e9}\u{20ac}"
+        );
+        assert_eq!(
+            uri_to_path("file:///c%3A/Users/x", true).unwrap(),
+            r"c:\Users\x"
+        );
+        assert_eq!(
+            uri_to_path("file:///c:/Users/My%20App", true).unwrap(),
+            r"c:\Users\My App"
+        );
         assert_eq!(uri_to_path("vscode-remote://ssh/x", false), None);
         assert_eq!(uri_to_path("file://server/share", false), None);
         assert_eq!(uri_to_path("file:///bad%FF", false), None);
@@ -386,6 +609,15 @@ mod tests {
         assert_eq!(parse_zed_timestamp("2000-02-29 00:00:01"), Some(951782401));
         assert_eq!(parse_zed_timestamp("garbage"), None);
         assert_eq!(parse_zed_timestamp("2024-13-01 00:00:00"), None);
+        // Timezone offsets (+ and -).
+        assert_eq!(
+            parse_iso_timestamp("2024-03-05T14:30:45+02:00"),
+            Some(1709641845)
+        );
+        assert_eq!(
+            parse_iso_timestamp("2024-03-05T07:30:45-05:00"),
+            Some(1709641845)
+        );
     }
 
     #[test]
@@ -393,10 +625,17 @@ mod tests {
         let j = r#"{"entries":[
             {"folderUri":"file:///a/b"},
             {"fileUri":"file:///a/f.txt"},
-            {"workspace":{"id":"x","configPath":"file:///w.code-workspace"}},
+            {"workspace":{"id":"x","configPath":"file:///ws/w.code-workspace"}},
             {"folderUri":"vscode-remote://ssh-remote%2Bhost/home/x"},
             {"folderUri":"file:///c/d%20e"}]}"#;
-        assert_eq!(parse_recent_folder_uris(j), vec!["file:///a/b", "file:///c/d%20e"]);
+        assert_eq!(
+            parse_recent_folder_uris(j),
+            vec!["file:///a/b", "file:///c/d%20e"]
+        );
+        assert_eq!(
+            parse_recent_folders(j, false),
+            vec!["/a/b", "/ws", "/c/d e"]
+        );
         assert!(parse_recent_folder_uris("nope").is_empty());
         assert!(parse_recent_folder_uris("{}").is_empty());
     }
@@ -404,16 +643,26 @@ mod tests {
     #[test]
     fn builds_sqlite_uri() {
         assert_eq!(
-            sqlite_uri("/Users/me/Library/Application Support/Code/a?b#c.db", "immutable=1"),
-            "file:/Users/me/Library/Application%20Support/Code/a%3Fb%23c.db?immutable=1"
+            sqlite_uri(
+                "/Users/me/Library/Application Support/Code/a?b#c.db",
+                "mode=ro"
+            ),
+            "file:/Users/me/Library/Application%20Support/Code/a%3Fb%23c.db?mode=ro"
         );
-        assert_eq!(sqlite_uri(r"C:\Users\x\s.db", "immutable=1"), "file:/C:/Users/x/s.db?immutable=1");
+        assert_eq!(
+            sqlite_uri(r"\\?\C:\Users\x\s.db", "mode=ro"),
+            "file:/C:/Users/x/s.db?mode=ro"
+        );
     }
 
     /// Build a file URI the way VS Code writes it: file:///C:/a%20b on Windows, file:///a%20b on Unix.
     fn file_uri(path: &str) -> String {
         let p = path.replace('\\', "/").replace(' ', "%20");
-        if p.starts_with('/') { format!("file://{p}") } else { format!("file:///{p}") }
+        if p.starts_with('/') {
+            format!("file://{p}")
+        } else {
+            format!("file:///{p}")
+        }
     }
 
     #[test]
@@ -423,12 +672,17 @@ mod tests {
         std::fs::create_dir(&proj).unwrap();
         let dbp = d.path().join("state.vscdb");
         let c = Connection::open(&dbp).unwrap();
-        c.execute("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)", []).unwrap();
+        c.execute("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)", [])
+            .unwrap();
         let json = format!(
             r#"{{"entries":[{{"folderUri":"{}"}}]}}"#,
             file_uri(&proj.to_string_lossy())
         );
-        c.execute("INSERT INTO ItemTable VALUES ('history.recentlyOpenedPathsList', ?1)", [json]).unwrap();
+        c.execute(
+            "INSERT INTO ItemTable VALUES ('history.recentlyOpenedPathsList', ?1)",
+            [json],
+        )
+        .unwrap();
         drop(c);
         let got = recent_from_state_db(&dbp);
         assert_eq!(got.len(), 1);
@@ -438,7 +692,10 @@ mod tests {
     #[test]
     fn parses_iso_timestamps() {
         assert_eq!(parse_iso_timestamp("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_iso_timestamp("2024-03-05T12:30:45.960Z"), Some(1709641845));
+        assert_eq!(
+            parse_iso_timestamp("2024-03-05T12:30:45.960Z"),
+            Some(1709641845)
+        );
         assert_eq!(parse_iso_timestamp("nope"), None);
     }
 
@@ -452,8 +709,16 @@ mod tests {
             [],
         )
         .unwrap();
-        c.execute("INSERT INTO projection_projects VALUES ('/a', '2026-10-22T18:18:34.960Z', NULL, NULL)", []).unwrap();
-        c.execute("INSERT INTO projection_projects VALUES ('/b', '2026-10-22T18:18:34.960Z', 'x', NULL)", []).unwrap();
+        c.execute(
+            "INSERT INTO projection_projects VALUES ('/a', '2026-10-22T18:18:34.960Z', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO projection_projects VALUES ('/b', '2026-10-22T18:18:34.960Z', 'x', NULL)",
+            [],
+        )
+        .unwrap();
         drop(c);
         let conn = open_ro(&dbp).unwrap();
         let rows = t3code_rows(&conn);

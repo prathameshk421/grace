@@ -1,26 +1,7 @@
 //! goose: a plugin folder we own, `~/.agents/plugins/grace/`.
-//!
-//! Verified (https://goose-docs.ai/docs/guides/context-engineering/hooks/, fetched 2026-11-19):
-//! - User plugins live in `~/.agents/plugins/<name>/` and load with no enable step.
-//!   The layout is `plugin.json` (`name`, `version`, `description`) and `hooks/hooks.json`:
-//!   `{"hooks": {Event: [{"matcher"?: regex, "hooks": [{"type": "command", "command": ..}]}]}}`.
-//!   A missing matcher matches every event of that type. Commands run with `sh -c`, so the
-//!   already-quoted exe works as is.
-//! - Stdin JSON always has `event` and `session_id`. Tool events add `working_dir`.
-//!   We also accept `hook_event_name`. With no `working_dir`, cwd is None.
-//! - Only PreToolUse and Stop can block. For Stop, exit 0 with empty stdout allows the stop,
-//!   and any other output or exit code is "no decision". We print nothing.
-//!
-//! Safety choice: we do NOT install PreToolUse. The docs say exit 0 with empty stdout there
-//! "allows" the tool call, and they do not say if that skips goose's own permission prompt.
-//! Working comes from UserPromptSubmit and PostToolUse instead.
-//! Events: SessionStart and Stop (Ready), UserPromptSubmit and PostToolUse (Working),
-//! SessionEnd (Done). The docs list no "needs you" event.
-//!
-//! Assumed: `GRACE_GOOSE_DIR` replaces `~/.agents`. Our marker is the `description` in
-//! plugin.json. Remove deletes the folder only if that marker is there.
-use super::{HookResult, Integration};
+use super::{HookResult, HookStatus, Integration};
 use crate::model::Status;
+use crate::platform;
 use crate::setup::{env_dir, read_opt, write_atomic};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -28,18 +9,28 @@ use std::path::{Path, PathBuf};
 
 pub static INTEGRATION: Integration = Integration {
     name: "goose",
+    label: "Goose",
     tool: "goose",
     setup,
+    check,
     reads_stdin: true,
     hook,
     stdout: "",
 };
 
 const MARK: &str = "Managed by grace. Remove with: grace setup goose --remove";
-const EVENTS: [&str; 5] = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"];
+const EVENTS: [&str; 5] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd",
+];
 
 fn plugin_dir() -> Result<PathBuf> {
-    Ok(env_dir("GRACE_GOOSE_DIR", ".agents")?.join("plugins").join("grace"))
+    Ok(env_dir("GRACE_GOOSE_DIR", ".agents")?
+        .join("plugins")
+        .join("grace"))
 }
 
 fn setup(exe: &str, remove: bool) -> Result<String> {
@@ -48,6 +39,28 @@ fn setup(exe: &str, remove: bool) -> Result<String> {
         remove_at(&d)
     } else {
         add_at(&d, exe)
+    }
+}
+
+fn check(exe: &str) -> HookStatus {
+    let Ok(d) = plugin_dir() else {
+        return HookStatus::NotInstalled;
+    };
+    let hp = d.join("hooks").join("hooks.json");
+    if !d.exists() {
+        let base = d.parent().and_then(|p| p.parent());
+        if base.is_some_and(|p| p.is_dir()) || crate::tools::on_path("goose") {
+            return HookStatus::Available(hp);
+        }
+        return HookStatus::NotInstalled;
+    }
+    if !is_ours(&d) {
+        return HookStatus::Conflict(hp, "foreign plugin folder".into());
+    }
+    if read_opt(&hp).ok().flatten().as_deref() == Some(hooks_json(exe).as_str()) {
+        HookStatus::Connected(hp)
+    } else {
+        HookStatus::OutdatedPath(hp)
     }
 }
 
@@ -60,30 +73,53 @@ fn is_ours(dir: &Path) -> bool {
 }
 
 fn hooks_json(exe: &str) -> String {
-    let cmd = format!("{} session hook goose", super::gemini::quote_once(exe));
+    let cmd = format!("{} session hook goose", platform::quote_posix(exe));
     let mut hooks = serde_json::Map::new();
     for e in EVENTS {
-        hooks.insert(e.into(), json!([{ "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }] }]));
+        hooks.insert(
+            e.into(),
+            json!([{ "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }] }]),
+        );
     }
     serde_json::to_string_pretty(&json!({ "hooks": hooks })).unwrap() + "\n"
 }
 
 fn plugin_json() -> String {
-    serde_json::to_string_pretty(&json!({ "name": "grace", "version": "1.0.0", "description": MARK })).unwrap()
+    serde_json::to_string_pretty(
+        &json!({ "name": "grace", "version": "1.0.0", "description": MARK }),
+    )
+    .unwrap()
         + "\n"
 }
 
+fn ensure_not_symlink(dir: &Path) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if meta.file_type().is_symlink() {
+            bail!("refusing to touch symlink {}", dir.display());
+        }
+    }
+    Ok(())
+}
+
 fn add_at(dir: &Path, exe: &str) -> Result<String> {
+    ensure_not_symlink(dir)?;
     if dir.exists() && !is_ours(dir) {
-        bail!("{} exists and is not made by grace. Nothing changed", dir.display());
+        bail!(
+            "{} exists and is not made by grace. Nothing changed",
+            dir.display()
+        );
     }
     let (hj, pj) = (hooks_json(exe), plugin_json());
     let hp = dir.join("hooks").join("hooks.json");
     let pp = dir.join("plugin.json");
-    if read_opt(&hp)?.as_deref() == Some(hj.as_str()) && read_opt(&pp)?.as_deref() == Some(pj.as_str()) {
-        return Ok(format!("{}: grace plugin already set up. Nothing to do.", dir.display()));
+    if read_opt(&hp)?.as_deref() == Some(hj.as_str())
+        && read_opt(&pp)?.as_deref() == Some(pj.as_str())
+    {
+        return Ok(format!(
+            "{}: grace plugin already set up. Nothing to do.",
+            dir.display()
+        ));
     }
-    // plugin.json first: if the second write fails, the folder still carries our marker.
     write_atomic(&pp, &pj)?;
     write_atomic(&hp, &hj)?;
     Ok(format!(
@@ -94,6 +130,7 @@ fn add_at(dir: &Path, exe: &str) -> Result<String> {
 }
 
 fn remove_at(dir: &Path) -> Result<String> {
+    ensure_not_symlink(dir)?;
     if !dir.exists() {
         return Ok(format!("{} does not exist. Nothing to do.", dir.display()));
     }
@@ -101,7 +138,10 @@ fn remove_at(dir: &Path) -> Result<String> {
         bail!("{} is not made by grace. Left it alone", dir.display());
     }
     std::fs::remove_dir_all(dir).with_context(|| format!("cannot remove {}", dir.display()))?;
-    Ok(format!("Removed {}\nRestart running goose sessions to pick this up.", dir.display()))
+    Ok(format!(
+        "Removed {}\nRestart running goose sessions to pick this up.",
+        dir.display()
+    ))
 }
 
 fn hook(_args: &[String], stdin: &str) -> HookResult {
@@ -124,7 +164,22 @@ fn hook(_args: &[String], stdin: &str) -> HookResult {
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())
         .map(String::from);
-    HookResult { status: Some(status), cwd }
+    let session_id = v
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+    let detail = v
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(platform::sanitize_display);
+    HookResult {
+        status: Some(status),
+        cwd,
+        session_id,
+        detail,
+    }
 }
 
 #[cfg(test)]
@@ -138,10 +193,16 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         let p = d.path().join("plugins").join("grace");
         add_at(&p, "/bin/grace").unwrap();
-        let pj: Value = serde_json::from_str(&std::fs::read_to_string(p.join("plugin.json")).unwrap()).unwrap();
+        let pj: Value =
+            serde_json::from_str(&std::fs::read_to_string(p.join("plugin.json")).unwrap()).unwrap();
         assert_eq!(pj["name"], "grace");
-        let h: Value = serde_json::from_str(&std::fs::read_to_string(p.join("hooks/hooks.json")).unwrap()).unwrap();
-        assert_eq!(h["hooks"]["Stop"][0]["hooks"][0]["command"], "/bin/grace session hook goose");
+        let h: Value =
+            serde_json::from_str(&std::fs::read_to_string(p.join("hooks/hooks.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            h["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/bin/grace session hook goose"
+        );
         assert!(h["hooks"].get("PreToolUse").is_none());
         assert!(add_at(&p, "/bin/grace").unwrap().contains("Nothing to do"));
         assert!(add_at(&p, "/new/grace").unwrap().contains("Wrote"));
@@ -159,21 +220,37 @@ mod tests {
         std::fs::write(p.join("plugin.json"), r#"{"name":"grace"}"#).unwrap();
         assert!(add_at(&p, "g").is_err());
         assert!(remove_at(&p).is_err());
-        assert_eq!(std::fs::read_to_string(p.join("plugin.json")).unwrap(), r#"{"name":"grace"}"#);
+        assert_eq!(
+            std::fs::read_to_string(p.join("plugin.json")).unwrap(),
+            r#"{"name":"grace"}"#
+        );
     }
 
     #[test]
     fn parse() {
-        let r = hook(&[], r#"{"event":"PostToolUse","session_id":"s","working_dir":"/w"}"#);
+        let r = hook(
+            &[],
+            r#"{"event":"PostToolUse","session_id":"s","working_dir":"/w"}"#,
+        );
         assert_eq!(r.status, Some(Status::Working));
         assert_eq!(r.cwd.as_deref(), Some("/w"));
-        assert_eq!(hook(&[], r#"{"hook_event_name":"Stop"}"#).status, Some(Status::Ready));
-        assert_eq!(hook(&[], r#"{"event":"UserPromptSubmit"}"#).status, Some(Status::Working));
+        assert_eq!(r.session_id.as_deref(), Some("s"));
+        assert_eq!(
+            hook(&[], r#"{"hook_event_name":"Stop"}"#).status,
+            Some(Status::Ready)
+        );
+        assert_eq!(
+            hook(&[], r#"{"event":"UserPromptSubmit"}"#).status,
+            Some(Status::Working)
+        );
         let end = hook(&[], r#"{"event":"SessionEnd"}"#);
         assert_eq!(end.status, Some(Status::Done));
         assert_eq!(end.cwd, None);
         assert_eq!(hook(&[], ""), HookResult::default());
         assert_eq!(hook(&[], "[1]"), HookResult::default());
-        assert_eq!(hook(&[], r#"{"event":"BeforeReadFile"}"#), HookResult::default());
+        assert_eq!(
+            hook(&[], r#"{"event":"BeforeReadFile"}"#),
+            HookResult::default()
+        );
     }
 }

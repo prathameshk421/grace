@@ -1,12 +1,13 @@
-//! Shell integration.
+//! Shell integration and completion scripts.
 use crate::tools;
 
-const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
+const ZSH_TEMPLATE: &str = r#"if [[ -z ${__GRACE_LOADED:-} ]]; then
   typeset -g __GRACE_LOADED=1
+  typeset -gx GRACE_SHELL=zsh
   autoload -Uz add-zsh-hook
 
   __grace_chpwd() {
-    command grace add "$PWD" &>/dev/null &!
+    command grace add -- "$PWD" &>/dev/null &!
   }
 
   __grace_preexec() {
@@ -25,17 +26,19 @@ const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
           tgt=
           for a in "${(@)ws[i+1,-1]}"; do
             a=${(Q)a}
+            [[ -z $a ]] && continue
+            [[ $a == (';'|'&&'|'||'|'|'|'&') ]] && break
             [[ $a == -* ]] && continue
             tgt=$a
             break
           done
-          command grace tag "$PWD" "$w" ${tgt:+"$tgt"} &>/dev/null &!
+          command grace tag -- "$PWD" "$w" ${tgt:+"$tgt"} &>/dev/null &!
           case $w in
             @AI@)
               # Live session: start now, end in precmd.
               local sdir=$PWD
-              [[ -n $tgt && -d ${tgt/#\~/$HOME} ]] && sdir=${tgt/#\~/$HOME}
-              command grace session start "$sdir" "$w" --pid $$ &>/dev/null
+              [[ -n ${tgt:-} && -d ${tgt/#\~/$HOME} ]] && sdir=${tgt/#\~/$HOME}
+              command grace session start --pid $$ -- "$sdir" "$w" &>/dev/null
               typeset -g __grace_session=1
               ;;
           esac
@@ -46,7 +49,7 @@ const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
   }
 
   __grace_precmd() {
-    [[ -n $__grace_session ]] || return
+    [[ -n ${__grace_session:-} ]] || return 0
     unset __grace_session
     command grace session end --pid $$ &>/dev/null &!
   }
@@ -56,40 +59,54 @@ const ZSH_TEMPLATE: &str = r#"if [[ -z $__GRACE_LOADED ]]; then
   add-zsh-hook precmd __grace_precmd
 
   # Record the folder where the shell starts.
-  command grace add "$PWD" &>/dev/null &!
+  command grace add -- "$PWD" &>/dev/null &!
 
   grace() {
-    case $1 in
-      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|hub|diff|tree|help|-h|--help|-V|--version)
-        command grace "$@"
+    local check=${1-}
+    local full_opt=
+    if [[ $check == --full ]]; then
+      check=${2-}
+      full_opt=--full
+      shift
+    fi
+    case $check in
+      add|tag|tool|list|pin|unpin|forget|import|init|setup|doctor|prune|stats|completions|session|hub|diff|tree|help|-h|--help|-V|--version)
+        command grace ${full_opt:+"$full_opt"} "$@"
         return $?
         ;;
     esac
     local sub=pick x
-    case $1 in
+    case ${1-} in
       sessions)
         shift
         sub=sessions
         for x in "$@"; do
           case $x in
-            -l|--list|-h|--help) command grace sessions "$@"; return $? ;;
+            -l|--list|--json|-h|--help) command grace ${full_opt:+"$full_opt"} sessions "$@"; return $? ;;
           esac
         done
         ;;
-      pick) shift ;;
+      pick)
+        shift
+        for x in "$@"; do
+          case $x in
+            -h|--help) command grace ${full_opt:+"$full_opt"} pick "$@"; return $? ;;
+          esac
+        done
+        ;;
     esac
-    local out dir cmd
-    out="$(command grace $sub "$@")" || return
+    local out dir= cmd=
+    out="$(command grace ${full_opt:+"$full_opt"} $sub "$@")" || return $?
     dir=${out%%$'\n'*}
     if [[ $out == *$'\n'* ]]; then
       cmd=${out#*$'\n'}
     fi
-    # An empty line 1 means: stay here, only run line 2.
-    [[ -n $dir || -n $cmd ]] || return 1
-    if [[ -n $dir ]]; then
-      builtin cd -- "$dir" || return
+    # Empty output with exit 0 means handled directly (e.g. GUI editor launched).
+    [[ -n ${dir:-} || -n ${cmd:-} ]] || return 0
+    if [[ -n ${dir:-} ]]; then
+      builtin cd -- "$dir" || return $?
     fi
-    if [[ -n $cmd ]]; then
+    if [[ -n ${cmd:-} ]]; then
       eval "$cmd"
     fi
   }
@@ -98,6 +115,7 @@ fi
 
 const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
   __GRACE_LOADED=1
+  export GRACE_SHELL=bash
   __GRACE_LAST_PWD=$PWD
   __GRACE_LAST_HIST=
 
@@ -105,19 +123,29 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
     local rc=$?
     local line num rest w a tgt i
     local -a words
-    if [[ $PWD != "$__GRACE_LAST_PWD" ]]; then
+    if [[ $PWD != "${__GRACE_LAST_PWD:-}" ]]; then
       __GRACE_LAST_PWD=$PWD
-      (command grace add "$PWD" &>/dev/null &)
+      (command grace add -- "$PWD" &>/dev/null &)
     fi
-    line=$(HISTTIMEFORMAT= history 1 2>/dev/null)
+    line=$(HISTTIMEFORMAT= history 1 2>/dev/null || true)
     line=${line#"${line%%[![:space:]]*}"}
     num=${line%%[[:space:]]*}
     rest=${line#"$num"}
     rest=${rest#"${rest%%[![:space:]]*}"}
     num=${num%\*}
-    if [[ -n $num && $num != "$__GRACE_LAST_HIST" ]]; then
+    if [[ -n $num && $num != "${__GRACE_LAST_HIST:-}" ]]; then
       __GRACE_LAST_HIST=$num
-      read -ra words <<<"$rest"
+      local re=$'^[[:space:]]*("[^"]*"|\'[^\']*\'|[^[:space:]"\'&|;]+|[&|;])'
+      local tmp=$rest tok
+      words=()
+      while [[ $tmp =~ $re ]]; do
+        tok=${BASH_REMATCH[1]}
+        [[ $tok == '&' || $tok == '|' || $tok == ';' ]] && break
+        tok=${tok#[\"\']}
+        tok=${tok%[\"\']}
+        words+=("$tok")
+        tmp=${tmp:${#BASH_REMATCH[0]}}
+      done
       for ((i = 0; i < ${#words[@]}; i++)); do
         w=${words[i]}
         case $w in
@@ -130,11 +158,13 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
             for a in "${words[@]:i+1}"; do
               a=${a#[\"\']}
               a=${a%[\"\']}
-              [[ -z $a || $a == -* ]] && continue
+              [[ -z $a ]] && continue
+              [[ $a == ';' || $a == '&&' || $a == '||' || $a == '|' ]] && break
+              [[ $a == -* ]] && continue
               tgt=$a
               break
             done
-            (command grace tag "$PWD" "$w" ${tgt:+"$tgt"} &>/dev/null &)
+            (command grace tag -- "$PWD" "$w" ${tgt:+"$tgt"} &>/dev/null &)
             ;;
         esac
         break
@@ -147,24 +177,35 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
   # The agent hooks (grace setup) still report the status.
 
   # Do not tag the last command of an older session.
-  __GRACE_LAST_HIST=$(HISTTIMEFORMAT= history 1 2>/dev/null)
+  __GRACE_LAST_HIST=$(HISTTIMEFORMAT= history 1 2>/dev/null || true)
   __GRACE_LAST_HIST=${__GRACE_LAST_HIST#"${__GRACE_LAST_HIST%%[![:space:]]*}"}
   __GRACE_LAST_HIST=${__GRACE_LAST_HIST%%[[:space:]]*}
   __GRACE_LAST_HIST=${__GRACE_LAST_HIST%\*}
 
   if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
-    PROMPT_COMMAND=(__grace_hook "${PROMPT_COMMAND[@]}")
+    PROMPT_COMMAND=(__grace_hook ${PROMPT_COMMAND[@]+"${PROMPT_COMMAND[@]}"})
   else
-    PROMPT_COMMAND="__grace_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    __grace_pc=${PROMPT_COMMAND:-}
+    __grace_pc=${__grace_pc#;}
+    __grace_pc=${__grace_pc#"${__grace_pc%%[![:space:]]*}"}
+    PROMPT_COMMAND="__grace_hook${__grace_pc:+;$__grace_pc}"
+    unset __grace_pc
   fi
 
   # Record the folder where the shell starts.
-  (command grace add "$PWD" &>/dev/null &)
+  (command grace add -- "$PWD" &>/dev/null &)
 
   grace() {
-    case ${1-} in
-      add|tag|tool|list|pin|unpin|forget|import|init|setup|session|hub|diff|tree|help|-h|--help|-V|--version)
-        command grace "$@"
+    local check=${1-}
+    local full_opt=
+    if [[ $check == --full ]]; then
+      check=${2-}
+      full_opt=--full
+      shift
+    fi
+    case $check in
+      add|tag|tool|list|pin|unpin|forget|import|init|setup|doctor|prune|stats|completions|session|hub|diff|tree|help|-h|--help|-V|--version)
+        command grace ${full_opt:+"$full_opt"} "$@"
         return $?
         ;;
     esac
@@ -175,24 +216,31 @@ const BASH_TEMPLATE: &str = r##"if [[ -z ${__GRACE_LOADED:-} ]]; then
         sub=sessions
         for x in "$@"; do
           case $x in
-            -l|--list|-h|--help) command grace sessions "$@"; return $? ;;
+            -l|--list|--json|-h|--help) command grace ${full_opt:+"$full_opt"} sessions "$@"; return $? ;;
           esac
         done
         ;;
-      pick) shift ;;
+      pick)
+        shift
+        for x in "$@"; do
+          case $x in
+            -h|--help) command grace ${full_opt:+"$full_opt"} pick "$@"; return $? ;;
+          esac
+        done
+        ;;
     esac
-    local out dir cmd=
-    out=$(command grace $sub "$@") || return
+    local out dir= cmd=
+    out=$(command grace ${full_opt:+"$full_opt"} $sub "$@") || return $?
     dir=${out%%$'\n'*}
     if [[ $out == *$'\n'* ]]; then
       cmd=${out#*$'\n'}
     fi
-    # An empty line 1 means: stay here, only run line 2.
-    [[ -n $dir || -n $cmd ]] || return 1
-    if [[ -n $dir ]]; then
-      builtin cd -- "$dir" || return
+    # Empty output with exit 0 means handled directly (e.g. GUI editor launched).
+    [[ -n ${dir:-} || -n ${cmd:-} ]] || return 0
+    if [[ -n ${dir:-} ]]; then
+      builtin cd -- "$dir" || return $?
     fi
-    if [[ -n $cmd ]]; then
+    if [[ -n ${cmd:-} ]]; then
       eval "$cmd"
     fi
   }
@@ -201,15 +249,17 @@ fi
 
 const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
     set -g __GRACE_LOADED 1
+    set -gx GRACE_SHELL fish
 
     function __grace_pwd --on-variable PWD
-        command grace add $PWD >/dev/null 2>&1 &
+        command grace add -- $PWD >/dev/null 2>&1 &
         disown 2>/dev/null
     end
 
     function __grace_preexec --on-event fish_preexec
         set -l ws (string split -n ' ' -- $argv[1])
         set -l n (count $ws)
+        test $n -gt 0; or return
         for i in (seq $n)
             set -l w $ws[$i]
             switch $w
@@ -227,12 +277,13 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
                         for a in $ws[(math $i + 1)..-1]
                             set a (string trim -c "\"'" -- $a)
                             test -n "$a"; or continue
+                            contains -- $a ';' '&&' '||' '|' '&'; and break
                             string match -q -- '-*' $a; and continue
                             set tgt $a
                             break
                         end
                     end
-                    command grace tag $PWD $base $tgt >/dev/null 2>&1 &
+                    command grace tag -- $PWD $base $tgt >/dev/null 2>&1 &
                     disown 2>/dev/null
                     if contains -- $base @AI@
                         # Live session: start now, end in fish_postexec.
@@ -241,8 +292,7 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
                             set -l t (string replace -r -- '^~' $HOME $tgt)
                             test -d "$t"; and set sdir $t
                         end
-                        command grace session start $sdir $base --pid $fish_pid >/dev/null 2>&1
-                        disown 2>/dev/null
+                        command grace session start --pid $fish_pid -- $sdir $base >/dev/null 2>&1
                         set -g __grace_session 1
                     end
             end
@@ -258,33 +308,49 @@ const FISH_TEMPLATE: &str = r##"if not set -q __GRACE_LOADED
     end
 
     # Record the folder where the shell starts.
-    command grace add $PWD >/dev/null 2>&1 &
+    command grace add -- $PWD >/dev/null 2>&1 &
     disown 2>/dev/null
 
     function grace
-        if set -q argv[1]; and contains -- $argv[1] add tag tool list pin unpin forget import init setup session hub diff tree help -h --help -V --version
-            command grace $argv
+        set -l extra
+        set -l check ""
+        if set -q argv[1]; and test "$argv[1]" = --full
+            set extra --full
+            set -e argv[1]
+        end
+        if set -q argv[1]
+            set check $argv[1]
+        end
+        if test -n "$check"; and contains -- $check add tag tool list pin unpin forget import init setup doctor prune stats completions session hub diff tree help -h --help -V --version
+            command grace $extra $argv
             return $status
         end
         set -l sub pick
         if set -q argv[1]; and test "$argv[1]" = sessions
             set sub sessions
             set -e argv[1]
-            if contains -- -l $argv; or contains -- --list $argv; or contains -- -h $argv; or contains -- --help $argv
-                command grace sessions $argv
+            if contains -- -l $argv; or contains -- --list $argv; or contains -- --json $argv; or contains -- -h $argv; or contains -- --help $argv
+                command grace $extra sessions $argv
                 return $status
             end
         else if set -q argv[1]; and test "$argv[1]" = pick
             set -e argv[1]
+            if contains -- -h $argv; or contains -- --help $argv
+                command grace $extra pick $argv
+                return $status
+            end
         end
-        set -l out (command grace $sub $argv)
-        or return
+        set -l out (command grace $extra $sub $argv)
+        or return $status
+        if test (count $out) -eq 0
+            return 0
+        end
         set -l dir $out[1]
         # An empty line 1 means: stay here, only run line 2.
         if test -n "$dir"
-            builtin cd -- $dir; or return
+            builtin cd -- $dir; or return $status
         else if not set -q out[2]; or test -z "$out[2]"
-            return 1
+            return 0
         end
         if set -q out[2]; and test -n "$out[2]"
             eval $out[2]
@@ -295,6 +361,7 @@ end
 
 const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
   $global:__GraceLoaded = $true
+  $env:GRACE_SHELL = 'powershell'
   $global:__GraceExe = (Get-Command grace -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
   $global:__GraceTools = @('@TOOLS@')
   $global:__GraceLastPwd = $PWD.Path
@@ -304,26 +371,54 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
   Remove-Variable __graceHist
   $global:__GraceOldPrompt = $function:prompt
 
+  function global:__GraceSpawn {
+    param([string]$Exe, [string[]]$ArgList)
+    $escaped = foreach ($arg in $ArgList) {
+      if ($null -eq $arg) { continue }
+      $s = [string]$arg
+      if ($s -eq '' -or $s -match '[\s"]') {
+        '"' + ($s -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+      } else {
+        $s
+      }
+    }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = ($escaped -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    if ($p) { $p.Dispose() }
+  }
+
   # Record the folder where the shell starts.
   if ($global:__GraceExe) {
-    try { & $global:__GraceExe add $PWD.Path *> $null } catch { }
+    try { __GraceSpawn -Exe $global:__GraceExe -ArgList @('add', '--', $PWD.Path) } catch { }
   }
 
   function global:prompt {
     $savedExit = $global:LASTEXITCODE
+    # Invoke previous prompt first so it observes the caller's real $? and $LASTEXITCODE.
+    $promptOut = if ($global:__GraceOldPrompt) {
+      & $global:__GraceOldPrompt
+    } else {
+      "PS $($PWD.Path)> "
+    }
     $exe = $global:__GraceExe
     if ($exe) {
+      $oldEap = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
       try {
         if ($PWD.Provider.Name -eq 'FileSystem') {
           $cwd = $PWD.Path
           if ($cwd -ne $global:__GraceLastPwd) {
             $global:__GraceLastPwd = $cwd
-            & $exe add $cwd *> $null
+            __GraceSpawn -Exe $exe -ArgList @('add', '--', $cwd)
           }
           $h = Get-History -Count 1 -ErrorAction SilentlyContinue
-          if ($h -and $h.Id -ne $global:__GraceLastId) {
+          if ($h -and $h.Id -ne $global:__GraceLastId -and $h.CommandLine) {
             $global:__GraceLastId = $h.Id
-            $ws = @($h.CommandLine.Trim() -split '\s+')
+            $ws = @([regex]::Matches($h.CommandLine.Trim(), '"[^"]*"|''[^'']*''|\S+') | ForEach-Object { $_.Value })
             for ($i = 0; $i -lt $ws.Count; $i++) {
               $w = $ws[$i]
               if ($w -eq '&' -or $w -eq '') { continue }
@@ -333,23 +428,27 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
                 for ($j = $i + 1; $j -lt $ws.Count; $j++) {
                   $a = $ws[$j].Trim('"', "'")
                   if ($a -eq '' -or $a.StartsWith('-')) { continue }
+                  if ($a -in ';', '&&', '||', '|') { break }
                   $tgt = $a
                   break
                 }
-                if ($tgt) { & $exe tag $cwd $w $tgt *> $null } else { & $exe tag $cwd $w *> $null }
+                if ($tgt) {
+                  __GraceSpawn -Exe $exe -ArgList @('tag', '--', $cwd, $w, $tgt)
+                } else {
+                  __GraceSpawn -Exe $exe -ArgList @('tag', '--', $cwd, $w)
+                }
               }
               break
             }
           }
         }
       } catch { }
+      finally {
+        $ErrorActionPreference = $oldEap
+      }
     }
     $global:LASTEXITCODE = $savedExit
-    if ($global:__GraceOldPrompt) {
-      & $global:__GraceOldPrompt
-    } else {
-      "PS $($PWD.Path)> "
-    }
+    return $promptOut
   }
 
   function global:grace {
@@ -358,34 +457,196 @@ const POWERSHELL_TEMPLATE: &str = r##"if (-not $global:__GraceLoaded) {
       Write-Error 'grace: the grace program is not on PATH'
       return
     }
-    $passthrough = @('add', 'tag', 'tool', 'list', 'pin', 'unpin', 'forget', 'import', 'init', 'setup', 'session', 'hub', 'diff', 'tree', 'help', '-h', '--help', '-V', '--version')
-    if ($args.Count -gt 0 -and ($passthrough -ccontains [string]$args[0])) {
-      & $exe @args
+    $passthrough = @('add', 'tag', 'tool', 'list', 'pin', 'unpin', 'forget', 'import', 'init', 'setup', 'doctor', 'prune', 'stats', 'completions', 'session', 'hub', 'diff', 'tree', 'help', '-h', '--help', '-V', '--version')
+    $rest = @($args)
+    $extra = @()
+    if ($rest.Count -gt 0 -and ([string]$rest[0] -ceq '--full')) {
+      $extra = @('--full')
+      $rest = @($rest | Select-Object -Skip 1)
+    }
+    if ($rest.Count -gt 0 -and ($passthrough -ccontains [string]$rest[0])) {
+      & $exe @extra @rest
       return
     }
     # No shell side for live sessions here: PowerShell has no reliable preexec.
     # The agent hooks (grace setup) still report the status.
-    $rest = @($args)
     $sub = 'pick'
-    if ($rest.Count -gt 0 -and $rest[0] -ceq 'sessions') {
+    if ($rest.Count -gt 0 -and ([string]$rest[0] -ceq 'sessions')) {
       $sub = 'sessions'
       $rest = @($rest | Select-Object -Skip 1)
-      if (@($rest | Where-Object { $_ -in '-l', '--list', '-h', '--help' }).Count -gt 0) {
-        & $exe sessions @rest
+      if (@($rest | Where-Object { $_ -cin @('-l', '--list', '--json', '-h', '--help') }).Count -gt 0) {
+        & $exe @extra sessions @rest
         return
       }
-    } elseif ($rest.Count -gt 0 -and $rest[0] -ceq 'pick') {
+    } elseif ($rest.Count -gt 0 -and ([string]$rest[0] -ceq 'pick')) {
       $rest = @($rest | Select-Object -Skip 1)
+      if (@($rest | Where-Object { $_ -cin @('-h', '--help') }).Count -gt 0) {
+        & $exe @extra pick @rest
+        return
+      }
     }
-    $out = @(& $exe $sub @rest)
+    $out = @(& $exe @extra $sub @rest)
     if ($LASTEXITCODE -ne 0) { return }
     if ($out.Count -eq 0) { return }
     # An empty line 1 means: stay here, only run line 2.
-    if ($out[0]) { Set-Location -LiteralPath $out[0] }
+    if ($out[0]) {
+      try {
+        Set-Location -LiteralPath $out[0] -ErrorAction Stop
+      } catch {
+        return
+      }
+    }
     if ($out.Count -gt 1 -and $out[1]) { Invoke-Expression $out[1] }
   }
 }
 "##;
+
+const ZSH_COMPLETIONS: &str = r#"#compdef grace
+_grace() {
+  local -a cmds
+  cmds=(
+    'pick:Open the picker and print the chosen path'
+    'list:Print tracked folders, best first'
+    'pin:Keep a folder at the top'
+    'unpin:Remove the pin from a folder'
+    'forget:Remove a folder from grace'
+    'import:Import folders from Claude Code and editors'
+    'tool:Add, remove or list AI tools'
+    'sessions:Show folders with active CLI agent sessions'
+    'setup:Connect CLI agents for live session status'
+    'doctor:Check environment, hooks, database, and tmux'
+    'prune:Remove tracked folders missing on disk'
+    'stats:Show usage statistics'
+    'hub:Open tmux multi-pane workspace hub'
+    'diff:Show git changes for a folder'
+    'tree:Show file tree with git status'
+    'init:Print shell setup code'
+    'completions:Print shell completion script'
+  )
+  _arguments -C \
+    '--full[Draw picker fullscreen]' \
+    '-h[Print help]' '--help[Print help]' \
+    '-V[Print version]' '--version[Print version]' \
+    '1:command:->cmd' \
+    '*::arg:->args'
+  case $state in
+    cmd) _describe -t commands 'grace command' cmds ;;
+    args)
+      case $words[1] in
+        init|completions) compadd zsh bash fish powershell pwsh ;;
+        setup) compadd -- --all --remove claude codex gemini qwen copilot opencode agy crush goose amp aider ;;
+        import) compadd all claude vscode cursor windsurf antigravity zed t3code ;;
+        doctor) compadd -- --fix ;;
+        prune) compadd -- --dry-run --older-than ;;
+        list) compadd -- -t --tag --json ;;
+        sessions) compadd -- -l --list --json -o --open ;;
+        hub) compadd quit ;;
+        tool) compadd add rm list ;;
+      esac
+      ;;
+  esac
+}
+compdef _grace grace
+"#;
+
+const BASH_COMPLETIONS: &str = r#"_grace_completions() {
+  local cur cmds sub="" i
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  cmds="pick list pin unpin forget import tool sessions setup doctor prune stats hub diff tree init completions"
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    case "${COMP_WORDS[i]}" in
+      --full) continue ;;
+      -*) continue ;;
+      *) sub="${COMP_WORDS[i]}"; break ;;
+    esac
+  done
+  if [[ -z "$sub" ]]; then
+    COMPREPLY=( $(compgen -W "$cmds --full --help --version" -- "$cur") )
+    return 0
+  fi
+  case "$sub" in
+    init|completions)
+      COMPREPLY=( $(compgen -W "zsh bash fish powershell pwsh" -- "$cur") ) ;;
+    setup)
+      COMPREPLY=( $(compgen -W "--all --remove claude codex gemini qwen copilot opencode agy crush goose amp aider" -- "$cur") ) ;;
+    import)
+      COMPREPLY=( $(compgen -W "all claude vscode cursor windsurf antigravity zed t3code" -- "$cur") ) ;;
+    doctor)
+      COMPREPLY=( $(compgen -W "--fix" -- "$cur") ) ;;
+    prune)
+      COMPREPLY=( $(compgen -W "--dry-run --older-than" -- "$cur") ) ;;
+    list)
+      COMPREPLY=( $(compgen -W "--tag --json" -- "$cur") ) ;;
+    sessions)
+      COMPREPLY=( $(compgen -W "--list --json --open" -- "$cur") ) ;;
+    hub)
+      COMPREPLY=( $(compgen -W "quit" -- "$cur") ) ;;
+    tool)
+      COMPREPLY=( $(compgen -W "add rm list" -- "$cur") ) ;;
+  esac
+}
+complete -F _grace_completions grace
+"#;
+
+const FISH_COMPLETIONS: &str = r#"complete -c grace -f
+complete -c grace -l full -d "Draw picker fullscreen"
+complete -c grace -n "__fish_use_subcommand" -a "pick" -d "Open the folder picker"
+complete -c grace -n "__fish_use_subcommand" -a "list" -d "Print tracked folders"
+complete -c grace -n "__fish_use_subcommand" -a "pin" -d "Pin folder"
+complete -c grace -n "__fish_use_subcommand" -a "unpin" -d "Unpin folder"
+complete -c grace -n "__fish_use_subcommand" -a "forget" -d "Forget folder"
+complete -c grace -n "__fish_use_subcommand" -a "import" -d "Import from editors/Claude"
+complete -c grace -n "__fish_use_subcommand" -a "tool" -d "Manage tracked tools"
+complete -c grace -n "__fish_use_subcommand" -a "sessions" -d "Live agent sessions"
+complete -c grace -n "__fish_use_subcommand" -a "setup" -d "Connect CLI agent hooks"
+complete -c grace -n "__fish_use_subcommand" -a "doctor" -d "Run health diagnostics"
+complete -c grace -n "__fish_use_subcommand" -a "prune" -d "Prune missing folders"
+complete -c grace -n "__fish_use_subcommand" -a "stats" -d "Show usage statistics"
+complete -c grace -n "__fish_use_subcommand" -a "hub" -d "Open tmux workspace hub"
+complete -c grace -n "__fish_use_subcommand" -a "diff" -d "Git diff view"
+complete -c grace -n "__fish_use_subcommand" -a "tree" -d "File tree view"
+complete -c grace -n "__fish_use_subcommand" -a "init" -d "Print shell init code"
+complete -c grace -n "__fish_use_subcommand" -a "completions" -d "Print completion script"
+complete -c grace -n "__fish_seen_subcommand_from init completions" -a "zsh bash fish powershell pwsh"
+complete -c grace -n "__fish_seen_subcommand_from setup" -a "claude codex gemini qwen copilot opencode agy crush goose amp aider"
+complete -c grace -n "__fish_seen_subcommand_from setup" -l all -d "Setup all detected agents"
+complete -c grace -n "__fish_seen_subcommand_from setup" -l remove -d "Remove hook"
+complete -c grace -n "__fish_seen_subcommand_from import" -a "all claude vscode cursor windsurf antigravity zed t3code"
+complete -c grace -n "__fish_seen_subcommand_from doctor" -l fix -d "Auto-fix safe issues"
+complete -c grace -n "__fish_seen_subcommand_from prune" -l dry-run -d "Preview missing folders"
+"#;
+
+const POWERSHELL_COMPLETIONS: &str = r#"Register-ArgumentCompleter -Native -CommandName grace -ScriptBlock {
+  param($wordToComplete, $commandAst, $cursorPosition)
+  $cmds = @('pick','list','pin','unpin','forget','import','tool','sessions','setup','doctor','prune','stats','hub','diff','tree','init','completions')
+  $tokens = @($commandAst.CommandElements | ForEach-Object { $_.ToString() } | Where-Object { $_ -ne '--full' })
+  $typingSub = ($tokens.Count -lt 2) -or ($tokens.Count -eq 2 -and $wordToComplete -ne '')
+  if ($typingSub) {
+    $cmds | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+      [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+    }
+    return
+  }
+  $sub = $tokens[1]
+  $opts = switch ($sub) {
+    'init'        { @('zsh','bash','fish','powershell','pwsh') }
+    'completions' { @('zsh','bash','fish','powershell','pwsh') }
+    'setup'       { @('--all','--remove','claude','codex','gemini','qwen','copilot','opencode','agy','crush','goose','amp','aider') }
+    'import'      { @('all','claude','vscode','cursor','windsurf','antigravity','zed','t3code') }
+    'doctor'      { @('--fix') }
+    'prune'       { @('--dry-run','--older-than') }
+    'list'        { @('--tag','--json') }
+    'sessions'    { @('--list','--json','--open') }
+    'hub'         { @('quit') }
+    'tool'        { @('add','rm','list') }
+    default       { @() }
+  }
+  $opts | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+  }
+}
+"#;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(clippy::enum_variant_names)]
@@ -429,7 +690,19 @@ pub fn init(shell: Shell, names: &[String], ai_names: &[String]) -> String {
         Shell::Fish => (FISH_TEMPLATE, join(&names, " "), join(&ai, " ")),
         Shell::PowerShell => (POWERSHELL_TEMPLATE, join(&names, "','"), join(&ai, "','")),
     };
-    template.replace("@TOOLS@", &joined).replace("@AI@", &ai_joined)
+    template
+        .replace("@TOOLS@", &joined)
+        .replace("@AI@", &ai_joined)
+}
+
+/// Print shell tab-completion script for `shell`.
+pub fn completions(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Zsh => ZSH_COMPLETIONS,
+        Shell::Bash => BASH_COMPLETIONS,
+        Shell::Fish => FISH_COMPLETIONS,
+        Shell::PowerShell => POWERSHELL_COMPLETIONS,
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +734,7 @@ mod tests {
         assert!(s.contains("|kiro"));
         assert!(!s.contains("rm -rf"));
         assert!(s.contains("add|tag|tool|"));
+        assert!(s.contains("GRACE_SHELL=zsh"));
         assert!(!s.contains("@TOOLS@"));
         assert!(!s.contains("@AI@"));
     }
@@ -472,12 +746,19 @@ mod tests {
         assert!(z.contains("session end"));
         let (_, after) = z.split_once("case $w in\n            ").unwrap();
         let ai_pat = after.lines().next().unwrap();
-        assert!(ai_pat.contains("claude|") && ai_pat.contains("kiro"), "{ai_pat}");
-        assert!(!ai_pat.contains("zed") && !ai_pat.contains("nvim"), "{ai_pat}");
+        assert!(
+            ai_pat.contains("claude|") && ai_pat.contains("kiro"),
+            "{ai_pat}"
+        );
+        assert!(
+            !ai_pat.contains("zed") && !ai_pat.contains("nvim"),
+            "{ai_pat}"
+        );
         let f = script(Shell::Fish);
         assert!(f.contains("session start") && f.contains("fish_postexec"));
         assert!(f.contains("contains -- $base claude"));
         assert!(!f.contains("contains -- $base claude agy antigravity codex gemini cursor cursor-agent opencode aider copilot amp goose crush qwen t3 code"));
+        assert!(f.contains("test $n -gt 0"));
     }
 
     #[test]
@@ -486,8 +767,14 @@ mod tests {
             let s = script(sh);
             assert!(s.contains("sessions"), "{sh:?}");
             assert!(s.contains("--list"), "{sh:?}");
+            assert!(s.contains("--json"), "{sh:?}");
+            assert!(s.contains("--full"), "{sh:?}");
             assert!(s.contains("setup"), "{sh:?}");
             assert!(s.contains("session"), "{sh:?}");
+            assert!(s.contains("doctor"), "{sh:?}");
+            assert!(s.contains("prune"), "{sh:?}");
+            assert!(s.contains("stats"), "{sh:?}");
+            assert!(s.contains("completions"), "{sh:?}");
         }
         assert!(script(Shell::Zsh).contains("sessions)"));
         assert!(script(Shell::Bash).contains("sessions)"));
@@ -519,9 +806,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_shell_names() {
+    fn parses_shell_names_and_completions() {
         assert_eq!(Shell::parse("pwsh"), Some(Shell::PowerShell));
         assert_eq!(Shell::parse("bash"), Some(Shell::Bash));
         assert_eq!(Shell::parse("nu"), None);
+        for sh in [Shell::Zsh, Shell::Bash, Shell::Fish, Shell::PowerShell] {
+            assert!(completions(sh).contains("doctor"));
+        }
+    }
+
+    #[test]
+    fn safety_invariants_in_templates() {
+        let bash = script(Shell::Bash);
+        assert!(
+            !bash.contains("eval \"words="),
+            "bash must not eval history"
+        );
+        let zsh = script(Shell::Zsh);
+        assert!(zsh.contains("session start --pid $$ --"));
+        let fish = script(Shell::Fish);
+        assert!(fish.contains("session start --pid $fish_pid --"));
     }
 }

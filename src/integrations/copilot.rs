@@ -1,27 +1,7 @@
 //! copilot: GitHub Copilot CLI. We own one file, `~/.copilot/hooks/grace.json`.
-//!
-//! Verified in the docs (https://docs.github.com/en/copilot/reference/hooks-configuration):
-//! - Every `*.json` file in the user hooks folder loads. The folder is `~/.copilot/hooks/`,
-//!   or `$COPILOT_HOME/hooks/` if `COPILOT_HOME` is set.
-//! - Format: `{"version":1,"hooks":{"<event>":[{"type":"command","bash":"..","powershell":".."}]}}`.
-//!   Default `timeoutSec` is 30.
-//! - The payload is JSON on stdin with `cwd`. With a camelCase event name (what we install) the
-//!   payload has NO event name. With a PascalCase name it has `hook_event_name`. So we put the
-//!   event name in the command as an extra arg (`... session hook copilot agentStop`) and read it
-//!   from `args`. If the arg is missing, we use `hook_event_name` from the payload.
-//! - `notification` is fire-and-forget and has `notification_type`. `permission_prompt` and
-//!   `elicitation_dialog` mean Waiting. Other types (shell_completed, agent_idle of a background
-//!   agent, ...) are ignored.
-//! - Stdout: "If the leftover output is empty ... falls through to default behavior". So `stdout: ""`.
-//! - `permissionRequest` fires BEFORE the permission service runs (rules, session approvals,
-//!   auto-allow). It can fire for a tool that never asks the user. We still map it to Waiting
-//!   (from the brief). The next postToolUse sets Working again.
-//!
-//! Assumed: the powershell command is the same text. If the exe is quoted, we add `& ` in front.
-//! Event `notification` is an addition to the brief. It catches real prompts and questions.
-//! `GRACE_COPILOT_DIR` (grace only) wins over `COPILOT_HOME`, then `~/.copilot`.
-use super::{HookResult, Integration};
+use super::{HookResult, HookStatus, Integration};
 use crate::model::Status;
+use crate::platform;
 use crate::setup::{env_dir, read_opt, write_atomic};
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
@@ -29,8 +9,10 @@ use std::path::{Path, PathBuf};
 
 pub static INTEGRATION: Integration = Integration {
     name: "copilot",
+    label: "GitHub Copilot CLI",
     tool: "copilot",
     setup,
+    check,
     reads_stdin: true,
     hook,
     stdout: "",
@@ -64,17 +46,38 @@ fn setup(exe: &str, remove: bool) -> Result<String> {
     }
 }
 
+fn check(exe: &str) -> HookStatus {
+    let Ok(path) = hooks_file() else {
+        return HookStatus::NotInstalled;
+    };
+    let Ok(Some(old)) = read_opt(&path) else {
+        let dir = path.parent().and_then(|p| p.parent());
+        if dir.is_some_and(|p| p.is_dir()) || crate::tools::on_path("copilot") {
+            return HookStatus::Available(path);
+        }
+        return HookStatus::NotInstalled;
+    };
+    if !old.contains(MARK) {
+        return HookStatus::Conflict(path, "custom grace.json".into());
+    }
+    if serde_json::from_str::<Value>(&old).ok().as_ref() == Some(&desired(exe)) {
+        HookStatus::Connected(path)
+    } else {
+        HookStatus::OutdatedPath(path)
+    }
+}
+
 fn desired(exe: &str) -> Value {
-    let exe = super::gemini::quote_once(exe);
-    let ps_prefix = if exe.starts_with(['\'', '"']) { "& " } else { "" };
+    let sh_exe = platform::quote_posix(exe);
+    let ps_exe = platform::quote_powershell(exe);
     let mut hooks = Map::new();
     for ev in EVENTS {
         hooks.insert(
             ev.to_string(),
             json!([{
                 "type": "command",
-                "bash": format!("{exe} {MARK} {ev}"),
-                "powershell": format!("{ps_prefix}{exe} {MARK} {ev}"),
+                "bash": format!("{sh_exe} {MARK} {ev}"),
+                "powershell": format!("& {ps_exe} {MARK} {ev}"),
             }]),
         );
     }
@@ -85,10 +88,16 @@ fn add_file(path: &Path, exe: &str) -> Result<String> {
     let want = desired(exe);
     if let Some(old) = read_opt(path)? {
         if !old.contains(MARK) {
-            bail!("{} exists and is not a grace file. Nothing changed", path.display());
+            bail!(
+                "{} exists and is not a grace file. Nothing changed",
+                path.display()
+            );
         }
         if serde_json::from_str::<Value>(&old).ok().as_ref() == Some(&want) {
-            return Ok(format!("{}: grace hooks already set up. Nothing to do.", path.display()));
+            return Ok(format!(
+                "{}: grace hooks already set up. Nothing to do.",
+                path.display()
+            ));
         }
     }
     let mut out = serde_json::to_string_pretty(&want)?;
@@ -104,9 +113,10 @@ fn add_file(path: &Path, exe: &str) -> Result<String> {
 fn remove_file(path: &Path) -> Result<String> {
     match read_opt(path)? {
         None => Ok(format!("{} does not exist. Nothing to do.", path.display())),
-        Some(t) if !t.contains(MARK) => {
-            Ok(format!("{}: not a grace file. Left as it is. Nothing to do.", path.display()))
-        }
+        Some(t) if !t.contains(MARK) => Ok(format!(
+            "{}: not a grace file. Left as it is. Nothing to do.",
+            path.display()
+        )),
         Some(_) => {
             std::fs::remove_file(path)?;
             Ok(format!(
@@ -118,7 +128,6 @@ fn remove_file(path: &Path) -> Result<String> {
 }
 
 fn status_for(event: &str, ntype: &str) -> Option<Status> {
-    // Accept PascalCase too (same event, VS Code style name).
     let mut e = event.to_string();
     if let Some(c) = e.get_mut(0..1) {
         c.make_ascii_lowercase();
@@ -127,7 +136,6 @@ fn status_for(event: &str, ntype: &str) -> Option<Status> {
         "userPromptSubmitted" | "userPromptSubmit" | "preToolUse" | "postToolUse" => {
             Some(Status::Working)
         }
-        // permissionRequest also fires for auto-allowed tools, so it is not a reliable "needs you".
         "permissionRequest" => None,
         "notification" => match ntype {
             "permission_prompt" | "elicitation_dialog" => Some(Status::Waiting),
@@ -149,9 +157,27 @@ fn hook(args: &[String], stdin: &str) -> HookResult {
         Some(a) if !a.is_empty() => a.as_str(),
         _ => text("hook_event_name"),
     };
+    let ntype = text("notification_type");
+    let status = status_for(event, ntype);
+    let cwd = Some(text("cwd"))
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let session_id = Some(text("sessionId"))
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let detail = match status {
+        Some(Status::Waiting) if !ntype.is_empty() => Some(platform::sanitize_display(ntype)),
+        Some(Status::Working) => {
+            let tn = text("toolName");
+            (!tn.is_empty()).then(|| platform::sanitize_display(tn))
+        }
+        _ => None,
+    };
     HookResult {
-        status: status_for(event, text("notification_type")),
-        cwd: Some(text("cwd")).filter(|s| !s.is_empty()).map(String::from),
+        status,
+        cwd,
+        session_id,
+        detail,
     }
 }
 
@@ -179,9 +205,13 @@ mod tests {
             "/opt/grace/bin/grace session hook copilot agentStop"
         );
         assert_eq!(v["hooks"].as_object().unwrap().len(), EVENTS.len());
-        assert!(add_file(&p, EXE).unwrap().ends_with("already set up. Nothing to do."));
+        assert!(add_file(&p, EXE)
+            .unwrap()
+            .ends_with("already set up. Nothing to do."));
         add_file(&p, "/new/grace").unwrap();
-        assert!(fs::read_to_string(&p).unwrap().contains("/new/grace session hook"));
+        assert!(fs::read_to_string(&p)
+            .unwrap()
+            .contains("/new/grace session hook"));
         remove_file(&p).unwrap();
         assert!(!p.exists());
         assert!(remove_file(&p).unwrap().contains("Nothing to do"));
@@ -198,14 +228,21 @@ mod tests {
     }
 
     #[test]
-    fn quoted_exe_in_powershell() {
-        let v = desired("'/a b/grace'");
-        assert!(v["hooks"]["sessionEnd"][0]["powershell"].as_str().unwrap().starts_with("& '"));
-        assert!(v["hooks"]["sessionEnd"][0]["bash"].as_str().unwrap().starts_with("'/a b"));
-        if cfg!(unix) {
-            let v = desired("/a b/grace");
-            assert_eq!(v["hooks"]["sessionEnd"][0]["bash"], "'/a b/grace' session hook copilot sessionEnd");
-        }
+    fn quoted_exe_in_powershell_and_bash() {
+        let v = desired("/a b/grace");
+        assert_eq!(
+            v["hooks"]["sessionEnd"][0]["powershell"],
+            "& '/a b/grace' session hook copilot sessionEnd"
+        );
+        assert_eq!(
+            v["hooks"]["sessionEnd"][0]["bash"],
+            "'/a b/grace' session hook copilot sessionEnd"
+        );
+        let win = desired(r"C:\My Tools\grace.exe");
+        assert_eq!(
+            win["hooks"]["sessionEnd"][0]["powershell"],
+            r"& 'C:\My Tools\grace.exe' session hook copilot sessionEnd"
+        );
     }
 
     #[test]
@@ -213,7 +250,11 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let other = d.path().join("hooks").join("mine.json");
         std::fs::create_dir_all(other.parent().unwrap()).unwrap();
-        fs::write(&other, r#"{"version":1,"hooks":{"agentStop":[{"type":"command","bash":"echo hi"}]}}"#).unwrap();
+        fs::write(
+            &other,
+            r#"{"version":1,"hooks":{"agentStop":[{"type":"command","bash":"echo hi"}]}}"#,
+        )
+        .unwrap();
         let p = d.path().join("hooks").join("grace.json");
         add_file(&p, EXE).unwrap();
         remove_file(&p).unwrap();
@@ -228,7 +269,10 @@ mod tests {
             assert_eq!(s(e, ""), Some(Status::Working));
         }
         assert_eq!(s("permissionRequest", ""), None);
-        assert_eq!(s("notification", "elicitation_dialog"), Some(Status::Waiting));
+        assert_eq!(
+            s("notification", "elicitation_dialog"),
+            Some(Status::Waiting)
+        );
         assert_eq!(s("notification", "shell_completed"), None);
         assert_eq!(s("agentStop", ""), Some(Status::Ready));
         assert_eq!(s("sessionStart", ""), Some(Status::Ready));
@@ -240,12 +284,19 @@ mod tests {
 
     #[test]
     fn hook_parse() {
-        let r = hook(&a("agentStop"), r#"{"sessionId":"1","timestamp":1,"cwd":"/c"}"#);
+        let r = hook(
+            &a("agentStop"),
+            r#"{"sessionId":"1","timestamp":1,"cwd":"/c"}"#,
+        );
         assert_eq!(r.status, Some(Status::Ready));
         assert_eq!(r.cwd.as_deref(), Some("/c"));
+        assert_eq!(r.session_id.as_deref(), Some("1"));
         let r = hook(&[], r#"{"hook_event_name":"SessionEnd","cwd":"/c"}"#);
         assert_eq!(r.status, Some(Status::Done));
-        let r = hook(&a("notification"), r#"{"cwd":"/c","hook_event_name":"Notification","notification_type":"permission_prompt"}"#);
+        let r = hook(
+            &a("notification"),
+            r#"{"cwd":"/c","hook_event_name":"Notification","notification_type":"permission_prompt"}"#,
+        );
         assert_eq!(r.status, Some(Status::Waiting));
         assert_eq!(hook(&a("agentStop"), "bad"), HookResult::default());
         assert_eq!(hook(&a("agentStop"), "").status, None);

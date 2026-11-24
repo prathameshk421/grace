@@ -1,84 +1,192 @@
-# Install grace: irm https://raw.githubusercontent.com/prathameshk421/grace/main/install.ps1 | iex
-# Env: GRACE_VERSION (for example v1.1.1), GRACE_INSTALL_DIR (default %LOCALAPPDATA%\grace\bin).
+﻿# Install grace for Windows from GitHub Releases.
+# Env: GRACE_VERSION (for example v2.1.0), GRACE_INSTALL_DIR (default %LOCALAPPDATA%\grace\bin).
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-& {
-    $repo = 'prathameshk421/grace'
-    $releases = "https://github.com/$repo/releases"
+$repo = 'prathameshk421/grace'
+$releases = "https://github.com/$repo/releases"
 
-    $arch = $env:PROCESSOR_ARCHITEW6432
-    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
-    switch ($arch) {
-        'AMD64' { }
-        'ARM64' { Write-Host 'ARM64 Windows: the x64 build runs under emulation. Using it.' }
-        default { throw "Unsupported CPU: $arch. See $releases for other builds." }
+# Enforce TLS 1.2+ only.
+$proto = [System.Net.SecurityProtocolType]::Tls12
+if ([Enum]::GetNames([System.Net.SecurityProtocolType]) -contains 'Tls13') {
+  $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13
+}
+[System.Net.ServicePointManager]::SecurityProtocol = $proto
+
+function Assert-GitHubHttpsUri {
+  param([string]$Url)
+  $uri = [Uri]$Url
+  if ($uri.Scheme -ne 'https' -or $uri.Host -ne 'github.com') {
+    throw "Refusing unexpected download URI: $Url"
+  }
+}
+
+$arch = ''
+try {
+  $arch = [string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+} catch {
+  $arch = $env:PROCESSOR_ARCHITECTURE
+}
+if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+
+$targets = switch ($arch.ToUpperInvariant()) {
+  'ARM64' { @('aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc') }
+  default { @('x86_64-pc-windows-msvc') }
+}
+
+$version = $env:GRACE_VERSION
+if (-not $version) {
+  try {
+    $req = [System.Net.HttpWebRequest]::Create("$releases/latest")
+    $req.Method = 'HEAD'
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 15000
+    $resp = $req.GetResponse()
+    $loc = $resp.Headers['Location']
+    $resp.Close()
+    if ($loc -match '/releases/tag/([^/?#]+)$') {
+      $version = $Matches[1]
     }
-    $target = 'x86_64-pc-windows-msvc'
-
-    $version = $env:GRACE_VERSION
-    if (-not $version) {
-        # The releases/latest page redirects to .../tag/<version>. This has no API rate limit.
-        try {
-            $resp = Invoke-WebRequest "$releases/latest" -UseBasicParsing -MaximumRedirection 5
-            $final = $resp.BaseResponse.ResponseUri
-            if (-not $final) { $final = $resp.BaseResponse.RequestMessage.RequestUri }
-            if ("$final" -match '/tag/([^/?#]+)') { $version = $Matches[1] }
-        } catch { }
-        if (-not $version) {
-            try {
-                $version = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
-            } catch {
-                throw "Could not read the latest version. Set GRACE_VERSION or see $releases"
-            }
-        }
+  } catch [System.Net.WebException] {
+    $r = $_.Exception.Response
+    if ($r) {
+      $loc = $r.Headers['Location']
+      $r.Close()
+      if ($loc -match '/releases/tag/([^/?#]+)$') {
+        $version = $Matches[1]
+      }
     }
-    if (-not $version) { throw "Could not read the latest version. Set GRACE_VERSION or see $releases" }
+  }
+  if (-not $version) {
+    $rel = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
+    $version = $rel.tag_name
+  }
+  if (-not $version) {
+    throw "Could not read the latest version. Set GRACE_VERSION or see $releases"
+  }
+}
 
-    $name = "grace-$version-$target"
-    $base = "$releases/download/$version"
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("grace-" + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $tmp | Out-Null
+if ($version -notmatch '^v\d+\.\d+\.\d+([.-][A-Za-z0-9.+-]+)?$') {
+  throw "Invalid GRACE_VERSION format: $version"
+}
 
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("grace-install-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+try {
+  $chosenTarget = $null
+  $name = $null
+  $zipPath = $null
+  $shaPath = $null
+
+  foreach ($t in $targets) {
+    $candidateName = "grace-$version-$t"
+    $zipUrl = "$releases/download/$version/$candidateName.zip"
+    $shaUrl = "$zipUrl.sha256"
+    Assert-GitHubHttpsUri $zipUrl
+    Assert-GitHubHttpsUri $shaUrl
+    $zp = Join-Path $tmp "$candidateName.zip"
+    $sp = Join-Path $tmp "$candidateName.zip.sha256"
     try {
-        Write-Host "Downloading grace $version for $target"
-        $zip = Join-Path $tmp "$name.zip"
-        Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.zip" -OutFile $zip
-        $sumText = (Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.zip.sha256").Content
-        if ($sumText -is [byte[]]) { $sumText = [Text.Encoding]::ASCII.GetString($sumText) }
-        $expected = ($sumText.Trim() -split '\s+')[0].ToLower()
-        $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
-        if ($expected -ne $actual) { throw "Checksum mismatch for $name.zip" }
-        Write-Host 'Checksum OK'
-
-        $out = Join-Path $tmp 'out'
-        Expand-Archive -Path $zip -DestinationPath $out -Force
-        $exe = Get-ChildItem -Path $out -Filter 'grace.exe' -Recurse | Select-Object -First 1
-        if (-not $exe) { throw 'grace.exe not found in the archive' }
-
-        $dir = $env:GRACE_INSTALL_DIR
-        if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA 'grace\bin' }
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        Copy-Item -Path $exe.FullName -Destination (Join-Path $dir 'grace.exe') -Force
-        Write-Host "Installed grace $version to $(Join-Path $dir 'grace.exe')"
-
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        $parts = @()
-        if ($userPath) { $parts = $userPath -split ';' | Where-Object { $_ } }
-        if (-not ($parts | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') })) {
-            $newPath = (@($parts) + $dir) -join ';'
-            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-            Write-Host "Added $dir to your user PATH. Open a new terminal to use it."
-        }
-        if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$env:Path;$dir" }
-
-        Write-Host ''
-        Write-Host 'Next step: add this line to your PowerShell profile, then open a new terminal.'
-        Write-Host '  notepad $PROFILE'
-        Write-Host ''
-        Write-Host '  Invoke-Expression (& grace init powershell | Out-String)'
-    } finally {
-        Remove-Item -Recurse -Force -Path $tmp -ErrorAction SilentlyContinue
+      Invoke-WebRequest -Uri $zipUrl -OutFile $zp -UseBasicParsing
+      Invoke-WebRequest -Uri $shaUrl -OutFile $sp -UseBasicParsing
+      $chosenTarget = $t
+      $name = $candidateName
+      $zipPath = $zp
+      $shaPath = $sp
+      break
+    } catch {
+      if ($t -eq $targets[-1]) { throw }
     }
+  }
+
+  $expected = ((Get-Content -Raw -LiteralPath $shaPath).Trim() -split '\s+')[0].ToLowerInvariant()
+  if ($expected -notmatch '^[0-9a-f]{64}$') {
+    throw "Malformed SHA-256 checksum file ($shaPath)"
+  }
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) {
+    throw "SHA-256 mismatch for $name.zip (expected $expected, got $actual)"
+  }
+
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $extractDir = Join-Path $tmp 'extract'
+  New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+  $canonRoot = [System.IO.Path]::GetFullPath($extractDir + [System.IO.Path]::DirectorySeparatorChar)
+  $stagedExe = $null
+
+  $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+  try {
+    foreach ($entry in $zip.Entries) {
+      if ($entry.FullName.EndsWith('/')) { continue }
+      $destPath = [System.IO.Path]::GetFullPath((Join-Path $extractDir $entry.FullName))
+      if (-not $destPath.StartsWith($canonRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Blocked unsafe archive entry path: $($entry.FullName)"
+      }
+      if ($entry.Name -ceq 'grace.exe') {
+        $parent = Split-Path -Parent $destPath
+        if (-not (Test-Path -LiteralPath $parent)) {
+          New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destPath, $true)
+        $stagedExe = $destPath
+        break
+      }
+    }
+  } finally {
+    $zip.Dispose()
+  }
+
+  if (-not $stagedExe -or -not (Test-Path -LiteralPath $stagedExe)) {
+    throw "Archive did not contain grace.exe"
+  }
+
+  $dir = $env:GRACE_INSTALL_DIR
+  if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA 'grace\bin' }
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+  $dst = Join-Path $dir 'grace.exe'
+  $old = Join-Path $dir 'grace.exe.old'
+  if (Test-Path -LiteralPath $old) {
+    Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path -LiteralPath $dst) {
+    Move-Item -LiteralPath $dst -Destination $old -Force
+  }
+  Move-Item -LiteralPath $stagedExe -Destination $dst -Force
+  Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+
+  # Update current user PATH while preserving REG_EXPAND_SZ if already set.
+  $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+  if ($envKey) {
+    try {
+      $rawPath = $envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+      $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+      try { $kind = $envKey.GetValueKind('Path') } catch { }
+      $parts = @($rawPath -split ';' | Where-Object { $_ -ne '' })
+      if (-not ($parts | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') })) {
+        $newPath = if ($rawPath) { "$rawPath;$dir" } else { $dir }
+        $envKey.SetValue('Path', $newPath, $kind)
+      }
+    } finally {
+      $envKey.Close()
+    }
+  }
+  if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') })) {
+    $env:Path = "$env:Path;$dir"
+  }
+
+  Write-Host ""
+  Write-Host "  * grace $version installed to $dst ($chosenTarget)" -ForegroundColor Green
+  Write-Host ""
+  Write-Host "  1. Enable shell integration in PowerShell (`$PROFILE):"
+  Write-Host "       New-Item -ItemType File -Force -Path `$PROFILE"
+  Write-Host "       Add-Content `$PROFILE 'Invoke-Expression (& grace init powershell | Out-String)'"
+  Write-Host ""
+  Write-Host "  2. Connect CLI agents and verify health:"
+  Write-Host "       grace setup --all"
+  Write-Host "       grace doctor"
+  Write-Host ""
+} finally {
+  if (Test-Path -LiteralPath $tmp) {
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }

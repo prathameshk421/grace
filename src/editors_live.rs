@@ -1,13 +1,13 @@
 //! Live editor state: which folders have an editor window open right now, and a cheap
 //! background refresh of editor history so folders opened from File > Open show up.
-//! OWNER: editors agent. The picker agent only calls these two functions.
 use crate::db::Db;
 use crate::import_editors::{config_root, uri_to_path};
 use crate::platform;
-use crate::setup::shell_quote;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+const MAX_STORAGE_JSON_BYTES: usize = 8 << 20;
 
 /// One folder with an editor window open right now.
 #[derive(Debug, Clone, PartialEq)]
@@ -16,7 +16,11 @@ pub struct OpenEditor {
     pub path: String,
     /// grace tag of the editor, e.g. "vscode", "antigravity", "cursor".
     pub tag: String,
-    /// Command that opens or focuses this folder in that editor, e.g. `code "/a b"`.
+    /// Executable program name or path to launch/focus this editor directly.
+    pub prog: String,
+    /// Direct arguments to pass to `prog` (never shell-evaluated).
+    pub args: Vec<String>,
+    /// Human-readable command string for display/tests.
     pub open_cmd: String,
 }
 
@@ -36,7 +40,14 @@ struct App {
 }
 
 const APPS: &[App] = &[
-    App { dir: "Code", tag: "vscode", cli: "code", bundle: "Visual Studio Code", bin: "code", exe: "Code.exe" },
+    App {
+        dir: "Code",
+        tag: "vscode",
+        cli: "code",
+        bundle: "Visual Studio Code",
+        bin: "code",
+        exe: "Code.exe",
+    },
     App {
         dir: "Code - Insiders",
         tag: "vscode",
@@ -45,9 +56,30 @@ const APPS: &[App] = &[
         bin: "code-insiders",
         exe: "Code - Insiders.exe",
     },
-    App { dir: "VSCodium", tag: "vscodium", cli: "codium", bundle: "VSCodium", bin: "codium", exe: "VSCodium.exe" },
-    App { dir: "Cursor", tag: "cursor", cli: "cursor", bundle: "Cursor", bin: "cursor", exe: "Cursor.exe" },
-    App { dir: "Windsurf", tag: "windsurf", cli: "windsurf", bundle: "Windsurf", bin: "windsurf", exe: "Windsurf.exe" },
+    App {
+        dir: "VSCodium",
+        tag: "vscodium",
+        cli: "codium",
+        bundle: "VSCodium",
+        bin: "codium",
+        exe: "VSCodium.exe",
+    },
+    App {
+        dir: "Cursor",
+        tag: "cursor",
+        cli: "cursor",
+        bundle: "Cursor",
+        bin: "cursor",
+        exe: "Cursor.exe",
+    },
+    App {
+        dir: "Windsurf",
+        tag: "windsurf",
+        cli: "windsurf",
+        bundle: "Windsurf",
+        bin: "windsurf",
+        exe: "Windsurf.exe",
+    },
     App {
         dir: "Antigravity",
         tag: "antigravity",
@@ -112,7 +144,10 @@ fn window_folder(w: &serde_json::Value, windows: bool) -> Option<String> {
         return uri_to_path(u, windows);
     }
     let ws = w.get("workspaceIdentifier")?;
-    let cfg = ws.get("configURIPath").or_else(|| ws.get("configPath"))?.as_str()?;
+    let cfg = ws
+        .get("configURIPath")
+        .or_else(|| ws.get("configPath"))?
+        .as_str()?;
     let file = if cfg.starts_with("file:") {
         uri_to_path(cfg, windows)?
     } else if cfg.contains("://") {
@@ -133,20 +168,29 @@ fn base_name(s: &str) -> &str {
     s.rsplit(['/', '\\']).next().unwrap_or(s)
 }
 
-/// The outer bundle (`/x/Name.app`) that holds the command of a process line.
+/// The outer bundle (`/x/Name.app`) from `argv[0]` only (never arbitrary flag arguments).
 fn bundle_of(cmd: &str) -> Option<&str> {
-    cmd.find(".app/").map(|i| &cmd[..i + 4])
+    let i = cmd.find(".app/")?;
+    let head = &cmd[..i + 4];
+    // Reject if a `--flag` preceded the `.app/` match (not argv[0]).
+    if head.contains(" --") {
+        return None;
+    }
+    Some(head)
 }
 
 /// Map process lines to running apps: `app data folder name -> bundle path (macOS)`.
-/// Unix lines are `pgrep -lf` / `pgrep -af` output (`PID command args`).
-/// Windows lines are `tasklist /fo csv /nh` output.
+/// Unix lines are `pgrep` / `/proc` output (`PID command args`).
+/// Windows lines are executable names or `tasklist /fo csv /nh` output.
 pub fn parse_running(out: &str, windows: bool) -> HashMap<&'static str, Option<String>> {
     let mut found: HashMap<&'static str, Option<String>> = HashMap::new();
     let mut udd_bundles: HashSet<String> = HashSet::new();
     let mut main: Vec<(&'static App, Option<String>)> = Vec::new();
     for line in out.lines() {
         let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         if windows {
             let exe = line.trim_start_matches('"').split('"').next().unwrap_or("");
             for a in APPS.iter().filter(|a| a.exe.eq_ignore_ascii_case(exe)) {
@@ -204,13 +248,14 @@ pub fn parse_running(out: &str, windows: bool) -> HashMap<&'static str, Option<S
 /// True when the last import time is missing, bad, 10 minutes old or more, or in the future.
 pub fn is_stale(last: Option<&str>, now: i64) -> bool {
     match last.and_then(|s| s.trim().parse::<i64>().ok()) {
-        Some(t) => now - t >= STALE_SECS || t > now,
+        Some(t) => now.saturating_sub(t) >= STALE_SECS || t > now,
         None => true,
     }
 }
 
 // ---------- system ----------
 
+#[cfg(all(unix, not(target_os = "linux")))]
 fn pgrep_pattern() -> String {
     let dirs: Vec<&str> = APPS.iter().map(|a| a.dir).collect();
     let mut pat = format!("user-data-dir=.*/({})( --|$)", dirs.join("|"));
@@ -224,53 +269,190 @@ fn pgrep_pattern() -> String {
     pat
 }
 
-/// Run one process listing and return its output. Empty on any error.
+/// Fast OS-native process listing filtered to the current user where applicable.
 fn process_listing() -> String {
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("tasklist");
-        c.args(["/fo", "csv", "/nh"]);
-        c
-    } else {
-        let mut c = Command::new("pgrep");
-        c.arg(if cfg!(target_os = "macos") { "-lf" } else { "-af" }).arg(pgrep_pattern());
-        c
-    };
+    #[cfg(target_os = "linux")]
+    {
+        linux_proc_listing()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // SAFETY: geteuid is always safe and returns the effective user ID.
+        let uid = unsafe { libc::geteuid() }.to_string();
+        // Both macOS and BSD pgrep support `-u <uid> -lf <pattern>`.
+        match Command::new("pgrep")
+            .args(["-u", &uid, "-lf"])
+            .arg(pgrep_pattern())
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(_) => String::new(),
+        }
+    }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        windows_process_listing()
     }
-    cmd.stdin(Stdio::null()).stderr(Stdio::null());
-    match cmd.output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
+    #[cfg(not(any(unix, windows)))]
+    {
+        String::new()
     }
 }
 
-/// True when `name` is a command on PATH.
-fn on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
+#[cfg(target_os = "linux")]
+fn linux_proc_listing() -> String {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid is always safe.
+    let euid = unsafe { libc::geteuid() };
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return String::new();
     };
-    let exts: &[&str] = if cfg!(windows) { &[".cmd", ".exe", ""] } else { &[""] };
-    std::env::split_paths(&path).any(|dir| exts.iter().any(|ext| dir.join(format!("{name}{ext}")).is_file()))
+    let mut out = String::new();
+    for entry in rd.flatten() {
+        let fname = entry.file_name();
+        let pid_str = fname.to_string_lossy();
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let p = entry.path();
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if meta.uid() != euid {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(p.join("cmdline")) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let cmd = bytes
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !cmd.is_empty() {
+            out.push_str(&pid_str);
+            out.push(' ');
+            out.push_str(&cmd);
+            out.push('\n');
+        }
+    }
+    out
 }
 
-/// Command that opens `path` in `app`.
-fn open_command(app: &App, bundle: Option<&str>, path: &str, cli_on_path: bool) -> String {
-    let q = shell_quote(path);
-    if cli_on_path || !cfg!(target_os = "macos") {
-        return format!("{} {q}", app.cli);
+#[cfg(windows)]
+fn windows_process_listing() -> String {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut out = String::new();
+    // SAFETY: Standard ToolHelp32 process snapshot; handle is closed before return.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                if !name.is_empty() {
+                    out.push_str(&name);
+                    out.push('\n');
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
     }
-    let bundle = bundle
+    out
+}
+
+/// Validate that a discovered macOS `.app` bundle is safe to execute/open.
+fn trusted_bundle(bundle: &str) -> bool {
+    let p = Path::new(bundle);
+    if !p.is_absolute() || !p.is_dir() {
+        return false;
+    }
+    let home_apps = platform::home_dir().map(|h| h.join("Applications"));
+    let in_trusted_root = bundle.starts_with("/Applications/")
+        || bundle.starts_with("/System/Applications/")
+        || home_apps.as_ref().is_some_and(|ha| p.starts_with(ha));
+    if !in_trusted_root {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(meta) = std::fs::metadata(p) else {
+            return false;
+        };
+        // SAFETY: geteuid is always safe.
+        let euid = unsafe { libc::geteuid() };
+        let owner_ok = meta.uid() == 0 || meta.uid() == euid;
+        let not_world_writable = meta.permissions().mode() & 0o002 == 0;
+        owner_ok && not_world_writable
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Target program + args + display string to open `path` in `app`.
+fn build_open_target(
+    app: &App,
+    bundle: Option<&str>,
+    path: &str,
+    cli_on_path: bool,
+) -> (String, Vec<String>, String) {
+    let q = if cfg!(windows) {
+        platform::quote_powershell(path)
+    } else {
+        platform::quote_posix(path)
+    };
+    if cli_on_path || !cfg!(target_os = "macos") {
+        let args = vec![path.to_string()];
+        let open_cmd = format!("{} {q}", app.cli);
+        return (app.cli.to_string(), args, open_cmd);
+    }
+    let bundle_path = bundle
+        .filter(|b| trusted_bundle(b))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/Applications/{}.app", app.bundle)));
-    let cli = bundle.join("Contents/Resources/app/bin").join(app.cli);
+    let cli = bundle_path.join("Contents/Resources/app/bin").join(app.cli);
     if cli.is_file() {
-        return format!("{} {q}", shell_quote(&cli.to_string_lossy()));
+        let prog = cli.to_string_lossy().into_owned();
+        let open_cmd = format!("{} {q}", platform::quote_posix(&prog));
+        return (prog, vec![path.to_string()], open_cmd);
     }
-    let target = if bundle.is_dir() { bundle.to_string_lossy().into_owned() } else { app.bundle.to_string() };
-    format!("open -a {} {q}", shell_quote(&target))
+    let target = if bundle_path.is_dir() {
+        bundle_path.to_string_lossy().into_owned()
+    } else {
+        app.bundle.to_string()
+    };
+    let open_cmd = format!("open -a {} {q}", platform::quote_posix(&target));
+    (
+        "open".to_string(),
+        vec!["-a".into(), target, path.to_string()],
+        open_cmd,
+    )
 }
 
 /// Folders with an editor window open now. Must be fast (< 30 ms) and never fail.
@@ -294,10 +476,13 @@ fn open_editors_inner() -> Vec<OpenEditor> {
             continue;
         };
         let file = root.join(a.dir).join("User/globalStorage/storage.json");
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = platform::read_to_string_capped(&file, MAX_STORAGE_JSON_BYTES) else {
             continue;
         };
         for p in parse_open_folders(&text, cfg!(windows)) {
+            if platform::has_line_break_or_nul(&p) {
+                continue;
+            }
             let dir = Path::new(&p);
             if !dir.is_dir() {
                 continue;
@@ -306,23 +491,47 @@ fn open_editors_inner() -> Vec<OpenEditor> {
             if platform::ignored(&path) || out.iter().any(|e| e.tag == a.tag && e.path == path) {
                 continue;
             }
-            let cli = *cli_cache.entry(a.cli).or_insert_with(|| on_path(a.cli));
-            let open_cmd = open_command(a, bundle.as_deref(), &path, cli);
-            out.push(OpenEditor { path, tag: a.tag.to_string(), open_cmd });
+            let cli = *cli_cache
+                .entry(a.cli)
+                .or_insert_with(|| crate::tools::on_path(a.cli));
+            let (prog, args, open_cmd) = build_open_target(a, bundle.as_deref(), &path, cli);
+            out.push(OpenEditor {
+                path,
+                tag: a.tag.to_string(),
+                prog,
+                args,
+                open_cmd,
+            });
         }
     }
     out
 }
 
 /// Re-import editor history if the last import is older than 10 minutes. Never fails loudly.
+#[cfg(test)]
 pub fn refresh_if_stale(db: &Db) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refresh_inner(db)));
+    refresh_if_stale_with(db, None);
 }
 
-fn refresh_inner(db: &Db) {
+/// Re-import editor history using pre-collected open editors when available.
+pub fn refresh_if_stale_with(db: &Db, already_open: Option<&[OpenEditor]>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refresh_inner(db, already_open);
+    }));
+}
+
+fn refresh_inner(db: &Db, already_open: Option<&[OpenEditor]>) {
     let now = crate::model::now();
     // An open editor folder always appears in the list.
-    for e in open_editors() {
+    let owned;
+    let open = match already_open {
+        Some(list) => list,
+        None => {
+            owned = open_editors();
+            &owned
+        }
+    };
+    for e in open {
         let _ = db.import_dir(&e.path, now, Some(&e.tag));
     }
     let last = db.get_meta(IMPORTED_AT).ok().flatten();
@@ -334,6 +543,11 @@ fn refresh_inner(db: &Db) {
         return;
     }
     crate::import_editors::import_editors_quiet(db);
+}
+
+/// Record that the initial import ran so we do not immediately re-scan on the next command.
+pub fn mark_imported_now(db: &Db) {
+    let _ = db.set_meta(IMPORTED_AT, &crate::model::now().to_string());
 }
 
 #[cfg(test)]
@@ -352,10 +566,14 @@ mod tests {
                 {"backupPath":"/b/empty"},
                 {"folder":"vscode-remote://ssh-remote%2Bhost/home/x"}
             ]}}"#;
-        assert_eq!(parse_open_folders(j, false), vec!["/a/last", "/a/one two", "/ws/proj"]);
+        assert_eq!(
+            parse_open_folders(j, false),
+            vec!["/a/last", "/a/one two", "/ws/proj"]
+        );
         assert!(parse_open_folders("{}", false).is_empty());
         assert!(parse_open_folders("garbage", false).is_empty());
-        let empty = r#"{"windowsState":{"lastActiveWindow":{"backupPath":"/b"},"openedWindows":[]}}"#;
+        let empty =
+            r#"{"windowsState":{"lastActiveWindow":{"backupPath":"/b"},"openedWindows":[]}}"#;
         assert!(parse_open_folders(empty, false).is_empty());
     }
 
@@ -373,9 +591,17 @@ mod tests {
         let mut names: Vec<&str> = r.keys().copied().collect();
         names.sort();
         assert_eq!(names, vec!["Antigravity IDE", "Code", "Cursor"]);
-        assert_eq!(r["Code"].as_deref(), Some("/Applications/Visual Studio Code.app"));
-        assert_eq!(r["Cursor"].as_deref(), Some("/Users/me/Applications/Cursor.app"));
+        assert_eq!(
+            r["Code"].as_deref(),
+            Some("/Applications/Visual Studio Code.app")
+        );
+        assert_eq!(
+            r["Cursor"].as_deref(),
+            Some("/Users/me/Applications/Cursor.app")
+        );
         assert!(parse_running("", false).is_empty());
+        // Rejects bundle path in flags rather than argv[0].
+        assert_eq!(bundle_of("foo --arg=/tmp/Fake.app/Contents/MacOS/x"), None);
     }
 
     #[test]
@@ -406,8 +632,10 @@ mod tests {
     #[test]
     fn builds_open_command() {
         let a = app("Code").unwrap();
-        let want = if cfg!(windows) { "code \"/a b\"" } else { "code '/a b'" };
-        assert_eq!(open_command(a, None, "/a b", true), want);
+        let (prog, args, cmd) = build_open_target(a, None, "/a b", true);
+        assert_eq!(prog, "code");
+        assert_eq!(args, vec!["/a b"]);
+        assert_eq!(cmd, "code '/a b'");
     }
 
     #[test]
@@ -418,20 +646,5 @@ mod tests {
         refresh_if_stale(&db);
         let t: i64 = db.get_meta(IMPORTED_AT).unwrap().unwrap().parse().unwrap();
         assert!(crate::model::now() - t < 60);
-    }
-
-    /// Smoke test on the real machine: `cargo test smoke_open_editors -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn smoke_open_editors() {
-        let t = std::time::Instant::now();
-        let list = open_editors();
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
-        let home = platform::home_dir().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
-        let short = |s: &str| if home.is_empty() { s.to_string() } else { s.replace(&home, "~") };
-        for e in &list {
-            println!("{} [{}] {}", short(&e.path), e.tag, short(&e.open_cmd));
-        }
-        println!("open_editors: {} entries in {ms:.1} ms", list.len());
     }
 }

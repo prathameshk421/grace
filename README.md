@@ -64,15 +64,21 @@ Other shells, downloads and source builds are in [Install](#install).
 |---|---|
 | **~13 ms** | One hook call. It runs in the background, so the prompt does not wait. |
 | **13 + 11** | 13 AI tools and 11 editors built in. |
-| **3 systems, 4 shells** | macOS, Linux, Windows. zsh, bash, fish, PowerShell. |
+| **3 systems, 4 shells** | macOS, Linux (musl & glibc), Windows (x64 & ARM64). zsh, bash, fish, PowerShell. |
 | **7 sources** | Claude Code, VS Code, Cursor, Windsurf, Antigravity, Zed and T3 Code history. |
-| **0 config** | Install, add one line to your shell, and go. |
+| **0 config** | Works out of the box — plus optional `~/.config/grace/config.toml`. |
 | **1 window** | `grace hub` puts your agents, shell, diff and file tree side by side. |
-| **1 binary** | Written in Rust. Local SQLite. Nothing leaves your machine. |
+| **1 binary** | Written in Rust. Local SQLite (`0600`). Nothing leaves your machine. |
 
 ## Fast travel.
 
 Type `grace` to open the picker. Type to filter, press Enter, and your shell moves there. If your word matches only one folder, grace jumps at once.
+
+Inside the picker:
+- `Tab` switches between **Folders** and **Sessions** (or click the tabs)
+- `Alt-i` toggles the inline **Inspector** panel (git status, counts, session details)
+- `Alt-p` pin/unpin · `Ctrl-d` forget · `Ctrl-y` copy path · `Ctrl-g` open in `grace hub`
+- `ctrl-o` jump & launch last AI tool · `ctrl-e` focus/open editor · `?` all keys
 
 ```sh
 grace          # open the picker
@@ -108,8 +114,12 @@ Press **ctrl-g**, then one key. No tmux prefix needed.
 | `d` | Show or hide the diff |
 | `t` | Show or hide the file tree |
 | `r` | Show or hide the whole right side |
+| `l` | Cycle layout presets (`full` → `code+diff` → `sidebar+main` → `zen`) |
+| `P` | Restore saved pane widths |
 | `z` | Zoom the main pane, or zoom out |
 | `g` | Go to the sidebar |
+| `n` / `p` / `Tab` | Next / previous / last workspace (`1`–`9` to jump directly) |
+| `w` | Close the current workspace |
 | `q` | Detach. The hub keeps running. Run `grace hub` to come back. |
 | `Q` | Quit the hub. It asks first, then closes every workspace. |
 | `?` | Show all keys |
@@ -151,8 +161,8 @@ grace runs tmux on its own server (`tmux -L grace`) with its own config file. Yo
 </table>
 
 ```sh
-grace diff     # changed files and a colored diff. j/k move, tab switches focus, q quits.
-grace tree     # files with git changes marked. enter opens a folder, o opens a file.
+grace diff     # changed files & line-numbered diff (j/k, s/u stage, ]/[ hunks, S scope, / search)
+grace tree     # project file tree with git marks (Enter folder, / filter, c changed-only, o/y/E/C)
 ```
 
 `grace diff` shows untracked files as added. It cuts very long diffs. `grace tree` hides the files that `.gitignore` lists. Outside a git repository, it skips `.git`, `node_modules` and `target`.
@@ -172,10 +182,12 @@ grace ❯
 "Needs you" means the agent is blocked on a question or a permission. "Your turn" means it finished.
 
 ```sh
-grace setup claude     # Claude Code CLI reports its status to grace
-grace setup codex      # Codex CLI reports when a turn ends
+grace setup            # see status across all 11 CLI agents
+grace setup --all      # connect every detected CLI agent at once
+grace setup claude     # connect one agent explicitly
+grace doctor --fix     # check environment health, DB perms, and outdated hooks
 grace sessions         # picker with live agents only
-grace sessions -l      # plain list
+grace sessions -l      # plain list (or --json)
 ```
 
 `grace setup <cli>` connects 11 CLI agents:
@@ -285,9 +297,12 @@ irm https://raw.githubusercontent.com/prathameshk421/grace/main/install.ps1 | ie
 |---|---|
 | macOS Apple Silicon | `grace-<version>-aarch64-apple-darwin.tar.gz` |
 | macOS Intel | `grace-<version>-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `grace-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `grace-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 (static musl) | `grace-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux x86_64 (glibc) | `grace-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 (static musl) | `grace-<version>-aarch64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 (glibc) | `grace-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows x86_64 | `grace-<version>-x86_64-pc-windows-msvc.zip` |
+| Windows ARM64 | `grace-<version>-aarch64-pc-windows-msvc.zip` |
 
 macOS and Linux: extract the archive and move `grace` into a folder on your PATH.
 
@@ -342,7 +357,13 @@ cargo install --git https://github.com/prathameshk421/grace
 | `grace hub [path]` | Open the hub on tmux: sidebar, shell, diff and file tree. Inside the hub, switch to the folder. |
 | `grace diff [path]` | Show the changed files of a git repository and a colored diff. |
 | `grace tree [path]` | Show the files of a folder as a tree, with git changes marked. |
-| `grace list` | Print all folders, best first. |
+| `grace list` | Print all folders, best first (`--json` for JSON output). |
+| `grace sessions` | Live CLI agent sessions (`-l` plain, `--json` for JSON). |
+| `grace setup [agent]` | Inspect agent hooks, connect one agent, or use `--all`. |
+| `grace doctor [--fix]` | Check shell integration, DB permissions/integrity, hooks, and tmux. |
+| `grace stats` | Show usage statistics across tracked folders and tools. |
+| `grace prune [--dry-run]` | Remove tracked folders that no longer exist on disk (`--older-than DAYS`). |
+| `grace completions <shell>` | Print tab-completion script (`zsh`, `bash`, `fish`, `powershell`). |
 | `grace pin` / `grace unpin` | Keep the current folder at the top (or remove the pin). |
 | `grace forget` | Remove the current folder from grace. |
 | `grace import [source]` | Import history again. Sources: `all` (default), `claude`, `vscode`, `cursor`, `windsurf`, `antigravity`, `zed`, `t3code`. |
@@ -379,6 +400,14 @@ With `all`, grace skips sources it cannot find. With a named source, it prints "
 - **Imports.** grace opens editor databases read-only. It never tracks `/` or your home folder.
 - **Hub.** grace writes `tmux.conf` next to its database at each `grace hub` start. Each pane has a role (sidebar, diff, tree). `ctrl-g` keys run `grace hub toggle`, which removes a pane or splits it back. Sidebar, diff and tree hold no state, so a new copy is the same as the old one.
 - **Screenshots.** The images in this README are real captures, not mockups. `scripts/screens.sh` runs grace on demo data in a private tmux server and turns each screen into an SVG.
+- **Optional config (`~/.config/grace/config.toml` or `%APPDATA%\grace\config.toml`, override with `$GRACE_CONFIG`).**
+  ```toml
+  theme = "auto"           # "auto" | "dark" | "light"
+  editor = "zed"           # fallback editor for ctrl-e
+  ascii = false            # set true for ASCII-only glyphs
+  hub_layout = "full"      # "full" | "code+diff" | "sidebar+main" | "zen"
+  ignore = ["/tmp/*", "~/Downloads/*"]
+  ```
 
 ## Built with Claude
 

@@ -58,7 +58,9 @@ pub fn valid_name(s: &str) -> bool {
         Some(c) if c.is_ascii_alphanumeric() => {}
         _ => return false,
     }
-    s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// A launch command: not empty, no control characters (this includes newlines).
@@ -171,14 +173,91 @@ impl Registry {
     /// True if the canonical tag belongs to an AI or custom tool, not an editor.
     /// Unknown tags count as AI, like custom tools.
     pub fn is_ai_tag(&self, tag: &str) -> bool {
-        !self.tools.iter().any(|t| t.tag == tag && t.kind == Some(Kind::Editor))
-            || self.tools.iter().any(|t| t.tag == tag && t.kind != Some(Kind::Editor))
+        !self
+            .tools
+            .iter()
+            .any(|t| t.tag == tag && t.kind == Some(Kind::Editor))
+            || self
+                .tools
+                .iter()
+                .any(|t| t.tag == tag && t.kind != Some(Kind::Editor))
+    }
+
+    /// True if this tag can be opened as an editor (includes hybrid tools like cursor / antigravity).
+    pub fn is_editor_tag(&self, tag: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|t| t.tag == tag && t.kind == Some(Kind::Editor))
+            || matches!(tag, "cursor" | "antigravity")
+    }
+
+    /// Program & terminal-flag for opening a folder in an editor tag.
+    /// Returns `(program, runs_in_terminal)`.
+    pub fn editor_launch(&self, tag: &str) -> Option<(String, bool)> {
+        if let Some(custom) = self
+            .tools
+            .iter()
+            .rev()
+            .find(|t| t.tag == tag && t.kind.is_none())
+        {
+            let base = custom
+                .launch
+                .strip_suffix(" .")
+                .unwrap_or(&custom.launch)
+                .trim();
+            let first = base.split_whitespace().next()?;
+            return Some((
+                first.to_string(),
+                matches!(first, "nvim" | "vim" | "vi" | "nano" | "helix" | "hx"),
+            ));
+        }
+        match tag {
+            "cursor" => Some(("cursor".into(), false)),
+            "antigravity" => Some(("antigravity".into(), false)),
+            "jetbrains" => {
+                for bin in ["idea", "pycharm", "webstorm"] {
+                    if on_path(bin) {
+                        return Some((bin.into(), false));
+                    }
+                }
+                Some(("idea".into(), false))
+            }
+            _ => {
+                let t = self
+                    .tools
+                    .iter()
+                    .find(|t| t.tag == tag && t.kind == Some(Kind::Editor))?;
+                let base = t
+                    .launch
+                    .strip_suffix(" .")
+                    .unwrap_or(&t.launch)
+                    .trim()
+                    .to_string();
+                let term = matches!(base.as_str(), "nvim" | "vim");
+                Some((base, term))
+            }
+        }
     }
 
     /// All command names, for the shell script.
     pub fn command_names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.command.clone()).collect()
     }
+}
+
+pub fn on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exts: &[&str] = if cfg!(windows) {
+        &[".cmd", ".exe", ".bat", ""]
+    } else {
+        &[""]
+    };
+    std::env::split_paths(&path).any(|dir| {
+        exts.iter()
+            .any(|ext| dir.join(format!("{name}{ext}")).is_file())
+    })
 }
 
 #[cfg(test)]
@@ -206,6 +285,10 @@ mod tests {
         assert_eq!(r.launch_command("vscode").as_deref(), Some("code ."));
         assert_eq!(r.launch_command("neovim").as_deref(), Some("nvim"));
         assert_eq!(r.launch_command("jetbrains").as_deref(), Some("idea ."));
+        assert!(r.is_editor_tag("cursor"));
+        assert!(r.is_editor_tag("antigravity"));
+        assert_eq!(r.editor_launch("cursor"), Some(("cursor".into(), false)));
+        assert_eq!(r.editor_launch("neovim"), Some(("nvim".into(), true)));
         let t = r.tools().iter().find(|t| t.command == "zed").unwrap();
         assert_eq!(t.kind_label(), "editor");
     }
@@ -224,7 +307,17 @@ mod tests {
         for ok in ["kiro", "cursor-agent", "q", "a.b_c", "9lives"] {
             assert!(valid_name(ok), "{ok}");
         }
-        for bad in ["a;rm -rf", "$(x)", "foo bar", "", "-x", ".x", "a|b", "a\nb", &"a".repeat(65)] {
+        for bad in [
+            "a;rm -rf",
+            "$(x)",
+            "foo bar",
+            "",
+            "-x",
+            ".x",
+            "a|b",
+            "a\nb",
+            &"a".repeat(65),
+        ] {
             assert!(!valid_name(bad), "{bad}");
         }
         assert!(valid_launch("q chat"));
@@ -247,7 +340,10 @@ mod tests {
         assert_eq!(r.launch_command("amazon-q").as_deref(), Some("q chat"));
         assert_eq!(r.normalize_tag("claude"), "mine");
         assert_eq!(r.launch_command("mine").as_deref(), Some("my-claude"));
-        assert_eq!(r.tools().iter().filter(|t| t.command == "claude").count(), 1);
+        assert_eq!(
+            r.tools().iter().filter(|t| t.command == "claude").count(),
+            1
+        );
         assert!(!r.command_names().contains(&"bad;cmd".to_string()));
         assert!(r.command_names().contains(&"codex".to_string()));
     }

@@ -3,11 +3,22 @@
 //! The TUI draws on stderr, because the shell function captures stdout.
 //! By default it draws inline, below the prompt. `--full` uses the alternate screen.
 use crate::editors_live::OpenEditor;
+use crate::git::{self, RepoSummary};
 use crate::model::{Entry, Session, Status};
+use crate::platform;
+use crate::rank::time_ago;
+use crate::theme::{Theme, ToastKind};
+use crate::widgets::{
+    center_msg, cut, cut_tail, fit_end, fit_middle, hint_spans, push_fit_coalesced, render_modal,
+    render_scrollbar, sw, toast_line, Toast,
+};
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -19,14 +30,16 @@ use ratatui::{
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
     buffer::Cell,
     layout::{Alignment, Position, Rect, Size},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Paragraph},
+    widgets::{Block, Paragraph},
     Frame, Terminal, TerminalOptions, Viewport,
 };
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 /// Sessions by folder, one per folder: the most urgent, then the newest.
@@ -66,21 +79,42 @@ pub(crate) fn status_words(s: Status) -> &'static str {
     }
 }
 
-pub(crate) fn haystack(e: &Entry, best: &Best) -> String {
+pub(crate) fn haystack(
+    e: &Entry,
+    best: &Best,
+    branches: &HashMap<String, (String, bool)>,
+) -> String {
     let mut s = e.path.clone();
     for t in &e.tags {
         s.push(' ');
         s.push_str(&t.tool);
     }
+    if let Some((br, _)) = branches.get(&e.path) {
+        s.push(' ');
+        s.push_str(br);
+    }
     if let Some(b) = best.get(&e.path) {
         s.push(' ');
         s.push_str(status_words(b.status));
+        if let Some(d) = &b.detail {
+            s.push(' ');
+            s.push_str(d);
+        }
     }
     s
 }
 
 /// Return indices into `entries` that match `query`, best first.
 pub(crate) fn filter(entries: &[Entry], best: &Best, query: &str) -> Vec<usize> {
+    filter_with_branches(entries, best, &HashMap::new(), query)
+}
+
+pub(crate) fn filter_with_branches(
+    entries: &[Entry],
+    best: &Best,
+    branches: &HashMap<String, (String, bool)>,
+    query: &str,
+) -> Vec<usize> {
     if query.trim().is_empty() {
         return (0..entries.len()).collect();
     }
@@ -91,80 +125,34 @@ pub(crate) fn filter(entries: &[Entry], best: &Best, query: &str) -> Vec<usize> 
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
-            let h = haystack(e, best);
+            let h = haystack(e, best, branches);
             pattern
                 .score(Utf32Str::new(&h, &mut buf), &mut matcher)
                 .map(|s| (s, i))
         })
         .collect();
-    // Stable sort keeps the original order for equal scores.
     scored.sort_by_key(|s| std::cmp::Reverse(s.0));
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
-/// Char positions in `path` that the query matched.
-fn match_positions(path: &str, query: &str, matcher: &mut Matcher) -> Vec<u32> {
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
-    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+/// Char positions in `text` that `pattern` matched.
+fn match_positions_pat(text: &str, pattern: &Pattern, matcher: &mut Matcher) -> Vec<usize> {
     let mut buf = Vec::new();
     let mut idx = Vec::new();
-    pattern.indices(Utf32Str::new(path, &mut buf), matcher, &mut idx);
-    idx
-}
-
-pub(crate) fn time_ago(now: i64, then: i64) -> String {
-    let d = (now - then).max(0);
-    match d {
-        0..=59 => "now".into(),
-        60..=3599 => format!("{}m", d / 60),
-        3600..=86399 => format!("{}h", d / 3600),
-        86400..=604799 => format!("{}d", d / 86400),
-        604800..=2591999 => format!("{}w", d / 604800),
-        2592000..=31535999 => format!("{}mo", d / 2592000),
-        _ => format!("{}y", d / 31536000),
-    }
-}
-
-/// Each tool's tag uses the main color of its logo. Colors come from the
-/// official logo files. A logo that is only black and white gets a light gray.
-pub(crate) fn tag_color(tool: &str) -> Color {
-    const MONO: Color = Color::Rgb(220, 220, 220);
-    match tool {
-        // AI tools
-        "claude" => Color::Rgb(217, 119, 87),      // #D97757 Claude orange
-        "codex" => Color::Rgb(177, 167, 255),      // #B1A7FF Codex lavender
-        "antigravity" => Color::Rgb(49, 134, 255), // #3186FF Antigravity blue
-        "gemini" => Color::Rgb(179, 129, 221),     // #B381DD Gemini CLI violet
-        "aider" => Color::Rgb(60, 230, 130),       // Aider terminal green
-        "amp" => Color::Rgb(230, 228, 205),        // Amp cream
-        "crush" => Color::Rgb(107, 80, 255),       // Charm purple
-        "qwen" => Color::Rgb(90, 120, 255),        // #082DFF Qwen blue, lighter
-        "t3code" => Color::Rgb(196, 202, 212),     // T3 silver
-        "cursor" | "opencode" | "copilot" | "goose" => MONO,
-        // Editors
-        "vscode" => Color::Rgb(31, 156, 240),      // VS Code blue
-        "vscodium" => Color::Rgb(70, 190, 230),    // VSCodium light blue
-        "neovim" => Color::Rgb(87, 161, 67),       // Neovim green
-        "vim" => Color::Rgb(1, 152, 51),           // Vim green
-        "sublime" => Color::Rgb(255, 152, 0),      // Sublime orange
-        "jetbrains" => Color::Rgb(255, 49, 140),   // JetBrains magenta
-        "windsurf" | "zed" => MONO,
-        _ => Color::Gray,
-    }
+    pattern.indices(Utf32Str::new(text, &mut buf), matcher, &mut idx);
+    idx.into_iter().map(|i| i as usize).collect()
 }
 
 pub fn display_path(path: &str, home: Option<&str>) -> String {
     if let Some(h) = home.filter(|h| !h.is_empty()) {
-        let h = crate::platform::trim_separators(h);
+        let h = platform::trim_separators(h);
         let h = h.as_str();
-        if crate::platform::same_path(path, h) {
+        if platform::same_path(path, h) {
             return "~".into();
         }
         if let (Some(pre), Some(rest)) = (path.get(..h.len()), path.get(h.len()..)) {
             let sep = rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\'));
-            if sep && crate::platform::same_path(pre, h) {
+            if sep && platform::same_path(pre, h) {
                 return format!("~{rest}");
             }
         }
@@ -175,24 +163,29 @@ pub fn display_path(path: &str, home: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 // Public API
 
-/// Which list the picker shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
-    /// All folders, with status glyphs.
     Folders,
-    /// Live agent sessions, grouped by status.
     Sessions,
 }
 
-/// What the user asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditorChoice {
+    pub prog: String,
+    pub args: Vec<String>,
+    pub in_terminal: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Enter: go to the folder.
     Travel,
-    /// ctrl-o: go to the folder and start the last tool used there.
+    /// ctrl-o: go to the folder and start the AI tool used there last.
     Resume,
-    /// ctrl-e: open or focus the folder in its editor with this command. No cd.
-    Editor(String),
+    /// ctrl-e: open or focus the folder in its editor.
+    Editor(EditorChoice),
+    /// ctrl-g: open the folder in `grace hub`.
+    Hub,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,199 +200,45 @@ pub struct Data {
     pub entries: Vec<Entry>,
     pub sessions: Vec<Session>,
     pub editors: Vec<OpenEditor>,
+    pub branches: HashMap<String, (String, bool)>,
+    pub hub_paths: Vec<String>,
 }
 
-/// The command for ctrl-e. Gets the entry and its open editor window, if any.
-pub type EditorCmd<'a> = Box<dyn Fn(&Entry, Option<&OpenEditor>) -> Option<String> + 'a>;
+pub type EditorCmd<'a> = Box<dyn Fn(&Entry, Option<&OpenEditor>) -> Option<EditorChoice> + 'a>;
+pub type LabelFn<'a> = Box<dyn Fn(&Entry) -> Option<String> + 'a>;
+pub type EditorLabelFn<'a> = Box<dyn Fn(&Entry, Option<&OpenEditor>) -> Option<String> + 'a>;
+pub type PinFn<'a> = Box<dyn FnMut(&Entry) -> Result<bool, String> + 'a>;
+pub type ForgetFn<'a> = Box<dyn FnMut(&Entry) -> Result<(), String> + 'a>;
 
 pub struct Opts<'a> {
     pub view: View,
     pub fullscreen: bool,
+    pub tag_filter: Option<String>,
+    pub initial_toast: Option<(String, ToastKind)>,
+    pub shell_hook_missing: Option<String>,
     pub editor_cmd: EditorCmd<'a>,
-    /// Runs once, after the first frame is on screen. Slow work goes here.
-    pub after_first_frame: Option<Box<dyn FnOnce() + 'a>>,
-    /// Reads the data again. The picker keeps the query and the selection.
-    pub reload: Option<Box<dyn FnMut() -> Option<Data> + 'a>>,
-    /// How often to reload. None: reload once, after `after_first_frame`.
+    pub tool_label: LabelFn<'a>,
+    pub editor_label: EditorLabelFn<'a>,
+    pub toggle_pin: Option<PinFn<'a>>,
+    pub forget_dir: Option<ForgetFn<'a>>,
+    pub import_all_now: Option<Box<dyn FnMut() -> Result<String, String> + 'a>>,
+    pub add_cwd_now: Option<Box<dyn FnMut() -> Result<String, String> + 'a>>,
+    /// Runs off the UI thread after frame 1 and sends updated `Data`.
+    pub after_first_frame: Option<Box<dyn FnOnce() -> Option<Data> + Send + 'static>>,
+    /// Reads the data again for a view.
+    pub reload: Option<Box<dyn FnMut(View) -> Option<Data> + 'a>>,
     pub reload_every: Option<Duration>,
 }
 
 // ---------------------------------------------------------------------------
-// Theme
+// Constants & Layout
 
-/// Grace gold.
-pub(crate) const GOLD: Color = Color::Rgb(232, 185, 74);
-const SEL_BG: Color = Color::Rgb(40, 44, 52);
-const OPEN_BLUE: Color = Color::Rgb(97, 175, 239);
-const MAX_WIDTH: u16 = 110;
+const MAX_WIDTH: u16 = 116;
+const MAX_FULL_WIDTH: u16 = 144;
 const NAME_MAX: usize = 28;
 const TAGS_MAX: usize = 32;
 const PARENT_MAX: usize = 30;
-pub(crate) const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const FLASH_FOR: Duration = Duration::from_millis(1500);
 const TICK: Duration = Duration::from_millis(100);
-const HINTS: [(&str, &str); 4] =
-    [("enter", "travel"), ("ctrl-o", "resume tool"), ("ctrl-e", "editor"), ("esc", "quit")];
-
-#[derive(Debug, Clone, Copy)]
-pub struct Theme {
-    /// False with NO_COLOR: bold and dim stay, colors go.
-    pub color: bool,
-    /// COLORTERM says the terminal shows 24-bit color.
-    pub truecolor: bool,
-}
-
-impl Theme {
-    pub fn from_env() -> Theme {
-        let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-        let truecolor = std::env::var("COLORTERM")
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "truecolor" | "24bit"))
-            .unwrap_or(false);
-        Theme { color, truecolor }
-    }
-
-    /// Map a color to what the terminal can show. None means no color.
-    pub(crate) fn map(&self, c: Color) -> Option<Color> {
-        if !self.color {
-            return None;
-        }
-        match c {
-            Color::Rgb(r, g, b) if !self.truecolor => Some(Color::Indexed(rgb_to_256(r, g, b))),
-            c => Some(c),
-        }
-    }
-
-    pub(crate) fn fg(&self, s: Style, c: Color) -> Style {
-        match self.map(c) {
-            Some(c) => s.fg(c),
-            None => s,
-        }
-    }
-
-    pub(crate) fn accent(&self) -> Color {
-        if self.truecolor {
-            GOLD
-        } else {
-            Color::Yellow
-        }
-    }
-
-    pub(crate) fn sel_bg(&self) -> Option<Color> {
-        if !self.color {
-            None
-        } else if self.truecolor {
-            Some(SEL_BG)
-        } else {
-            Some(Color::DarkGray)
-        }
-    }
-
-    /// Apply the theme rules (NO_COLOR, 256 colors) to a style that may hold a color.
-    pub(crate) fn apply(&self, s: Style) -> Style {
-        let mut out = Style::default().add_modifier(s.add_modifier).remove_modifier(s.sub_modifier);
-        if let Some(c) = s.fg.and_then(|c| self.map(c)) {
-            out = out.fg(c);
-        }
-        out
-    }
-}
-
-/// Nearest xterm 256-color index for an RGB color.
-fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
-    let q = |v: u8| -> u8 {
-        if v < 48 {
-            0
-        } else if v < 115 {
-            1
-        } else {
-            (v - 35) / 40
-        }
-    };
-    16 + 36 * q(r) + 6 * q(g) + q(b)
-}
-
-pub(crate) fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-}
-
-// ---------------------------------------------------------------------------
-// Pure layout helpers
-
-/// Display width of one char.
-fn cw(c: char) -> usize {
-    let mut b = [0u8; 4];
-    Span::raw(&*c.encode_utf8(&mut b)).width()
-}
-
-pub(crate) fn sw(s: &str) -> usize {
-    Span::raw(s).width()
-}
-
-/// Shown chars with their index in the source text. None marks the ellipsis.
-pub type Fit = Vec<(char, Option<usize>)>;
-
-fn fit_all(chars: Vec<char>) -> Fit {
-    chars.into_iter().enumerate().map(|(i, c)| (c, Some(i))).collect()
-}
-
-/// Fit `s` into `w` columns. Cut the end and add "…" if it is too long.
-pub fn fit_end(s: &str, w: usize) -> Fit {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.iter().map(|&c| cw(c)).sum::<usize>() <= w {
-        return fit_all(chars);
-    }
-    if w == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut used = 0;
-    for (i, &c) in chars.iter().enumerate() {
-        if used + cw(c) > w - 1 {
-            break;
-        }
-        used += cw(c);
-        out.push((c, Some(i)));
-    }
-    out.push(('…', None));
-    out
-}
-
-/// Fit `s` into `w` columns. Cut the middle and put "…" there if it is too long.
-/// The tail gets the extra column, because the end of a path says more.
-pub fn fit_middle(s: &str, w: usize) -> Fit {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.iter().map(|&c| cw(c)).sum::<usize>() <= w {
-        return fit_all(chars);
-    }
-    if w == 0 {
-        return Vec::new();
-    }
-    let budget = w - 1;
-    let head_w = budget / 2;
-    let tail_w = budget - head_w;
-    let mut head = Vec::new();
-    let mut used = 0;
-    for (i, &c) in chars.iter().enumerate() {
-        if used + cw(c) > head_w {
-            break;
-        }
-        used += cw(c);
-        head.push((c, Some(i)));
-    }
-    let mut tail = Vec::new();
-    used = 0;
-    for (i, &c) in chars.iter().enumerate().rev() {
-        if i < head.len() || used + cw(c) > tail_w {
-            break;
-        }
-        used += cw(c);
-        tail.push((c, Some(i)));
-    }
-    tail.reverse();
-    head.push(('…', None));
-    head.extend(tail);
-    head
-}
 
 /// Split a shown path into (parent, name, char index where the name starts).
 pub fn split_path(shown: &str) -> (String, String, usize) {
@@ -407,14 +246,19 @@ pub fn split_path(shown: &str) -> (String, String, usize) {
     let is_sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
     match chars.iter().rposition(|&c| is_sep(c)) {
         Some(p) if p + 1 < chars.len() => {
-            let parent: String = if p == 0 { "/".into() } else { chars[..p].iter().collect() };
+            let parent: String = if p == 0 {
+                "/".into()
+            } else if cfg!(windows) && p == 2 && chars[1] == ':' {
+                chars[..=p].iter().collect()
+            } else {
+                chars[..p].iter().collect()
+            };
             (parent, chars[p + 1..].iter().collect(), p + 1)
         }
         _ => (String::new(), shown.to_string(), 0),
     }
 }
 
-/// Column widths of a row, in display columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cols {
     pub status: usize,
@@ -425,7 +269,6 @@ pub struct Cols {
 }
 
 /// A row is: bar(1) status star(2) name gap(2) parent gap(2) tags gap(>=1) time pad(1).
-/// The parent gets at most 30 columns, and keeps at least 12 before the tags get space.
 pub fn layout_cols(
     inner: usize,
     status: usize,
@@ -441,12 +284,20 @@ pub fn layout_cols(
     }
     let avail = inner.saturating_sub(fixed + name);
     let parent_max = parent_max.min(PARENT_MAX);
-    let tags = tags_max.min(TAGS_MAX).min(avail.saturating_sub(parent_max.min(12)));
+    let tags = tags_max
+        .min(TAGS_MAX)
+        .min(avail.saturating_sub(parent_max.min(12)));
     let mut parent = parent_max.min(avail - tags);
     if parent < 4 {
         parent = 0;
     }
-    Cols { status, name, parent, tags, time }
+    Cols {
+        status,
+        name,
+        parent,
+        tags,
+        time,
+    }
 }
 
 /// How many tags fit in `w` columns, joined by " · ". The bool says if " +N" follows.
@@ -455,8 +306,11 @@ pub fn fit_tags(widths: &[usize], w: usize) -> (usize, bool) {
     for (i, &tw) in widths.iter().enumerate() {
         let add = if i == 0 { tw } else { 3 + tw };
         let more = widths.len() - i - 1;
-        // Keep room for " +N" while tags stay hidden.
-        let reserve = if more > 0 { 2 + more.to_string().len() } else { 0 };
+        let reserve = if more > 0 {
+            2 + more.to_string().len()
+        } else {
+            0
+        };
         if used + add + reserve > w {
             let fits_more = used + 2 + (widths.len() - i).to_string().len() <= w;
             return (i, fits_more && i > 0);
@@ -466,32 +320,45 @@ pub fn fit_tags(widths: &[usize], w: usize) -> (usize, bool) {
     (widths.len(), false)
 }
 
-/// One line of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
-    /// A section title in the sessions view. Not selectable.
-    Header(Status),
-    /// Index into the entries.
+    Header(Status, usize),
     Item(usize),
 }
 
-const GROUPS: [Status; 4] = [Status::Waiting, Status::Ready, Status::Working, Status::Done];
+const GROUPS: [Status; 4] = [
+    Status::Waiting,
+    Status::Ready,
+    Status::Working,
+    Status::Done,
+];
 
-/// Build the list rows. The sessions view groups the matches by status, in rank order.
-pub fn build_rows(view: View, matches: &[usize], status: impl Fn(usize) -> Option<Status>) -> Vec<Row> {
+pub fn build_rows(
+    view: View,
+    matches: &[usize],
+    status: impl Fn(usize) -> Option<Status>,
+) -> Vec<Row> {
     match view {
         View::Folders => matches.iter().map(|&i| Row::Item(i)).collect(),
         View::Sessions => {
             let mut rows = Vec::new();
             for g in GROUPS {
-                let items: Vec<Row> =
-                    matches.iter().filter(|&&i| status(i) == Some(g)).map(|&i| Row::Item(i)).collect();
+                let items: Vec<Row> = matches
+                    .iter()
+                    .filter(|&&i| status(i) == Some(g))
+                    .map(|&i| Row::Item(i))
+                    .collect();
                 if !items.is_empty() {
-                    rows.push(Row::Header(g));
+                    rows.push(Row::Header(g, items.len()));
                     rows.extend(items);
                 }
             }
-            rows.extend(matches.iter().filter(|&&i| status(i).is_none()).map(|&i| Row::Item(i)));
+            rows.extend(
+                matches
+                    .iter()
+                    .filter(|&&i| status(i).is_none())
+                    .map(|&i| Row::Item(i)),
+            );
             rows
         }
     }
@@ -501,7 +368,6 @@ pub fn first_item(rows: &[Row]) -> Option<usize> {
     rows.iter().position(|r| matches!(r, Row::Item(_)))
 }
 
-/// Move `delta` items from row `from`. Headers are skipped. Stops at the ends.
 pub fn step_item(rows: &[Row], from: usize, delta: isize) -> usize {
     let step = delta.signum();
     let mut left = delta.unsigned_abs();
@@ -520,7 +386,6 @@ pub fn step_item(rows: &[Row], from: usize, delta: isize) -> usize {
     cur
 }
 
-/// First visible row so that `selected` is on screen. Shows a header above the first item.
 pub fn scroll(rows: &[Row], selected: usize, offset: usize, height: usize) -> usize {
     if height == 0 || rows.is_empty() {
         return 0;
@@ -531,107 +396,200 @@ pub fn scroll(rows: &[Row], selected: usize, offset: usize, height: usize) -> us
     } else if selected >= off + height {
         off = selected + 1 - height;
     }
-    if off == selected && off > 0 && height > 1 && matches!(rows[off - 1], Row::Header(_)) {
+    if off == selected && off > 0 && height > 1 && matches!(rows[off - 1], Row::Header(_, _)) {
         off -= 1;
     }
     off
 }
 
-/// Inline viewport height: the rows plus chrome, at most 45% of the terminal (min 10).
+/// Inline viewport height: the rows plus chrome, at most 48% of the terminal (min 10).
 pub fn inline_height(rows: usize, term_h: u16) -> u16 {
-    let chrome = 3;
-    let cap = (term_h as usize * 45 / 100).max(10);
-    ((rows.max(1) + chrome).min(cap) as u16).min(term_h.max(1))
-}
-
-/// Key hints for the bottom border. Hints that do not fit in `w` columns are left out.
-fn hint_spans(w: usize) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::raw(" ")];
-    let mut used = 2;
-    let mut first = true;
-    for (k, l) in HINTS {
-        let add = sw(k) + 1 + sw(l) + if first { 0 } else { 3 };
-        if used + add > w {
-            continue;
-        }
-        if !first {
-            spans.push(Span::styled(" · ", dim()));
-        }
-        spans.push(Span::styled(k, Style::default().add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(format!(" {l}"), dim()));
-        used += add;
-        first = false;
-    }
-    spans.push(Span::raw(" "));
-    spans
+    let chrome = 4;
+    let cap = (term_h as usize * 48 / 100).max(11);
+    ((rows.max(3) + chrome).min(cap) as u16).min(term_h.max(1))
 }
 
 // ---------------------------------------------------------------------------
 // State
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Modal {
+    None,
+    Help,
+    ConfirmForget,
+}
+
+struct CachedWidths {
+    name_max: usize,
+    parent_max: usize,
+    tags_max: usize,
+    time_max: usize,
+}
+
 struct State {
     data: Data,
     best: Best,
-    open: HashMap<String, OpenEditor>,
+    open: HashMap<String, Vec<OpenEditor>>,
     query: String,
+    pattern: Option<Pattern>,
     matches: Vec<usize>,
     rows: Vec<Row>,
     selected: usize,
     offset: usize,
+    page: usize,
     now: i64,
     home: Option<String>,
     matcher: Matcher,
     view: View,
+    fullscreen: bool,
+    tag_filter: Option<String>,
+    shell_hook_missing: Option<String>,
     theme: Theme,
     start: Instant,
-    flash: Option<(String, Instant)>,
-    /// A working spinner is on screen, so redraw on each tick.
+    toast: Option<Toast>,
     animating: bool,
+    modal: Modal,
+    inspector: bool,
+    summaries: HashMap<String, Option<RepoSummary>>,
+    pending_summary: Option<String>,
+    summary_rx: Option<Receiver<(String, Option<RepoSummary>)>>,
+    widths: CachedWidths,
+    list_area: Rect,
+    tab_folders_area: Rect,
+    tab_sessions_area: Rect,
+    last_click: Option<(usize, Instant)>,
+    footer_hints: Vec<(&'static str, String)>,
 }
 
 impl State {
-    fn new(data: Data, query: &str, now: i64, view: View, theme: Theme, home: Option<String>) -> State {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        data: Data,
+        query: &str,
+        now: i64,
+        view: View,
+        fullscreen: bool,
+        tag_filter: Option<String>,
+        shell_hook_missing: Option<String>,
+        theme: Theme,
+        home: Option<String>,
+    ) -> State {
         let mut st = State {
             data: Data::default(),
             best: Best::new(),
             open: HashMap::new(),
             query: query.to_string(),
+            pattern: None,
             matches: Vec::new(),
             rows: Vec::new(),
             selected: 0,
             offset: 0,
+            page: 10,
             now,
             home,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             view,
+            fullscreen,
+            tag_filter,
+            shell_hook_missing,
             theme,
             start: Instant::now(),
-            flash: None,
+            toast: None,
             animating: false,
+            modal: Modal::None,
+            inspector: fullscreen,
+            summaries: HashMap::new(),
+            pending_summary: None,
+            summary_rx: None,
+            widths: CachedWidths {
+                name_max: 0,
+                parent_max: 0,
+                tags_max: 0,
+                time_max: 0,
+            },
+            list_area: Rect::default(),
+            tab_folders_area: Rect::default(),
+            tab_sessions_area: Rect::default(),
+            last_click: None,
+            footer_hints: Vec::new(),
         };
+        st.update_pattern();
         st.set_data(data);
         st
+    }
+
+    fn update_pattern(&mut self) {
+        self.pattern = (!self.query.trim().is_empty())
+            .then(|| Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart));
     }
 
     /// Replace the data. The query and the selected folder stay.
     fn set_data(&mut self, data: Data) {
         let keep = self.selected_entry().map(|e| e.path.clone());
         self.best = best_by_path(&data.sessions);
-        self.open = data.editors.iter().map(|o| (o.path.clone(), o.clone())).collect();
+        self.open.clear();
+        for o in &data.editors {
+            self.open.entry(o.path.clone()).or_default().push(o.clone());
+        }
         self.data = data;
+        self.recompute_widths();
         self.refilter_keep(keep.as_deref());
+    }
+
+    fn recompute_widths(&mut self) {
+        let (mut name_max, mut parent_max, mut tags_max, mut time_max) = (0, 0, 0, 0);
+        for i in 0..self.data.entries.len() {
+            let rv = self.row_view(i, false);
+            name_max = name_max.max(sw(&rv.name));
+            parent_max = parent_max.max(sw(&rv.parent));
+            tags_max = tags_max.max(tags_width(&rv.tags));
+            time_max = time_max.max(sw(&rv.time));
+        }
+        self.widths = CachedWidths {
+            name_max,
+            parent_max,
+            tags_max,
+            time_max,
+        };
     }
 
     fn status(&self, i: usize) -> Option<Status> {
         self.best.get(&self.data.entries[i].path).map(|s| s.status)
     }
 
+    fn visible_entries_indices(&self) -> Vec<usize> {
+        let filtered = filter_with_branches(
+            &self.data.entries,
+            &self.best,
+            &self.data.branches,
+            &self.query,
+        );
+        if self.view == View::Sessions {
+            let mut sess: Vec<usize> = filtered
+                .into_iter()
+                .filter(|&i| self.best.contains_key(&self.data.entries[i].path))
+                .collect();
+            if self.query.trim().is_empty() {
+                sess.sort_by_key(|&i| {
+                    let b = &self.best[&self.data.entries[i].path];
+                    std::cmp::Reverse((urgency(b.status), b.updated_at))
+                });
+            }
+            sess
+        } else {
+            filtered
+        }
+    }
+
     fn refilter_keep(&mut self, keep: Option<&str>) {
-        self.matches = filter(&self.data.entries, &self.best, &self.query);
+        self.update_pattern();
+        self.matches = self.visible_entries_indices();
         self.rows = build_rows(self.view, &self.matches, |i| self.status(i));
         let entries = &self.data.entries;
         let kept = keep.and_then(|p| {
-            self.rows.iter().position(|r| matches!(r, Row::Item(i) if entries[*i].path == p))
+            self.rows
+                .iter()
+                .position(|r| matches!(r, Row::Item(i) if entries[*i].path == p))
         });
         self.selected = kept.or_else(|| first_item(&self.rows)).unwrap_or(0);
         if kept.is_none() {
@@ -654,42 +612,105 @@ impl State {
         }
     }
 
-    fn flash(&mut self, msg: &str) {
-        self.flash = Some((msg.to_string(), Instant::now() + FLASH_FOR));
+    fn selected_open_editor(&self, e: &Entry) -> Option<&OpenEditor> {
+        self.open.get(&e.path).and_then(|list| list.first())
     }
 
-    /// Row content for entry `i`. With `hl`, also the match positions.
-    fn row_view(&mut self, i: usize, hl: bool) -> RowView {
-        let e = &self.data.entries[i];
-        let shown = display_path(&e.path, self.home.as_deref());
-        let (parent, name, name_off) = split_path(&shown);
-        let mut name_hl = Vec::new();
-        let mut parent_hl = Vec::new();
-        if hl {
-            // Match positions refer to the full path. Map them onto the shown text.
-            let skip = e.path.chars().count() as i64 - shown.chars().count() as i64;
-            let parent_len = parent.chars().count();
-            for p in match_positions(&e.path, &self.query, &mut self.matcher) {
-                let q = p as i64 - skip;
-                // Chars inside the home prefix have no match in the shown text.
-                if q < 0 || (skip != 0 && q < 1) {
-                    continue;
-                }
-                let q = q as usize;
-                if q >= name_off {
-                    name_hl.push(q - name_off);
-                } else if name_off > 0 && q < parent_len {
-                    parent_hl.push(q);
+    fn flash(&mut self, msg: impl Into<String>, kind: ToastKind) {
+        self.toast = Some(Toast::new(msg, kind, 2200));
+    }
+
+    fn delete_word(&mut self) {
+        let trimmed = self.query.trim_end();
+        let new_len = match trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '\\') {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        self.query.truncate(new_len);
+        self.refilter();
+    }
+
+    fn maybe_fetch_summary(&mut self) {
+        if !self.inspector {
+            return;
+        }
+        if let Some(rx) = &self.summary_rx {
+            while let Ok((p, sum)) = rx.try_recv() {
+                self.summaries.insert(p.clone(), sum);
+                if self.pending_summary.as_deref() == Some(p.as_str()) {
+                    self.pending_summary = None;
                 }
             }
         }
+        let Some(e) = self.selected_entry() else {
+            return;
+        };
+        let path = e.path.clone();
+        if self.summaries.contains_key(&path)
+            || self.pending_summary.as_deref() == Some(path.as_str())
+        {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.summary_rx = Some(rx);
+        self.pending_summary = Some(path.clone());
+        std::thread::spawn(move || {
+            let sum = git::summary(Path::new(&path));
+            let _ = tx.send((path, sum));
+        });
+    }
+
+    /// Row content for entry `i`. With `hl`, computes match positions for name, parent, and tags.
+    fn row_view(&mut self, i: usize, hl: bool) -> RowView {
+        let e = &self.data.entries[i];
+        let raw_shown = display_path(&e.path, self.home.as_deref());
+        let shown = platform::sanitize_display(&raw_shown);
+        let (parent, name, _) = split_path(&shown);
+        let mut name_hl = Vec::new();
+        let mut parent_hl = Vec::new();
+        let mut tag_hl = Vec::new();
         let best = self.best.get(&e.path);
-        let open = self.open.get(&e.path);
-        let mut tags: Vec<(String, bool)> =
-            e.tags.iter().map(|t| (t.tool.clone(), open.is_some_and(|o| o.tag == t.tool))).collect();
-        if let Some(o) = open {
-            if !e.has_tag(&o.tag) {
-                tags.insert(0, (o.tag.clone(), true));
+        let open_list = self.open.get(&e.path);
+        let mut tags: Vec<(String, bool)> = e
+            .tags
+            .iter()
+            .map(|t| {
+                let is_open = open_list.is_some_and(|list| list.iter().any(|o| o.tag == t.tool));
+                (platform::sanitize_display(&t.tool), is_open)
+            })
+            .collect();
+        if let Some(list) = open_list {
+            for o in list.iter().rev() {
+                if !tags.iter().any(|(t, _)| t == &o.tag) {
+                    tags.insert(0, (platform::sanitize_display(&o.tag), true));
+                }
+            }
+        }
+        if hl {
+            if let Some(pat) = self.pattern.as_ref() {
+                let mut words = self.query.split_whitespace();
+                let first = words.next();
+                let multi = first.is_some() && words.next().is_some();
+                let collect_hl = |target: &str, m: &mut Matcher| -> Vec<usize> {
+                    if !multi {
+                        return match_positions_pat(target, pat, m);
+                    }
+                    let mut all = match_positions_pat(target, pat, m);
+                    for atom in self.query.split_whitespace() {
+                        let ap = Pattern::parse(atom, CaseMatching::Smart, Normalization::Smart);
+                        all.extend(match_positions_pat(target, &ap, m));
+                    }
+                    all.sort_unstable();
+                    all.dedup();
+                    all
+                };
+                name_hl = collect_hl(&name, &mut self.matcher);
+                if !parent.is_empty() {
+                    parent_hl = collect_hl(&parent, &mut self.matcher);
+                }
+                for (tag, _) in &tags {
+                    tag_hl.push(collect_hl(tag, &mut self.matcher));
+                }
             }
         }
         let then = match (self.view, best) {
@@ -701,11 +722,12 @@ impl State {
             parent,
             name_hl,
             parent_hl,
+            tag_hl,
             pinned: e.pinned,
-            status: best.map(|b| b.status),
-            editor_open: open.is_some(),
+            session: best.cloned(),
+            editor_open: open_list.is_some(),
             tags,
-            time: time_ago(self.now, then),
+            time: time_ago(then, self.now),
         }
     }
 }
@@ -713,16 +735,15 @@ impl State {
 // ---------------------------------------------------------------------------
 // Drawing
 
-/// What one row shows, before layout.
 struct RowView {
     name: String,
     parent: String,
     name_hl: Vec<usize>,
     parent_hl: Vec<usize>,
+    tag_hl: Vec<Vec<usize>>,
     pinned: bool,
-    status: Option<Status>,
+    session: Option<Session>,
     editor_open: bool,
-    /// (tag, the editor window of this tag is open now)
     tags: Vec<(String, bool)>,
     time: String,
 }
@@ -741,17 +762,6 @@ struct Ctx {
     frame: usize,
 }
 
-/// Glyph, word and style for a status.
-pub(crate) fn status_look(s: Status, frame: usize) -> (char, &'static str, Style) {
-    match s {
-        Status::Waiting => ('●', "needs you", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Status::Ready => ('○', "your turn", Style::default()),
-        Status::Working => (SPINNER[frame % SPINNER.len()], "working", Style::default().fg(Color::Cyan)),
-        Status::Done => ('✓', "done", Style::default().fg(Color::Green).add_modifier(Modifier::DIM)),
-    }
-}
-
-/// Spans of one row, with a known width.
 struct RowBuf {
     spans: Vec<Span<'static>>,
     used: usize,
@@ -769,19 +779,21 @@ impl RowBuf {
             self.spans.push(Span::styled(" ".repeat(n), self.base));
         }
     }
-    /// Pad up to column `to`.
     fn pad_to(&mut self, to: usize) {
         self.pad(to.saturating_sub(self.used));
     }
-    fn push_fit(&mut self, fit: Fit, hl: &[usize], style: Style, hl_style: Style) {
-        for (c, i) in fit {
-            let s = if i.is_some_and(|i| hl.contains(&i)) { hl_style } else { style };
-            self.push(c.to_string(), s);
-        }
+    fn push_fit(&mut self, fit: &crate::widgets::Fit, hl: &[usize], style: Style, hl_style: Style) {
+        push_fit_coalesced(&mut self.spans, &mut self.used, fit, hl, style, hl_style);
     }
 }
 
-fn compose_row(rv: &RowView, cols: &Cols, selected: bool, ctx: &Ctx, width: usize) -> Line<'static> {
+fn compose_row(
+    rv: &RowView,
+    cols: &Cols,
+    selected: bool,
+    ctx: &Ctx,
+    width: usize,
+) -> Line<'static> {
     let t = &ctx.theme;
     let mut base = Style::default();
     if selected {
@@ -789,8 +801,17 @@ fn compose_row(rv: &RowView, cols: &Cols, selected: bool, ctx: &Ctx, width: usiz
             base = base.bg(bg);
         }
     }
-    let hl = t.fg(base, t.accent()).add_modifier(Modifier::BOLD);
-    let mut b = RowBuf { spans: Vec::new(), used: 0, base };
+    let hl_name = t
+        .fg(base, if selected { t.accent_hi() } else { t.accent() })
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let hl_other = t
+        .fg(base, t.accent())
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let mut b = RowBuf {
+        spans: Vec::new(),
+        used: 0,
+        base,
+    };
 
     // Accent bar.
     if selected {
@@ -799,23 +820,28 @@ fn compose_row(rv: &RowView, cols: &Cols, selected: bool, ctx: &Ctx, width: usiz
         b.pad(1);
     }
 
-    // Status glyph, and the word in the sessions view. An agent wins over an editor.
+    // Status glyph (+ tool/detail in sessions view). An agent wins over an open editor.
     let end = b.used + cols.status;
-    if let Some(s) = rv.status {
-        let (g, word, style) = status_look(s, ctx.frame);
+    if let Some(s) = &rv.session {
+        let (g, _, style) = t.status_look(s.status, ctx.frame);
         let style = base.patch(t.apply(style));
         b.push(g.to_string(), style);
         if ctx.view == View::Sessions {
-            b.push(format!(" {word}"), style);
+            let mut label = format!(" {}", platform::sanitize_display(&s.tool));
+            if let Some(d) = &s.detail {
+                label.push_str(&format!("·{}", platform::sanitize_display(d)));
+            }
+            let room = cols.status.saturating_sub(1);
+            b.push(cut(&label, room), style);
         }
     } else if rv.editor_open {
-        b.push("▣".into(), t.fg(base, OPEN_BLUE));
+        b.push(t.editor_glyph().into(), t.fg(base, t.open_blue()));
     }
     b.pad_to(end);
 
     // Pin.
     if rv.pinned {
-        b.push("★ ".into(), t.fg(base, t.accent()));
+        b.push(format!("{} ", t.pin_glyph()), t.fg(base, t.accent()));
     } else {
         b.pad(2);
     }
@@ -827,40 +853,55 @@ fn compose_row(rv: &RowView, cols: &Cols, selected: bool, ctx: &Ctx, width: usiz
         base.add_modifier(Modifier::BOLD)
     };
     let end = b.used + cols.name;
-    b.push_fit(fit_end(&rv.name, cols.name), &rv.name_hl, name_style, hl);
+    b.push_fit(
+        &fit_end(&rv.name, cols.name),
+        &rv.name_hl,
+        name_style,
+        hl_name,
+    );
     b.pad_to(end);
 
     // Parent.
     if cols.parent > 0 {
         b.pad(2);
         let end = b.used + cols.parent;
-        b.push_fit(fit_middle(&rv.parent, cols.parent), &rv.parent_hl, base.add_modifier(Modifier::DIM), hl);
+        let p_style = base.patch(t.muted());
+        b.push_fit(
+            &fit_middle(&rv.parent, cols.parent),
+            &rv.parent_hl,
+            p_style,
+            hl_other,
+        );
         b.pad_to(end);
     }
 
     // Tags.
     if cols.tags > 0 && !rv.tags.is_empty() {
         b.pad(2);
-        let widths: Vec<usize> = rv.tags.iter().map(|(t, _)| sw(t)).collect();
+        let widths: Vec<usize> = rv.tags.iter().map(|(tag, _)| sw(tag)).collect();
         let (kept, more) = fit_tags(&widths, cols.tags);
         for (k, (tag, open)) in rv.tags.iter().take(kept).enumerate() {
             if k > 0 {
-                b.push(" · ".into(), base.add_modifier(Modifier::DIM));
+                b.push(" · ".into(), base.patch(t.muted()));
             }
-            // An open editor keeps its brand color, in bold.
-            let s = t.fg(base, tag_color(tag));
-            let s = if *open { s.add_modifier(Modifier::BOLD) } else { s };
-            b.push(tag.clone(), s);
+            let mut s = t.fg(base, t.tag_color(tag));
+            if *open {
+                s = s.add_modifier(Modifier::BOLD);
+            }
+            let thl = rv.tag_hl.get(k).map(Vec::as_slice).unwrap_or(&[]);
+            b.push_fit(&fit_end(tag, sw(tag)), thl, s, hl_other);
         }
         if more {
-            b.push(format!(" +{}", rv.tags.len() - kept), base.add_modifier(Modifier::DIM));
+            b.push(format!(" +{}", rv.tags.len() - kept), base.patch(t.muted()));
         }
     }
 
-    // Time, right aligned, one column from the edge.
+    // Time, right aligned, one column from the edge (guarded against narrow overflow).
     let tw = sw(&rv.time);
-    b.pad(width.saturating_sub(b.used + tw + 1).max(1));
-    b.push(rv.time.clone(), base.add_modifier(Modifier::DIM));
+    if b.used + tw < width {
+        b.pad(width.saturating_sub(b.used + tw + 1));
+        b.push(rv.time.clone(), base.patch(t.muted()));
+    }
     b.pad_to(width);
     Line::from(b.spans)
 }
@@ -868,20 +909,133 @@ fn compose_row(rv: &RowView, cols: &Cols, selected: bool, ctx: &Ctx, width: usiz
 fn draw(f: &mut Frame, st: &mut State) {
     let t = st.theme;
     let area = f.area();
-    let outer = Rect { width: area.width.min(MAX_WIDTH), ..area };
-    let accent = t.fg(Style::default(), t.accent());
-    let count = format!(" {}/{} ", st.matches.len(), st.data.entries.len());
-
-    let flash = st.flash.as_ref().filter(|(_, until)| Instant::now() < *until).map(|(m, _)| m.clone());
-    let bottom = match flash {
-        Some(m) => Line::from(vec![Span::raw(" "), Span::styled(m, dim()), Span::raw(" ")]),
-        None => Line::from(hint_spans((outer.width as usize).saturating_sub(4))),
+    let cap_w = if st.fullscreen && st.inspector {
+        MAX_FULL_WIDTH
+    } else {
+        MAX_WIDTH
     };
+    let w = area.width.min(cap_w);
+    let x = if st.fullscreen && area.width > w {
+        area.x + (area.width - w) / 2
+    } else {
+        area.x
+    };
+    let outer = Rect {
+        x,
+        width: w,
+        ..area
+    };
+
+    // Build top title with inline clickable tab pills.
+    let live_count = st
+        .best
+        .values()
+        .filter(|s| s.status != Status::Done)
+        .count();
+    let mut top_spans = vec![Span::styled(
+        format!(" {} grace ", t.star()),
+        t.title_accent(),
+    )];
+    let tab_style = |active: bool| {
+        if active {
+            let mut s = t
+                .fg(Style::default(), t.accent())
+                .add_modifier(Modifier::BOLD);
+            if let Some(bg) = t.pill_bg() {
+                s = s.bg(bg);
+            }
+            s.remove_modifier(Modifier::DIM)
+        } else {
+            t.title_muted()
+        }
+    };
+    let f_label = " Folders ";
+    let s_label = if live_count > 0 {
+        format!(" Sessions · {live_count} live ")
+    } else {
+        " Sessions ".into()
+    };
+    let title_str = format!(" {} grace ", t.star());
+    let mut tab_x = outer.x + 1 + sw(&title_str) as u16;
+    let count = format!(" {}/{} ", st.matches.len(), st.data.entries.len());
+    let tag_badge = st.tag_filter.as_ref().map(|tag| format!(" tag:{tag} "));
+    let right_w = tag_badge.as_deref().map_or(0, sw) + sw(&count);
+    let tabs_need = sw(&title_str) + 2 + sw(f_label) + 1 + sw(&s_label) + 1 + right_w + 4;
+    if (w as usize) >= tabs_need {
+        top_spans.push(Span::raw(" "));
+        tab_x += 1;
+        st.tab_folders_area = Rect {
+            x: tab_x,
+            y: outer.y,
+            width: sw(f_label) as u16,
+            height: 1,
+        };
+        top_spans.push(Span::styled(f_label, tab_style(st.view == View::Folders)));
+        tab_x += (sw(f_label) + 1) as u16;
+        top_spans.push(Span::raw(" "));
+        st.tab_sessions_area = Rect {
+            x: tab_x,
+            y: outer.y,
+            width: sw(&s_label) as u16,
+            height: 1,
+        };
+        top_spans.push(Span::styled(s_label, tab_style(st.view == View::Sessions)));
+        top_spans.push(Span::raw(" "));
+    } else {
+        st.tab_folders_area = Rect::default();
+        st.tab_sessions_area = Rect::default();
+    }
+
+    let mut right_spans = Vec::new();
+    let max_right = (w as usize).saturating_sub(sw(&title_str) + 4);
+    if right_w <= max_right {
+        if let (Some(tag), Some(badge)) = (&st.tag_filter, tag_badge) {
+            right_spans.push(Span::styled(
+                badge,
+                t.fg(Style::default(), t.tag_color(tag))
+                    .remove_modifier(Modifier::DIM),
+            ));
+        }
+        right_spans.push(Span::styled(count, t.title_muted()));
+    } else if sw(&count) <= max_right {
+        right_spans.push(Span::styled(count, t.title_muted()));
+    }
+
+    let active_toast = st
+        .toast
+        .as_ref()
+        .filter(|toast| Instant::now() < toast.until)
+        .cloned();
+    let max_bw = (outer.width as usize).saturating_sub(4);
+    let bottom = match &active_toast {
+        Some(toast) => toast_line(toast, max_bw, &t),
+        None => {
+            let owned: Vec<(&str, &str)> = st
+                .footer_hints
+                .iter()
+                .map(|(k, v)| (*k, v.as_str()))
+                .collect();
+            let fallback = [
+                ("⏎", "travel"),
+                ("^o", "resume"),
+                ("^e", "editor"),
+                ("^g", "hub"),
+                ("⇥", "view"),
+                ("?", "keys"),
+            ];
+            if owned.is_empty() {
+                Line::from(hint_spans(&fallback, max_bw, &t))
+            } else {
+                Line::from(hint_spans(&owned, max_bw, &t))
+            }
+        }
+    };
+
     let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(dim())
-        .title_top(Line::from(Span::styled(" grace ", accent.add_modifier(Modifier::BOLD))).left_aligned())
-        .title_top(Line::from(Span::styled(count, dim())).right_aligned())
+        .border_type(t.border_type())
+        .border_style(t.border_style(true))
+        .title_top(Line::from(top_spans).left_aligned())
+        .title_top(Line::from(right_spans).right_aligned())
         .title_bottom(bottom);
     let inner = block.inner(outer);
     f.render_widget(block, outer);
@@ -890,77 +1044,472 @@ fn draw(f: &mut Frame, st: &mut State) {
         return;
     }
 
-    // Query line.
-    let mut q = vec![
+    let iw = inner.width as usize;
+    let mut cur_y = inner.y;
+
+    // Optional shell-hook banner when stdout is a TTY (user didn't install shell hook yet).
+    if let Some(init_line) = &st.shell_hook_missing {
+        if inner.height >= 5 {
+            let warn = cut(&format!(" ! Shell hook inactive — add: {init_line}"), iw);
+            f.render_widget(
+                Paragraph::new(Span::styled(warn, t.fg(Style::default(), t.accent()))),
+                Rect {
+                    y: cur_y,
+                    height: 1,
+                    ..inner
+                },
+            );
+            cur_y += 1;
+        }
+    }
+
+    // Query line with tail scrolling.
+    let q_avail = iw.saturating_sub(6);
+    let q_shown = cut_tail(&st.query, q_avail);
+    let mut q_spans = vec![
         Span::raw(" "),
-        Span::styled("❯ ", accent.add_modifier(Modifier::BOLD)),
-        Span::raw(st.query.clone()),
+        Span::styled("❯ ", t.title_accent()),
+        Span::raw(q_shown),
         Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
     ];
-    if st.query.is_empty() {
-        q.push(Span::styled(" search folders, tags, tools", dim()));
+    if st.query.is_empty() && iw > 26 {
+        q_spans.push(Span::styled(" search folders, tags, branches", t.muted()));
     }
-    f.render_widget(Paragraph::new(Line::from(q)), Rect { height: 1, ..inner });
+    f.render_widget(
+        Paragraph::new(Line::from(q_spans)),
+        Rect {
+            y: cur_y,
+            height: 1,
+            ..inner
+        },
+    );
+    cur_y += 1;
 
-    let list = Rect { y: inner.y + 1, height: inner.height - 1, ..inner };
-    if list.height == 0 {
+    // Subtle hairline separator when space allows.
+    if cur_y < inner.y + inner.height && inner.height >= 6 {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(iw),
+                t.fg(Style::default(), t.border_color()),
+            )),
+            Rect {
+                y: cur_y,
+                height: 1,
+                ..inner
+            },
+        );
+        cur_y += 1;
+    }
+
+    let body = Rect {
+        x: inner.x,
+        y: cur_y,
+        width: inner.width,
+        height: (inner.y + inner.height).saturating_sub(cur_y),
+    };
+    if body.height == 0 {
+        st.list_area = Rect::default();
         return;
     }
-    let width = list.width as usize;
+
     if st.data.entries.is_empty() {
-        let msg = "No folders yet. cd around, or run grace import.";
-        let y = list.y + list.height.saturating_sub(1) / 2;
-        let p = Paragraph::new(Span::styled(msg, dim())).alignment(Alignment::Center);
-        f.render_widget(p, Rect { y, height: 1, ..list });
+        st.list_area = Rect::default();
+        draw_empty_welcome(f, body, &t);
+        draw_active_modal(f, outer, st);
         return;
     }
+
+    // Optional Inspector split on wide screens.
+    let show_inspector = st.inspector && body.width >= 94;
+    let (list_full, insp_area) = if show_inspector {
+        let lw = (body.width * 62 / 100).max(52);
+        let sep_x = body.x + lw;
+        let sep = Rect {
+            x: sep_x,
+            y: body.y,
+            width: 1,
+            height: body.height,
+        };
+        let sep_lines: Vec<Line> = (0..sep.height)
+            .map(|_| Line::from(Span::styled("│", t.fg(Style::default(), t.border_color()))))
+            .collect();
+        f.render_widget(Paragraph::new(sep_lines), sep);
+        (
+            Rect { width: lw, ..body },
+            Some(Rect {
+                x: sep_x + 1,
+                width: body.width - lw - 1,
+                ..body
+            }),
+        )
+    } else {
+        (body, None)
+    };
+
     if st.rows.is_empty() {
-        f.render_widget(Paragraph::new(Span::styled("   No matches", dim())), Rect { height: 1, ..list });
+        st.list_area = Rect::default();
+        let msg = if st.view == View::Sessions {
+            "No live agent sessions matching filter"
+        } else {
+            "No matching folders"
+        };
+        center_msg(f, list_full, msg, &t);
+        if let Some(ia) = insp_area {
+            draw_inspector(f, ia, st);
+        }
+        draw_active_modal(f, outer, st);
         return;
     }
 
-    // Column widths come from all entries, so the layout stays still while you type.
-    let status_w = if st.view == View::Sessions { 12 } else { 2 };
-    let (mut name_max, mut parent_max, mut tags_max, mut time_max) = (0, 0, 0, 0);
-    for i in 0..st.data.entries.len() {
-        let rv = st.row_view(i, false);
-        name_max = name_max.max(sw(&rv.name));
-        parent_max = parent_max.max(sw(&rv.parent));
-        tags_max = tags_max.max(tags_width(&rv.tags));
-        time_max = time_max.max(sw(&rv.time));
-    }
-    let cols = layout_cols(width, status_w, name_max, parent_max, tags_max, time_max);
-
-    let height = list.height as usize;
+    let height = list_full.height as usize;
+    st.page = height;
     st.offset = scroll(&st.rows, st.selected, st.offset, height);
+    let need_sb = st.rows.len() > height && list_full.width > 12;
+    let row_rect = if need_sb {
+        Rect {
+            width: list_full.width - 1,
+            ..list_full
+        }
+    } else {
+        list_full
+    };
+    st.list_area = row_rect;
+    let width = row_rect.width as usize;
+
+    let status_w = if st.view == View::Sessions {
+        if width >= 72 {
+            15
+        } else if width >= 44 {
+            12
+        } else {
+            10
+        }
+    } else {
+        2
+    };
+    let cols = layout_cols(
+        width,
+        status_w,
+        st.widths.name_max,
+        st.widths.parent_max,
+        st.widths.tags_max,
+        st.widths.time_max,
+    );
+
     let frame = (st.start.elapsed().as_millis() / TICK.as_millis()) as usize;
-    let ctx = Ctx { theme: t, view: st.view, frame };
-    let visible: Vec<(usize, Row)> = st.rows.iter().copied().enumerate().skip(st.offset).take(height).collect();
+    let ctx = Ctx {
+        theme: t,
+        view: st.view,
+        frame,
+    };
+    let visible: Vec<(usize, Row)> = st
+        .rows
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(st.offset)
+        .take(height)
+        .collect();
     let mut lines = Vec::new();
     for (ri, row) in visible {
         match row {
-            Row::Header(s) => {
-                let label = s.label().to_uppercase();
-                lines.push(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(label, dim().add_modifier(Modifier::BOLD)),
-                ]));
+            Row::Header(s, count) => {
+                let (g, _, st_style) = t.status_look(s, frame);
+                let label = format!(" {g} {} ({count})", s.label().to_uppercase());
+                lines.push(Line::from(Span::styled(
+                    cut(&label, width),
+                    t.apply(st_style).add_modifier(Modifier::BOLD),
+                )));
             }
             Row::Item(i) => {
                 let rv = st.row_view(i, true);
-                st.animating |= rv.status == Some(Status::Working);
+                st.animating |= rv
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.status == Status::Working);
                 lines.push(compose_row(&rv, &cols, ri == st.selected, &ctx, width));
             }
         }
     }
-    f.render_widget(Paragraph::new(lines), list);
+    f.render_widget(Paragraph::new(lines), row_rect);
+
+    if need_sb {
+        let sb_area = Rect {
+            x: list_full.x + list_full.width - 1,
+            width: 1,
+            ..list_full
+        };
+        render_scrollbar(f, sb_area, st.rows.len(), st.offset, height, &t);
+    }
+    if let Some(ia) = insp_area {
+        draw_inspector(f, ia, st);
+    }
+    draw_active_modal(f, outer, st);
+}
+
+fn draw_empty_welcome(f: &mut Frame, area: Rect, t: &Theme) {
+    if area.height < 4 {
+        center_msg(
+            f,
+            area,
+            "No folders yet. Press i to import or a to add here.",
+            t,
+        );
+        return;
+    }
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{}  No sites of grace yet", t.star()),
+            t.title_accent(),
+        ))
+        .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("[i]", t.keycap_style()),
+            Span::styled(" import from editors & Claude   ", t.muted()),
+            Span::styled("[a]", t.keycap_style()),
+            Span::styled(" add current folder", t.muted()),
+        ])
+        .alignment(Alignment::Center),
+    ];
+    let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            y: top,
+            height: 3.min(area.height),
+            ..area
+        },
+    );
+}
+
+fn draw_inspector(f: &mut Frame, area: Rect, st: &State) {
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+    let t = &st.theme;
+    let pad = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
+    let w = pad.width as usize;
+    let Some(e) = st.selected_entry() else {
+        center_msg(f, pad, "Nothing selected", t);
+        return;
+    };
+    let shown = platform::sanitize_display(&display_path(&e.path, st.home.as_deref()));
+    let (_, name, _) = split_path(&shown);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", t.star()), t.title_accent()),
+            Span::styled(
+                cut(&name, w.saturating_sub(2)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(cut(&shown, w), t.muted())),
+    ];
+
+    if let Some(s) = st.best.get(&e.path) {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "SESSION",
+            t.muted().add_modifier(Modifier::BOLD),
+        )));
+        let (g, lbl, style) = t.status_look(
+            s.status,
+            (st.start.elapsed().as_millis() / TICK.as_millis()) as usize,
+        );
+        let detail = s
+            .detail
+            .as_deref()
+            .map(|d| format!(" · {}", platform::sanitize_display(d)))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{g} {} ", platform::sanitize_display(&s.tool)),
+                t.apply(style),
+            ),
+            Span::styled(
+                format!("({lbl}{detail}) · {}", time_ago(s.updated_at, st.now)),
+                t.muted(),
+            ),
+        ]));
+    }
+
+    if let Some(Some(sum)) = st.summaries.get(&e.path) {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "GIT",
+            t.muted().add_modifier(Modifier::BOLD),
+        )));
+        let mut br = format!(
+            "{} {}",
+            t.branch_glyph(),
+            platform::sanitize_display(&sum.branch.name)
+        );
+        if sum.worktree {
+            br.push_str(" (worktree)");
+        }
+        if sum.branch.ahead > 0 {
+            br.push_str(&format!(" ↑{}", sum.branch.ahead));
+        }
+        if sum.branch.behind > 0 {
+            br.push_str(&format!(" ↓{}", sum.branch.behind));
+        }
+        if sum.changed > 0 {
+            br.push_str(&format!(" · {} changed", sum.changed));
+        }
+        if sum.stashes > 0 {
+            br.push_str(&format!(" · {} stash", sum.stashes));
+        }
+        lines.push(Line::from(Span::styled(
+            cut(&br, w),
+            t.fg(Style::default(), t.accent()),
+        )));
+        for c in sum.commits.iter().take(3) {
+            lines.push(Line::from(Span::styled(
+                cut(&format!("  {c}"), w),
+                t.muted(),
+            )));
+        }
+    } else if let Some((br, wt)) = st.data.branches.get(&e.path) {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "GIT",
+            t.muted().add_modifier(Modifier::BOLD),
+        )));
+        let br_safe = platform::sanitize_display(br);
+        let label = if *wt {
+            format!("{} {br_safe} (worktree)", t.branch_glyph())
+        } else {
+            format!("{} {br_safe}", t.branch_glyph())
+        };
+        lines.push(Line::from(Span::styled(
+            cut(&label, w),
+            t.fg(Style::default(), t.accent()),
+        )));
+    }
+
+    if !e.tags.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "TOOLS",
+            t.muted().add_modifier(Modifier::BOLD),
+        )));
+        for tag in e.tags.iter().take(5) {
+            let clean = platform::sanitize_display(&tag.tool);
+            let open_mark = if st
+                .open
+                .get(&e.path)
+                .is_some_and(|l| l.iter().any(|o| o.tag == tag.tool))
+            {
+                format!("  {} open", t.editor_glyph())
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{clean:<12}"),
+                    t.fg(Style::default(), t.tag_color(&clean)),
+                ),
+                Span::styled(
+                    cut(
+                        &format!(
+                            "{} runs · {}{open_mark}",
+                            tag.count,
+                            time_ago(tag.last_used, st.now)
+                        ),
+                        w.saturating_sub(12),
+                    ),
+                    t.muted(),
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "STATS",
+        t.muted().add_modifier(Modifier::BOLD),
+    )));
+    let pin_s = if e.pinned {
+        format!("{} Pinned · ", t.pin_glyph())
+    } else {
+        String::new()
+    };
+    lines.push(Line::from(Span::styled(
+        cut(
+            &format!(
+                "{pin_s}{} visits · {}",
+                e.visits,
+                time_ago(e.last_visit, st.now)
+            ),
+            w,
+        ),
+        t.muted(),
+    )));
+
+    f.render_widget(Paragraph::new(lines), pad);
+}
+
+fn draw_active_modal(f: &mut Frame, outer: Rect, st: &State) {
+    let t = &st.theme;
+    match st.modal {
+        Modal::None => {}
+        Modal::Help => {
+            let row = |k: &str, d: &str| {
+                Line::from(vec![
+                    Span::styled(format!("{k:<10}"), t.title_accent()),
+                    Span::raw(d.to_string()),
+                ])
+            };
+            let body = vec![
+                row("Enter", "Travel to selected folder"),
+                row("Ctrl-O", "Travel and start last AI tool"),
+                row("Ctrl-E", "Open or focus editor"),
+                row("Ctrl-G", "Open folder in grace hub"),
+                row("Tab", "Switch Folders / Sessions view"),
+                row("Alt-P", "Pin or unpin folder"),
+                row("Alt-I", "Toggle Inspector drawer"),
+                row("Ctrl-Y", "Copy folder path"),
+                row("Ctrl-D", "Forget folder (asks first)"),
+                row("Ctrl-W/U", "Delete word / clear search"),
+            ];
+            render_modal(
+                f,
+                outer,
+                "keys",
+                body,
+                &[("esc", "close"), ("?", "close")],
+                t,
+            );
+        }
+        Modal::ConfirmForget => {
+            let name = st
+                .selected_entry()
+                .map(|e| split_path(&platform::sanitize_display(&e.path)).1)
+                .unwrap_or_default();
+            let body = vec![
+                Line::from(format!("Remove \"{name}\" from grace history?")),
+                Line::from(Span::styled("Files on disk are never deleted.", t.muted())),
+            ];
+            render_modal(
+                f,
+                outer,
+                "forget folder",
+                body,
+                &[("y", "forget"), ("n / esc", "cancel")],
+                t,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Terminal
 
-/// Crossterm on stderr. On unix it asks the cursor position through /dev/tty,
-/// because crossterm writes that query to stdout, and the shell captures stdout.
 struct TtyBackend(CrosstermBackend<io::Stderr>);
 
 impl Backend for TtyBackend {
@@ -1011,6 +1560,7 @@ impl Backend for TtyBackend {
 }
 
 /// Parse the last "ESC [ row ; col R" reply in `buf`. Returns a 0-based position.
+#[cfg(any(unix, test))]
 fn parse_cpr(buf: &[u8]) -> Option<Position> {
     let end = buf.iter().rposition(|&b| b == b'R')?;
     let start = buf[..end].windows(2).rposition(|w| w == b"\x1b[")?;
@@ -1018,32 +1568,55 @@ fn parse_cpr(buf: &[u8]) -> Option<Position> {
     let (row, col) = body.split_once(';')?;
     let row: u16 = row.parse().ok()?;
     let col: u16 = col.parse().ok()?;
-    Some(Position { x: col.saturating_sub(1), y: row.saturating_sub(1) })
+    Some(Position {
+        x: col.saturating_sub(1),
+        y: row.saturating_sub(1),
+    })
 }
 
 #[cfg(unix)]
 fn tty_cursor_position() -> io::Result<Position> {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
-    let mut tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
     tty.write_all(b"\x1b[6n")?;
     tty.flush()?;
     let fd = tty.as_raw_fd();
+    if fd < 0 || fd >= libc::FD_SETSIZE as libc::c_int {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tty fd exceeds FD_SETSIZE",
+        ));
+    }
     let deadline = Instant::now() + Duration::from_millis(1500);
     let mut buf = Vec::new();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "no cursor position reply"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no cursor position reply",
+            ));
         }
-        // select works on ttys on macOS. poll does not.
-        // SAFETY: the fd_set is zeroed and holds one open fd below FD_SETSIZE.
+        // SAFETY: `fd` was verified `< FD_SETSIZE` above and `set` is zero-initialized.
         let ready = unsafe {
             let mut set: libc::fd_set = std::mem::zeroed();
             libc::FD_ZERO(&mut set);
             libc::FD_SET(fd, &mut set);
-            let mut tv = libc::timeval { tv_sec: left.as_secs() as _, tv_usec: left.subsec_micros() as _ };
-            libc::select(fd + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv)
+            let mut tv = libc::timeval {
+                tv_sec: left.as_secs() as _,
+                tv_usec: left.subsec_micros() as _,
+            };
+            libc::select(
+                fd + 1,
+                &mut set,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut tv,
+            )
         };
         if ready < 0 {
             let e = io::Error::last_os_error();
@@ -1060,6 +1633,12 @@ fn tty_cursor_position() -> io::Result<Position> {
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tty closed"));
         }
+        if buf.len() + n > 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tty CPR overflow",
+            ));
+        }
         buf.extend_from_slice(&b[..n]);
         if let Some(p) = parse_cpr(&buf) {
             return Ok(p);
@@ -1071,6 +1650,7 @@ static FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
 fn restore() {
     let _ = disable_raw_mode();
+    let _ = execute!(io::stderr(), DisableMouseCapture);
     if FULLSCREEN.load(Ordering::SeqCst) {
         let _ = execute!(io::stderr(), LeaveAlternateScreen, Show);
     } else {
@@ -1078,135 +1658,439 @@ fn restore() {
     }
 }
 
-fn run<B: Backend>(terminal: &mut Terminal<B>, st: &mut State, opts: &mut Opts) -> Result<Option<Choice>> {
+fn update_footer_hints(st: &mut State, opts: &Opts) {
+    let mut hints = vec![("⏎", "travel".to_string())];
+    if let Some(e) = st.selected_entry() {
+        if let Some(tool) = (opts.tool_label)(e) {
+            hints.push(("^o", tool));
+        } else {
+            hints.push(("^o", "resume".into()));
+        }
+        if let Some(ed) = (opts.editor_label)(e, st.selected_open_editor(e)) {
+            hints.push(("^e", ed));
+        }
+    }
+    hints.push(("^g", "hub".into()));
+    hints.push((
+        "⇥",
+        if st.view == View::Folders {
+            "sessions".into()
+        } else {
+            "folders".into()
+        },
+    ));
+    hints.push(("?", "keys".into()));
+    st.footer_hints = hints;
+}
+
+fn is_altgr_char(key: &KeyEvent) -> bool {
+    cfg!(windows)
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn is_plain_char(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    (!ctrl && !alt) || is_altgr_char(key)
+}
+
+fn run<B: Backend>(
+    terminal: &mut Terminal<B>,
+    st: &mut State,
+    opts: &mut Opts,
+) -> Result<Option<Choice>> {
     let mut first = true;
+    let mut bg_rx: Option<Receiver<Option<Data>>> = None;
     let mut next_reload: Option<Instant> = None;
+
     loop {
+        if let Some(rx) = &bg_rx {
+            if let Ok(maybe) = rx.try_recv() {
+                if let Some(d) = maybe {
+                    st.now = crate::model::now();
+                    st.set_data(d);
+                }
+                bg_rx = None;
+            }
+        }
+        st.maybe_fetch_summary();
+        update_footer_hints(st, opts);
         terminal.draw(|f| draw(f, st))?;
+
         if first {
             first = false;
             if let Some(job) = opts.after_first_frame.take() {
-                job();
+                let (tx, rx) = mpsc::channel();
+                bg_rx = Some(rx);
+                std::thread::spawn(move || {
+                    let _ = tx.send(job());
+                });
             }
             if opts.reload.is_some() {
-                next_reload = Some(Instant::now() + opts.reload_every.unwrap_or(Duration::ZERO));
+                next_reload = opts.reload_every.map(|d| Instant::now() + d);
             }
         }
 
-        // Wait for a key, or for the next timer: spinner tick, flash end, reload.
         let now = Instant::now();
+        if st.toast.as_ref().is_some_and(|t| now >= t.until) {
+            st.toast = None;
+        }
+        if next_reload.is_some_and(|at| now >= at) {
+            if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
+                st.now = crate::model::now();
+                st.set_data(d);
+            }
+            next_reload = opts.reload_every.map(|d| Instant::now() + d);
+        }
+
         let mut wait = Duration::from_secs(60);
         if st.animating {
             let into = (now - st.start).as_millis() % TICK.as_millis();
             wait = wait.min(TICK - Duration::from_millis(into as u64));
         }
-        if let Some((_, until)) = &st.flash {
-            wait = wait.min(until.saturating_duration_since(now));
+        if bg_rx.is_some() || st.pending_summary.is_some() {
+            wait = wait.min(Duration::from_millis(40));
+        }
+        if let Some(toast) = &st.toast {
+            wait = wait.min(toast.until.saturating_duration_since(now));
         }
         if let Some(at) = next_reload {
             wait = wait.min(at.saturating_duration_since(now));
         }
+
         if !event::poll(wait)? {
-            let now = Instant::now();
-            if st.flash.as_ref().is_some_and(|(_, until)| now >= *until) {
-                st.flash = None;
-            }
-            if next_reload.is_some_and(|at| now >= at) {
-                if let Some(d) = opts.reload.as_mut().and_then(|reload| reload()) {
-                    st.now = crate::model::now();
-                    st.set_data(d);
-                }
-                next_reload = opts.reload_every.map(|d| Instant::now() + d);
-            }
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let choose = |st: &State, action: Action| {
-            st.selected_entry().map(|e| Choice { entry: e.clone(), action })
-        };
-        match key.code {
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Char('c') if ctrl => return Ok(None),
-            KeyCode::Enter => {
-                if let Some(c) = choose(st, Action::Travel) {
+        match event::read()? {
+            Event::Mouse(m) => {
+                if let Some(c) = handle_mouse(st, opts, m) {
                     return Ok(Some(c));
                 }
             }
-            KeyCode::Char('o') if ctrl => {
-                if let Some(c) = choose(st, Action::Resume) {
-                    return Ok(Some(c));
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if let Some(res) = handle_key(st, opts, key) {
+                    return Ok(res);
                 }
-            }
-            KeyCode::Char('e') if ctrl => {
-                if let Some(e) = st.selected_entry().cloned() {
-                    match (opts.editor_cmd)(&e, st.open.get(&e.path)) {
-                        Some(cmd) => return Ok(Some(Choice { entry: e, action: Action::Editor(cmd) })),
-                        None => st.flash("no editor used here"),
-                    }
-                }
-            }
-            KeyCode::Up => st.mv(-1),
-            KeyCode::Down => st.mv(1),
-            KeyCode::Char('p') | KeyCode::Char('k') if ctrl => st.mv(-1),
-            KeyCode::Char('n') | KeyCode::Char('j') if ctrl => st.mv(1),
-            KeyCode::Char('u') if ctrl => {
-                st.query.clear();
-                st.refilter();
-            }
-            KeyCode::Backspace => {
-                st.query.pop();
-                st.refilter();
-            }
-            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                st.query.push(c);
-                st.refilter();
             }
             _ => {}
         }
     }
 }
 
+fn handle_mouse(st: &mut State, opts: &mut Opts, m: MouseEvent) -> Option<Choice> {
+    if st.modal != Modal::None {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            st.modal = Modal::None;
+        }
+        return None;
+    }
+    match m.kind {
+        MouseEventKind::ScrollUp => st.mv(-1),
+        MouseEventKind::ScrollDown => st.mv(1),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let pos = Position {
+                x: m.column,
+                y: m.row,
+            };
+            if st.tab_folders_area.contains(pos) && st.view != View::Folders {
+                switch_view(st, opts, View::Folders);
+                return None;
+            }
+            if st.tab_sessions_area.contains(pos) && st.view != View::Sessions {
+                switch_view(st, opts, View::Sessions);
+                return None;
+            }
+            if st.list_area.contains(pos) {
+                let rel_y = (m.row - st.list_area.y) as usize;
+                let idx = st.offset + rel_y;
+                if matches!(st.rows.get(idx), Some(Row::Item(_))) {
+                    let is_dbl = st.last_click.is_some_and(|(prev, at)| {
+                        prev == idx && at.elapsed() < Duration::from_millis(400)
+                    });
+                    st.selected = idx;
+                    st.last_click = Some((idx, Instant::now()));
+                    if is_dbl {
+                        return st.selected_entry().map(|e| Choice {
+                            entry: e.clone(),
+                            action: Action::Travel,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn switch_view(st: &mut State, opts: &mut Opts, next: View) {
+    st.view = next;
+    if let Some(d) = opts.reload.as_mut().and_then(|r| r(next)) {
+        st.now = crate::model::now();
+        st.set_data(d);
+    } else {
+        st.refilter();
+    }
+}
+
+/// Returns `Some(res)` to exit the picker with `res`, `None` to keep running.
+fn handle_key(st: &mut State, opts: &mut Opts, key: KeyEvent) -> Option<Option<Choice>> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Modal intercept.
+    match st.modal {
+        Modal::Help => {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q')
+            ) || (ctrl && key.code == KeyCode::Char('c'))
+            {
+                st.modal = Modal::None;
+            }
+            return None;
+        }
+        Modal::ConfirmForget => {
+            match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    st.modal = Modal::None;
+                    if let Some(e) = st.selected_entry().cloned() {
+                        if let Some(cb) = opts.forget_dir.as_mut() {
+                            match cb(&e) {
+                                Ok(()) => {
+                                    if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
+                                        st.set_data(d);
+                                    }
+                                    st.flash(
+                                        format!("forgot {}", split_path(&e.path).1),
+                                        ToastKind::Success,
+                                    );
+                                }
+                                Err(err) => st.flash(err, ToastKind::Error),
+                            }
+                        }
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => st.modal = Modal::None,
+                KeyCode::Char('c') if ctrl => st.modal = Modal::None,
+                _ => {}
+            }
+            return None;
+        }
+        Modal::None => {}
+    }
+
+    // Empty-DB quick welcome keys.
+    if st.data.entries.is_empty() && st.query.is_empty() && !ctrl && !alt {
+        match key.code {
+            KeyCode::Char('i' | 'I') => {
+                if let Some(cb) = opts.import_all_now.as_mut() {
+                    match cb() {
+                        Ok(msg) => {
+                            if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
+                                st.set_data(d);
+                            }
+                            st.flash(msg, ToastKind::Success);
+                        }
+                        Err(e) => st.flash(e, ToastKind::Error),
+                    }
+                    return None;
+                }
+            }
+            KeyCode::Char('a' | 'A') => {
+                if let Some(cb) = opts.add_cwd_now.as_mut() {
+                    match cb() {
+                        Ok(msg) => {
+                            if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
+                                st.set_data(d);
+                            }
+                            st.flash(msg, ToastKind::Success);
+                        }
+                        Err(e) => st.flash(e, ToastKind::Error),
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let choose = |st: &State, action: Action| {
+        st.selected_entry().map(|e| Choice {
+            entry: e.clone(),
+            action,
+        })
+    };
+
+    match key.code {
+        KeyCode::Esc => return Some(None),
+        KeyCode::Char('c') if ctrl => return Some(None),
+        KeyCode::Enter => {
+            if let Some(c) = choose(st, Action::Travel) {
+                return Some(Some(c));
+            }
+        }
+        KeyCode::Char('o') if ctrl => {
+            if let Some(c) = choose(st, Action::Resume) {
+                return Some(Some(c));
+            }
+        }
+        KeyCode::Char('g') if ctrl => {
+            if let Some(c) = choose(st, Action::Hub) {
+                return Some(Some(c));
+            }
+        }
+        KeyCode::Char('e') if ctrl => {
+            if let Some(e) = st.selected_entry().cloned() {
+                match (opts.editor_cmd)(&e, st.selected_open_editor(&e)) {
+                    Some(cmd) => {
+                        return Some(Some(Choice {
+                            entry: e,
+                            action: Action::Editor(cmd),
+                        }))
+                    }
+                    None => st.flash("no editor used here", ToastKind::Warn),
+                }
+            }
+        }
+        KeyCode::Char('y') if ctrl => {
+            if let Some(e) = st.selected_entry() {
+                if platform::copy_to_clipboard(&e.path) {
+                    st.flash(
+                        format!("copied {}", split_path(&e.path).1),
+                        ToastKind::Success,
+                    );
+                } else {
+                    st.flash("clipboard copy unavailable", ToastKind::Warn);
+                }
+            }
+        }
+        KeyCode::Char('d') if ctrl => {
+            if st.selected_entry().is_some() && opts.forget_dir.is_some() {
+                st.modal = Modal::ConfirmForget;
+            }
+        }
+        KeyCode::Char('p') if alt => {
+            if let Some(e) = st.selected_entry().cloned() {
+                if let Some(cb) = opts.toggle_pin.as_mut() {
+                    match cb(&e) {
+                        Ok(now_pinned) => {
+                            if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
+                                st.set_data(d);
+                            }
+                            let verb = if now_pinned { "pinned" } else { "unpinned" };
+                            st.flash(
+                                format!("{verb} {}", split_path(&e.path).1),
+                                ToastKind::Success,
+                            );
+                        }
+                        Err(err) => st.flash(err, ToastKind::Error),
+                    }
+                }
+            }
+        }
+        KeyCode::Char('i') if alt => {
+            st.inspector = !st.inspector;
+            if st.inspector {
+                let term_w = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(100);
+                if term_w < 96 {
+                    st.flash(
+                        "Widen terminal (>= 96 cols) to view inspector",
+                        ToastKind::Info,
+                    );
+                }
+            }
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            let next = if st.view == View::Folders {
+                View::Sessions
+            } else {
+                View::Folders
+            };
+            switch_view(st, opts, next);
+        }
+        KeyCode::F(1) => st.modal = Modal::Help,
+        KeyCode::Char('?') if st.query.is_empty() && !ctrl && !alt => st.modal = Modal::Help,
+        KeyCode::Up => st.mv(-1),
+        KeyCode::Down => st.mv(1),
+        KeyCode::PageUp => st.mv(-(st.page.max(1) as isize)),
+        KeyCode::PageDown => st.mv(st.page.max(1) as isize),
+        KeyCode::Home => st.selected = first_item(&st.rows).unwrap_or(0),
+        KeyCode::End => st.mv(st.rows.len() as isize),
+        KeyCode::Char('p') | KeyCode::Char('k') if ctrl && !alt => st.mv(-1),
+        KeyCode::Char('n') | KeyCode::Char('j') if ctrl && !alt => st.mv(1),
+        KeyCode::Char('w') if ctrl => st.delete_word(),
+        KeyCode::Char('u') if ctrl => {
+            st.query.clear();
+            st.refilter();
+        }
+        KeyCode::Backspace => {
+            st.query.pop();
+            st.refilter();
+        }
+        KeyCode::Char(c) if is_plain_char(&key) => {
+            st.query.push(c);
+            st.refilter();
+        }
+        _ => {}
+    }
+    None
+}
+
 fn run_fullscreen(st: &mut State, opts: &mut Opts) -> Result<Option<Choice>> {
     FULLSCREEN.store(true, Ordering::SeqCst);
-    execute!(io::stderr(), EnterAlternateScreen, Hide)?;
+    execute!(io::stderr(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stderr()))?;
     run(&mut terminal, st, opts)
 }
 
 fn run_inline(st: &mut State, opts: &mut Opts) -> Result<Option<Choice>> {
     let (_, term_h) = crossterm::terminal::size()?;
-    let all: Vec<usize> = (0..st.data.entries.len()).collect();
-    let rows = build_rows(st.view, &all, |i| st.status(i)).len();
+    let rows = st.rows.len();
     let h = inline_height(rows, term_h);
-    // Without a cursor position reply, use the full screen.
     let mut terminal = match Terminal::with_options(
         TtyBackend(CrosstermBackend::new(io::stderr())),
-        TerminalOptions { viewport: Viewport::Inline(h) },
+        TerminalOptions {
+            viewport: Viewport::Inline(h),
+        },
     ) {
         Ok(t) => t,
         Err(_) => return run_fullscreen(st, opts),
     };
+    let _ = execute!(io::stderr(), EnableMouseCapture);
     terminal.hide_cursor()?;
     let result = run(&mut terminal, st, opts);
-    // Clear the drawing, so the prompt comes back where the picker was.
     let _ = terminal.clear();
     let _ = terminal.show_cursor();
     result
 }
 
 pub fn pick(data: Data, query: &str, now: i64, mut opts: Opts) -> Result<Option<Choice>> {
-    let home = crate::platform::home_dir().map(|h| h.to_string_lossy().into_owned());
-    let mut st = State::new(data, query, now, opts.view, Theme::from_env(), home);
+    let home = platform::home_dir().map(|h| h.to_string_lossy().into_owned());
+    let cfg = crate::config::load();
+    let theme = Theme::from_env_and_config(&cfg);
+    let mut st = State::new(
+        data,
+        query,
+        now,
+        opts.view,
+        opts.fullscreen,
+        opts.tag_filter.clone(),
+        opts.shell_hook_missing.clone(),
+        theme,
+        home,
+    );
+    if let Some((msg, kind)) = opts.initial_toast.take() {
+        st.toast = Some(Toast::new(msg, kind, 4000));
+    }
     // Fast travel: one match for a given query, so skip the UI.
     if !query.trim().is_empty() && st.matches.len() == 1 {
         let entry = st.data.entries[st.matches[0]].clone();
-        return Ok(Some(Choice { entry, action: Action::Travel }));
+        return Ok(Some(Choice {
+            entry,
+            action: Action::Travel,
+        }));
     }
 
     let default_hook = std::panic::take_hook();
@@ -1216,8 +2100,11 @@ pub fn pick(data: Data, query: &str, now: i64, mut opts: Opts) -> Result<Option<
     }));
 
     enable_raw_mode()?;
-    let result =
-        if opts.fullscreen { run_fullscreen(&mut st, &mut opts) } else { run_inline(&mut st, &mut opts) };
+    let result = if opts.fullscreen {
+        run_fullscreen(&mut st, &mut opts)
+    } else {
+        run_inline(&mut st, &mut opts)
+    };
     restore();
     result
 }
@@ -1227,6 +2114,7 @@ mod tests {
     use super::*;
     use crate::model::Tag;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn entry(path: &str, tools: &[&str]) -> Entry {
         Entry {
@@ -1236,7 +2124,11 @@ mod tests {
             pinned: false,
             tags: tools
                 .iter()
-                .map(|t| Tag { tool: t.to_string(), count: 1, last_used: 0 })
+                .map(|t| Tag {
+                    tool: t.to_string(),
+                    count: 1,
+                    last_used: 0,
+                })
                 .collect(),
         }
     }
@@ -1250,11 +2142,18 @@ mod tests {
     }
 
     fn session(id: i64, path: &str, tool: &str, status: Status, updated_at: i64) -> Session {
-        Session { id, path: path.into(), tool: tool.into(), status, shell_pid: None, started_at: 0, updated_at }
-    }
-
-    fn fit_text(f: &Fit) -> String {
-        f.iter().map(|(c, _)| c).collect()
+        Session {
+            id,
+            path: path.into(),
+            tool: tool.into(),
+            status,
+            shell_pid: None,
+            started_at: 0,
+            updated_at,
+            session_id: None,
+            detail: None,
+            tmux_pane: None,
+        }
     }
 
     #[test]
@@ -1275,7 +2174,12 @@ mod tests {
     #[test]
     fn status_word_matches() {
         let s = session(1, "/home/u/beta", "codex", Status::Waiting, 5);
-        let done = Session { id: 2, status: Status::Done, updated_at: 9, ..s.clone() };
+        let done = Session {
+            id: 2,
+            status: Status::Done,
+            updated_at: 9,
+            ..s.clone()
+        };
         let best = best_by_path(&[done, s]);
         assert_eq!(best["/home/u/beta"].status, Status::Waiting);
         assert_eq!(filter(&sample(), &best, "needs"), vec![1]);
@@ -1284,7 +2188,12 @@ mod tests {
     #[test]
     fn ready_badge_and_search() {
         let s = session(1, "/home/u/beta", "codex", Status::Ready, 5);
-        let work = Session { id: 2, status: Status::Working, updated_at: 9, ..s.clone() };
+        let work = Session {
+            id: 2,
+            status: Status::Working,
+            updated_at: 9,
+            ..s.clone()
+        };
         let best = best_by_path(&[work, s]);
         assert_eq!(best["/home/u/beta"].status, Status::Ready);
         assert!(urgency(Status::Waiting) > urgency(Status::Ready));
@@ -1298,28 +2207,6 @@ mod tests {
     }
 
     #[test]
-    fn time_ago_units() {
-        assert_eq!(time_ago(100, 90), "now");
-        assert_eq!(time_ago(1000, 700), "5m");
-        assert_eq!(time_ago(3 * 3600, 0), "3h");
-        assert_eq!(time_ago(2 * 86400, 0), "2d");
-    }
-
-    #[test]
-    fn truncation() {
-        assert_eq!(fit_text(&fit_end("knn", 5)), "knn");
-        assert_eq!(fit_text(&fit_end("kmeans-clustering", 8)), "kmeans-…");
-        assert_eq!(fit_text(&fit_end("abc", 0)), "");
-        assert_eq!(fit_text(&fit_middle("~/code/aiml", 20)), "~/code/aiml");
-        let m = fit_middle("~/code/very/deep/nested/aiml", 12);
-        assert_eq!(fit_text(&m), "~/cod…d/aiml");
-        assert_eq!(m.iter().map(|(c, _)| cw(*c)).sum::<usize>(), 12);
-        // The ellipsis has no source index. The other chars keep theirs.
-        assert_eq!(m[5], ('…', None));
-        assert_eq!(m[6].1, Some(22));
-    }
-
-    #[test]
     fn split_paths() {
         assert_eq!(split_path("~/code/knn"), ("~/code".into(), "knn".into(), 7));
         assert_eq!(split_path("/tmp"), ("/".into(), "tmp".into(), 1));
@@ -1330,10 +2217,8 @@ mod tests {
     fn columns() {
         let c = layout_cols(108, 2, 40, 20, 14, 3);
         assert_eq!((c.name, c.parent, c.tags), (28, 20, 14));
-        // Narrow: the parent keeps 12 columns before the tags grow.
         let c = layout_cols(60, 2, 10, 30, 30, 3);
         assert_eq!((c.name, c.parent, c.tags), (10, 12, 60 - 14 - 10 - 12));
-        // Very narrow: no parent at all.
         let c = layout_cols(25, 2, 10, 30, 0, 3);
         assert_eq!(c.parent, 0);
     }
@@ -1348,49 +2233,51 @@ mod tests {
 
     #[test]
     fn rows_group_and_skip_headers() {
-        let st = |i: usize| [Some(Status::Done), Some(Status::Waiting), Some(Status::Done)][i];
+        let st = |i: usize| {
+            [
+                Some(Status::Done),
+                Some(Status::Waiting),
+                Some(Status::Done),
+            ][i]
+        };
         let rows = build_rows(View::Sessions, &[0, 1, 2], st);
         assert_eq!(
             rows,
-            vec![Row::Header(Status::Waiting), Row::Item(1), Row::Header(Status::Done), Row::Item(0), Row::Item(2)]
+            vec![
+                Row::Header(Status::Waiting, 1),
+                Row::Item(1),
+                Row::Header(Status::Done, 2),
+                Row::Item(0),
+                Row::Item(2)
+            ]
         );
         assert_eq!(first_item(&rows), Some(1));
         assert_eq!(step_item(&rows, 1, 1), 3);
         assert_eq!(step_item(&rows, 3, -1), 1);
         assert_eq!(step_item(&rows, 1, -1), 1);
         assert_eq!(step_item(&rows, 4, 1), 4);
-        // The header above the selected item stays on screen.
         assert_eq!(scroll(&rows, 1, 0, 3), 0);
         assert_eq!(scroll(&rows, 3, 0, 2), 2);
         assert_eq!(scroll(&rows, 3, 3, 2), 2);
-        assert_eq!(build_rows(View::Folders, &[2, 0], st), vec![Row::Item(2), Row::Item(0)]);
+        assert_eq!(
+            build_rows(View::Folders, &[2, 0], st),
+            vec![Row::Item(2), Row::Item(0)]
+        );
     }
 
     #[test]
     fn heights() {
-        assert_eq!(inline_height(3, 50), 6);
-        assert_eq!(inline_height(100, 50), 22);
-        assert_eq!(inline_height(100, 12), 10);
+        assert_eq!(inline_height(3, 50), 7);
+        assert_eq!(inline_height(100, 50), 24);
+        assert_eq!(inline_height(100, 12), 11);
         assert_eq!(inline_height(100, 6), 6);
-        assert_eq!(inline_height(0, 50), 4);
+        assert_eq!(inline_height(0, 50), 7);
     }
 
     #[test]
     fn cursor_reply() {
         assert_eq!(parse_cpr(b"x\x1b[12;5R"), Some(Position { x: 4, y: 11 }));
         assert_eq!(parse_cpr(b"\x1b[12;"), None);
-    }
-
-    #[test]
-    fn colors_follow_the_terminal() {
-        let t = Theme { color: true, truecolor: false };
-        assert_eq!(t.accent(), Color::Yellow);
-        assert_eq!(t.sel_bg(), Some(Color::DarkGray));
-        assert_eq!(t.map(Color::Rgb(0, 122, 204)), Some(Color::Indexed(32)));
-        let t = Theme { color: false, truecolor: true };
-        assert_eq!(t.map(Color::Red), None);
-        assert_eq!(t.sel_bg(), None);
-        assert_ne!(tag_color("vscode"), tag_color("antigravity"));
     }
 
     fn render(st: &mut State, w: u16, h: u16) -> String {
@@ -1416,9 +2303,15 @@ mod tests {
             entry("/home/u/code/aiml/knn", &["claude", "vscode"]),
             entry("/home/u/code/aiml/svm", &["claude"]),
             entry("/home/u/work/api-server", &["codex", "cursor"]),
-            entry("/home/u/code/aiml/kmeans-clustering-experiments", &["antigravity"]),
+            entry(
+                "/home/u/code/aiml/kmeans-clustering-experiments",
+                &["antigravity"],
+            ),
             entry("/home/u/notes", &[]),
-            entry("/srv/data/archive/very/deep/nested/folder/structure/old-site", &["zed", "neovim", "gemini"]),
+            entry(
+                "/srv/data/archive/very/deep/nested/folder/structure/old-site",
+                &["zed", "neovim", "gemini"],
+            ),
         ];
         let ago = [120, 300, 30, 720, 3 * 86400, 40 * 86400];
         for (x, a) in e.iter_mut().zip(ago) {
@@ -1426,24 +2319,52 @@ mod tests {
         }
         e[0].pinned = true;
         let sessions = vec![
-            session(1, "/home/u/code/aiml/knn", "claude", Status::Waiting, NOW - 120),
-            session(2, "/home/u/code/aiml/svm", "claude", Status::Ready, NOW - 300),
-            session(3, "/home/u/work/api-server", "codex", Status::Working, NOW - 30),
-            session(4, "/home/u/code/aiml/kmeans-clustering-experiments", "antigravity", Status::Done, NOW - 720),
+            session(
+                1,
+                "/home/u/code/aiml/knn",
+                "claude",
+                Status::Waiting,
+                NOW - 120,
+            ),
+            session(
+                2,
+                "/home/u/code/aiml/svm",
+                "claude",
+                Status::Ready,
+                NOW - 300,
+            ),
+            session(
+                3,
+                "/home/u/work/api-server",
+                "codex",
+                Status::Working,
+                NOW - 30,
+            ),
+            session(
+                4,
+                "/home/u/code/aiml/kmeans-clustering-experiments",
+                "antigravity",
+                Status::Done,
+                NOW - 720,
+            ),
         ];
         let editors = vec![OpenEditor {
             path: "/home/u/notes".into(),
             tag: "vscode".into(),
+            prog: "code".into(),
+            args: vec!["/home/u/notes".into()],
             open_cmd: "code '/home/u/notes'".into(),
         }];
-        Data { entries: e, sessions, editors }
+        Data {
+            entries: e,
+            sessions,
+            editors,
+            branches: HashMap::new(),
+            hub_paths: Vec::new(),
+        }
     }
 
-    fn theme() -> Theme {
-        Theme { color: true, truecolor: true }
-    }
-
-    /// Writes assets/demo.svg from a real render. Run with:
+    /// Writes assets/demo.svg from a real render with coalesced SVG background rects. Run with:
     /// cargo test demo_svg -- --ignored
     #[test]
     #[ignore]
@@ -1452,20 +2373,60 @@ mod tests {
             match c {
                 Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
                 Color::Yellow => "#e5c07b".into(),
+                Color::LightYellow => "#ffe9a3".into(),
+                Color::Blue => "#61afef".into(),
                 Color::Cyan => "#56b6c2".into(),
                 Color::Green => "#98c379".into(),
+                Color::Magenta => "#c678dd".into(),
                 Color::Gray => "#abb2bf".into(),
                 Color::DarkGray => "#5c6370".into(),
                 Color::Red | Color::LightRed => "#e06c75".into(),
                 Color::White => "#f0f0f0".into(),
+                Color::Indexed(n) => match n {
+                    0..=15 => d.into(),
+                    232..=255 => {
+                        let v = 8 + (n - 232) * 10;
+                        format!("#{v:02x}{v:02x}{v:02x}")
+                    }
+                    n => {
+                        let idx = n - 16;
+                        let steps = [0u8, 95, 135, 175, 215, 255];
+                        format!(
+                            "#{:02x}{:02x}{:02x}",
+                            steps[(idx / 36) as usize],
+                            steps[((idx / 6) % 6) as usize],
+                            steps[(idx % 6) as usize]
+                        )
+                    }
+                },
                 _ => d.into(),
             }
         }
         fn esc(s: &str) -> String {
-            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
         }
-        let mut st = State::new(demo(), "", NOW, View::Folders, theme(), Some("/home/u".into()));
-        let (w, h) = (100u16, 10u16);
+        let mut st = State::new(
+            demo(),
+            "",
+            NOW,
+            View::Folders,
+            false,
+            None,
+            None,
+            Theme::dark(),
+            Some("/home/u".into()),
+        );
+        st.footer_hints = vec![
+            ("⏎", "travel".into()),
+            ("^o", "claude".into()),
+            ("^e", "vscode".into()),
+            ("^g", "hub".into()),
+            ("⇥", "sessions".into()),
+            ("?", "keys".into()),
+        ];
+        let (w, h) = (102u16, 11u16);
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, &mut st)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -1479,50 +2440,80 @@ mod tests {
 <circle cx="22" cy="19" r="6" fill="#ff5f57"/><circle cx="42" cy="19" r="6" fill="#febc2e"/><circle cx="62" cy="19" r="6" fill="#28c840"/>
 <text x="{}" y="24" text-anchor="middle" fill="#9a9ea8" style="font-size:12px">~ ❯ grace</text>
 "##,
-            width - 1.0, height - 1.0, width / 2.0
+            width - 1.0,
+            height - 1.0,
+            width / 2.0
         );
         let top = py + 34.0;
         for y in 0..h {
             let base_y = top + y as f64 * lh;
-            // Backgrounds.
-            for x in 0..w {
-                let c = &buf[(x, y)];
-                if c.bg != Color::Reset {
-                    o += &format!(
-                        "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{lh}\" fill=\"{}\"/>\n",
-                        px + x as f64 * cw, base_y - 15.0, cw + 0.3, hex(c.bg, "#282c34")
-                    );
+            // Coalesced background runs (including reversed whitespace cursor cells).
+            let cell_bg = |x: u16, y: u16| -> Option<String> {
+                let cell = &buf[(x, y)];
+                if cell.modifier.contains(Modifier::REVERSED) {
+                    Some(hex(cell.fg, "#d7dae0"))
+                } else if cell.bg != Color::Reset {
+                    Some(hex(cell.bg, "#282c38"))
+                } else {
+                    None
                 }
+            };
+            let mut x = 0u16;
+            while x < w {
+                let Some(bg_hex) = cell_bg(x, y) else {
+                    x += 1;
+                    continue;
+                };
+                let start = x;
+                while x < w && cell_bg(x, y).as_deref() == Some(bg_hex.as_str()) {
+                    x += 1;
+                }
+                o += &format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{lh}\" fill=\"{bg_hex}\"/>\n",
+                    px + start as f64 * cw,
+                    base_y - 15.0,
+                    (x - start) as f64 * cw + 0.3,
+                );
             }
-            // Text, one <text> per cell run with the same style, placed per cell for exact columns.
             let mut x = 0u16;
             while x < w {
                 let c = &buf[(x, y)];
-                let sym = c.symbol().to_string();
-                if sym.trim().is_empty() {
+                if c.symbol().trim().is_empty() {
                     x += 1;
                     continue;
                 }
                 let mut run = String::new();
                 let start = x;
                 let style = (c.fg, c.modifier);
-                while x < w && (buf[(x, y)].fg, buf[(x, y)].modifier) == style && !buf[(x, y)].symbol().is_empty() {
+                while x < w
+                    && (buf[(x, y)].fg, buf[(x, y)].modifier) == style
+                    && !buf[(x, y)].symbol().is_empty()
+                {
                     run.push_str(buf[(x, y)].symbol());
                     x += 1;
                 }
-                let mut attrs = format!("fill=\"{}\"", hex(style.0, "#d7dae0"));
-                if style.1.contains(Modifier::BOLD) {
+                let (fg, modf) = style;
+                let fill = if modf.contains(Modifier::REVERSED) {
+                    "#16171b".into()
+                } else {
+                    hex(fg, "#d7dae0")
+                };
+                let mut attrs = format!("fill=\"{fill}\"");
+                if modf.contains(Modifier::BOLD) {
                     attrs += " font-weight=\"700\"";
                 }
-                if style.1.contains(Modifier::DIM) {
+                if modf.contains(Modifier::DIM) {
                     attrs += " opacity=\".55\"";
                 }
-                if style.1.contains(Modifier::UNDERLINED) {
+                if modf.contains(Modifier::UNDERLINED) {
                     attrs += " text-decoration=\"underline\"";
                 }
                 o += &format!(
                     "<text x=\"{:.1}\" y=\"{:.1}\" textLength=\"{:.1}\" lengthAdjust=\"spacingAndGlyphs\" {attrs}>{}</text>\n",
-                    px + start as f64 * cw, base_y, (x - start) as f64 * cw, esc(&run)
+                    px + start as f64 * cw,
+                    base_y,
+                    (x - start) as f64 * cw,
+                    esc(&run)
                 );
             }
         }
@@ -1532,73 +2523,164 @@ mod tests {
 
     #[test]
     fn render_folders() {
-        let mut st = State::new(demo(), "", NOW, View::Folders, theme(), Some("/home/u".into()));
-        let out = render(&mut st, 100, 10);
+        let mut st = State::new(
+            demo(),
+            "",
+            NOW,
+            View::Folders,
+            false,
+            None,
+            None,
+            Theme::dark(),
+            Some("/home/u".into()),
+        );
+        let out = render(&mut st, 100, 11);
         println!("{out}");
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].starts_with("╭ grace ─") && lines[0].ends_with(" 6/6 ╮"), "{}", lines[0]);
-        assert!(lines[1].contains("❯   search folders, tags, tools"), "{}", lines[1]);
-        assert!(lines[2].starts_with("│▌● ★ knn"), "{}", lines[2]);
-        assert!(lines[2].contains("~/code/aiml") && lines[2].contains("claude · vscode"), "{}", lines[2]);
-        assert!(lines[2].ends_with("2m │"), "{}", lines[2]);
-        assert!(lines[4].contains("⠋") && lines[4].contains("codex · cursor"), "{}", lines[4]);
-        assert!(lines[5].contains("kmeans-clustering-experimen…"), "{}", lines[5]);
-        assert!(lines[6].contains("▣") && lines[6].contains("notes") && lines[6].contains("vscode"));
-        assert!(lines[7].contains("old-site") && lines[7].contains("…"), "{}", lines[7]);
-        assert!(lines[9].starts_with("╰ enter travel · ctrl-o resume tool · ctrl-e editor · esc quit ─"));
+        assert!(
+            lines[0].starts_with("╭ ✦ grace ")
+                && lines[0].contains("Folders")
+                && lines[0].ends_with(" 6/6 ╮"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("❯   search folders, tags, branches"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].contains("────"), "{}", lines[2]);
+        assert!(lines[3].starts_with("│▌● ★ knn"), "{}", lines[3]);
+        assert!(
+            lines[3].contains("~/code/aiml") && lines[3].contains("claude · vscode"),
+            "{}",
+            lines[3]
+        );
+        assert!(lines[3].ends_with("2m │"), "{}", lines[3]);
+        assert!(
+            lines[5].contains("⠋") && lines[5].contains("codex · cursor"),
+            "{}",
+            lines[5]
+        );
+        assert!(
+            lines[6].contains("kmeans-clustering-experimen…"),
+            "{}",
+            lines[6]
+        );
+        assert!(
+            lines[7].contains("▣") && lines[7].contains("notes") && lines[7].contains("vscode")
+        );
+        assert!(
+            lines[8].contains("old-site") && lines[8].contains("…"),
+            "{}",
+            lines[8]
+        );
         assert_eq!(lines[0].chars().count(), 100);
 
-        // Matches in a narrow terminal.
         st.query = "aiml".into();
         st.refilter();
-        let out = render(&mut st, 70, 7);
-        println!("{out}");
+        let out = render(&mut st, 70, 8);
         assert!(out.lines().next().unwrap().ends_with(" 3/6 ╮"));
 
         st.query = "zzzqqq".into();
         st.refilter();
-        let out = render(&mut st, 70, 4);
-        println!("{out}");
-        assert!(out.contains("No matches"));
+        let out = render(&mut st, 70, 6);
+        assert!(out.contains("No matching folders"));
 
-        let mut empty = State::new(Data::default(), "", 0, View::Folders, theme(), None);
-        let out = render(&mut empty, 70, 5);
-        println!("{out}");
-        assert!(out.contains("No folders yet. cd around, or run grace import."));
+        let mut empty = State::new(
+            Data::default(),
+            "",
+            0,
+            View::Folders,
+            false,
+            None,
+            None,
+            Theme::dark(),
+            None,
+        );
+        let out = render(&mut empty, 72, 8);
+        assert!(out.contains("No sites of grace yet"));
     }
 
     #[test]
     fn render_sessions() {
         let mut d = demo();
         d.entries.truncate(4);
-        let mut st = State::new(d, "", NOW, View::Sessions, theme(), Some("/home/u".into()));
-        let out = render(&mut st, 100, 11);
+        let mut st = State::new(
+            d,
+            "",
+            NOW,
+            View::Sessions,
+            false,
+            None,
+            None,
+            Theme::dark(),
+            Some("/home/u".into()),
+        );
+        let out = render(&mut st, 100, 12);
         println!("{out}");
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[2].trim_matches('│').trim(), "NEEDS YOU");
-        assert!(lines[3].starts_with("│▌● needs you ★ knn"), "{}", lines[3]);
-        assert!(lines[4].contains("YOUR TURN"));
-        assert!(lines[5].contains("○ your turn") && lines[5].contains("svm"));
-        assert!(lines[7].contains("working") && lines[7].contains("api-server"));
-        assert!(lines[9].contains("✓ done"));
-        // The cursor skips the header.
+        assert!(lines[3].contains("NEEDS YOU (1)"), "{}", lines[3]);
+        assert!(
+            lines[4].starts_with("│▌● claude") && lines[4].contains("★ knn"),
+            "{}",
+            lines[4]
+        );
+        assert!(lines[5].contains("YOUR TURN (1)"));
+        assert!(lines[6].contains("○ claude") && lines[6].contains("svm"));
+        assert!(lines[8].contains("codex") && lines[8].contains("api-server"));
+        assert!(lines[10].contains("✓ antigravity"));
         st.mv(1);
         assert_eq!(st.selected_entry().unwrap().path, "/home/u/code/aiml/svm");
-        // A reload keeps the selection by path.
-        let mut d = demo();
-        d.entries.truncate(4);
-        d.sessions[1].status = Status::Waiting;
-        st.set_data(d);
-        assert_eq!(st.selected_entry().unwrap().path, "/home/u/code/aiml/svm");
-        assert_eq!(st.rows[0], Row::Header(Status::Waiting));
-        assert_eq!(st.rows[3], Row::Header(Status::Working));
     }
 
     #[test]
     fn flash_shows_in_the_border() {
-        let mut st = State::new(demo(), "", NOW, View::Folders, theme(), Some("/home/u".into()));
-        st.flash("no editor used here");
-        let out = render(&mut st, 100, 6);
-        assert!(out.lines().last().unwrap().starts_with("╰ no editor used here ─"), "{out}");
+        let mut st = State::new(
+            demo(),
+            "",
+            NOW,
+            View::Folders,
+            false,
+            None,
+            None,
+            Theme::dark(),
+            Some("/home/u".into()),
+        );
+        st.flash("no editor used here", ToastKind::Warn);
+        let out = render(&mut st, 100, 10);
+        assert!(out.lines().last().unwrap().contains("no editor used here"));
+    }
+
+    #[test]
+    fn narrow_title_and_multiword_highlights() {
+        let mut st = State::new(
+            demo(),
+            "knn claude",
+            NOW,
+            View::Folders,
+            false,
+            Some("claude".into()),
+            None,
+            Theme::dark(),
+            Some("/home/u".into()),
+        );
+        let rv = st.row_view(0, true);
+        assert!(
+            !rv.name_hl.is_empty(),
+            "expected multi-word highlight in name"
+        );
+        assert!(
+            !rv.tag_hl.is_empty() && !rv.tag_hl[0].is_empty(),
+            "expected multi-word highlight in tag"
+        );
+        // Very narrow terminal with tag filter hides tab pills cleanly instead of colliding.
+        let out = render(&mut st, 44, 8);
+        let first_line = out.lines().next().unwrap();
+        assert_eq!(first_line.chars().count(), 44, "{first_line}");
+        assert!(first_line.contains("✦ grace"), "{first_line}");
+        assert!(!first_line.contains("Folders"), "{first_line}");
+        assert_eq!(st.tab_folders_area, Rect::default());
+        assert_eq!(st.tab_sessions_area, Rect::default());
     }
 }

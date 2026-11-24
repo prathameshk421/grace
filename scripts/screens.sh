@@ -1,32 +1,57 @@
 #!/usr/bin/env bash
 # Make the README images: assets/hub.svg, assets/diff.svg and assets/tree.svg.
 #
-# It builds a fake home folder with demo projects and a demo grace database,
+# Builds an isolated temporary home folder with demo projects and a demo database,
 # runs the real grace in a private tmux server, captures each screen with its
-# colors and turns the capture into an SVG with scripts/term2svg.py.
-# Your own grace data, tmux server and folders are not used or changed.
+# colors, and turns the capture into an SVG with scripts/term2svg.py.
+# Your own grace data, config, tmux server, and folders are never touched.
 #
 # Usage: scripts/screens.sh [path to grace]   (default: grace on PATH)
 # Needs: tmux, git, sqlite3, python3.
 set -euo pipefail
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
-grace=$(command -v "${1:-grace}")
+repo=$(cd "$(dirname "$0")/.." && pwd -P)
+raw_grace=${1:-grace}
+if [[ "$raw_grace" == */* ]]; then
+  grace=$(cd "$(dirname "$raw_grace")" && pwd -P)/$(basename "$raw_grace")
+else
+  grace=$(command -v "$raw_grace")
+fi
+[ -x "$grace" ] || { echo "error: grace binary not executable: $grace" >&2; exit 1; }
 work=$(mktemp -d)
 work=$(cd "$work" && pwd -P)
-H=$work/home
-data=$work/data
-trap 'tmux -L grace-shots kill-server 2>/dev/null; tmux -L grace-shots-hub kill-server 2>/dev/null; rm -rf "$work"' EXIT
+H="$work/home"
+data="$work/data"
+
+cleanup() {
+  tmux -L grace-shots kill-server 2>/dev/null || true
+  tmux -L grace-shots-hub kill-server 2>/dev/null || true
+  if [ -n "${work:-}" ] && [ -d "$work" ]; then
+    rm -rf "$work"
+  fi
+}
+trap cleanup EXIT INT TERM
 
 g() { git -c user.name=demo -c user.email=demo@example.com "$@"; }
 
 # Demo folders.
-mkdir -p "$H"/{code/{payments-api,web-dashboard,ml/churn-model,ml/embeddings},work/infra,notes,dotfiles} "$data" "$work/bin"
+mkdir -p \
+  "$H/code/payments-api" \
+  "$H/code/web-dashboard" \
+  "$H/code/ml/churn-model" \
+  "$H/code/ml/embeddings" \
+  "$H/work/infra" \
+  "$H/notes" \
+  "$H/dotfiles" \
+  "$data" \
+  "$work/bin"
 ln -s "$grace" "$work/bin/grace"
-for p in web-dashboard ml/churn-model ml/embeddings; do git -C "$H/code/$p" init -q -b main; done
+for p in web-dashboard ml/churn-model ml/embeddings; do
+  git -C "$H/code/$p" init -q -b main
+done
 
 # payments-api: a repo with history and open changes.
-api=$H/code/payments-api
+api="$H/code/payments-api"
 cd "$api"
 git init -q -b main
 mkdir -p src/routes src/db tests
@@ -92,7 +117,7 @@ export const idempotency = (): RequestHandler => (req, res, next) => {
 EOF
 sed -i.bak 's/0.4.0/0.5.0/' package.json && rm package.json.bak
 
-# Shell for the panes: a short prompt and a small PATH.
+# Shell for the panes: a short prompt and a clean PATH.
 cat > "$H/.bashrc" <<EOF
 export PS1='\[\e[36m\]\w\[\e[0m\] ❯ '
 export PATH="$work/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -102,9 +127,19 @@ EOF
 printf '. ~/.bashrc\n' > "$H/.bash_profile"
 
 # Demo database: folders, tags and agent sessions.
-run_env=(env -i HOME="$H" GRACE_DATA_DIR="$data" GRACE_TMUX_SOCKET=grace-shots-hub
-  TERM=xterm-256color COLORTERM=truecolor SHELL=/bin/bash LANG=en_US.UTF-8
-  PATH="$work/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+run_env=(
+  env -i
+  HOME="$H"
+  GRACE_DATA_DIR="$data"
+  GRACE_CONFIG="/dev/null"
+  GRACE_THEME="dark"
+  GRACE_TMUX_SOCKET="grace-shots-hub"
+  TERM="xterm-256color"
+  COLORTERM="truecolor"
+  SHELL="/bin/bash"
+  LANG="en_US.UTF-8"
+  PATH="$work/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+)
 "${run_env[@]}" grace list >/dev/null
 now=$(date +%s)
 sqlite3 "$data/grace.db" <<EOF
@@ -125,11 +160,11 @@ INSERT INTO tags VALUES
  ('$H/work/infra','opencode',4,$now-86400), ('$H/work/infra','zed',6,$now-86400),
  ('$H/notes','vscode',6,$now-259200),
  ('$H/dotfiles','neovim',3,$now-1728000);
-INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at) VALUES
- ('$H/code/payments-api','claude','waiting',NULL,$now-1500,$now-45),
- ('$H/code/web-dashboard','codex','working',NULL,$now-900,$now-10),
- ('$H/code/ml/churn-model','claude','ready',NULL,$now-4000,$now-600),
- ('$H/code/ml/embeddings','gemini','done',NULL,$now-5000,$now-1200);
+INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at, detail) VALUES
+ ('$H/code/payments-api','claude','waiting',NULL,$now-1500,$now-45,'permission'),
+ ('$H/code/web-dashboard','codex','working',NULL,$now-900,$now-10,'Bash'),
+ ('$H/code/ml/churn-model','claude','ready',NULL,$now-4000,$now-600,NULL),
+ ('$H/code/ml/embeddings','gemini','done',NULL,$now-5000,$now-1200,NULL);
 EOF
 
 # shot <name> <cols> <rows> <command> <wait> <label> [keys...]
@@ -139,23 +174,27 @@ shot() {
   local t=(tmux -L grace-shots -f /dev/null)
   "${t[@]}" kill-server 2>/dev/null || true
   "${t[@]}" new-session -d -s s -x "$cols" -y "$rows" -c "$api" \
-    "$(printf '%q ' "${run_env[@]}") /bin/bash --rcfile $H/.bashrc -i"
+    "$(printf '%q ' "${run_env[@]}") /bin/bash --rcfile $(printf '%q' "$H/.bashrc") -i"
   "${t[@]}" set -g status off
   sleep 1
   "${t[@]}" send-keys -t s "clear; $cmd" Enter
   sleep "$wait"
-  for k in "$@"; do "${t[@]}" send-keys -t s "$k"; sleep 0.6; done
+  for k in "$@"; do
+    "${t[@]}" send-keys -t s "$k"
+    sleep 0.6
+  done
   "${t[@]}" capture-pane -t s -e -p > "$work/$name.txt"
   "${t[@]}" kill-server
   tmux -L grace-shots-hub kill-server 2>/dev/null || true
+  local prefix=$'\x7e/code/payments-api'
   python3 "$repo/scripts/term2svg.py" "$work/$name.txt" "$repo/assets/$name.svg" \
-    "~/code/payments-api ❯ $cmd" "$label"
+    "${prefix} ❯ $cmd" "$label"
   echo "wrote assets/$name.svg"
 }
 
 label_hub="The grace hub: a sidebar of agents and folders, a shell, a live diff and a file tree in one window"
-label_diff="grace diff: changed files on the left, the colored diff on the right"
-label_tree="grace tree: the files of a folder with git changes marked"
+label_diff="grace diff: changed files on the left, line-numbered colored diff on the right"
+label_tree="grace tree: project files as a tree with indent guides and git status marks"
 shot hub 120 26 "grace hub" 4 "$label_hub" 'git log --oneline -3' Enter 'git status -s' Enter
 shot diff 112 24 "grace diff" 2 "$label_diff" j
-shot tree 60 16 "grace tree" 2 "$label_tree" Enter j j Enter
+shot tree 64 18 "grace tree" 2 "$label_tree" j j j

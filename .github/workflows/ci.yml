@@ -5,7 +5,26 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  lint:
+    name: lint & formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af84a81ea2a62c17d1cc81b1a06b # v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Lint shell scripts
+        run: shellcheck install.sh .github/scripts/formula.sh scripts/screens.sh
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -14,40 +33,103 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af84a81ea2a62c17d1cc81b1a06b # v2
       - name: Build
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
-      # macOS has zsh and bash built in, so this needs no install.
-      - name: Check zsh and bash init scripts
-        if: runner.os == 'macOS'
-        run: |
-          ./target/debug/grace init bash > init.bash
-          ./target/debug/grace init zsh > init.zsh
-          bash -n init.bash
-          zsh -n init.zsh
-      # The fish static binary downloads in seconds. apt took 2 to 5 minutes.
-      - name: Check fish init script
+      - name: Install Unix test shells & tmux (Linux)
         if: runner.os == 'Linux'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download --repo fish-shell/fish-shell --pattern 'fish-*-linux-x86_64.tar.xz' -O fish.tar.xz
-          mkdir fishbin && tar -xJf fish.tar.xz -C fishbin
-          ./target/debug/grace init fish > init.fish
-          "$(find fishbin -name fish -type f | head -1)" --no-execute init.fish
-      - name: Check PowerShell init script parses
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux zsh
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            -o fish.tar.xz \
+            "https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3-linux-x86_64.tar.xz"
+          echo "8f643d10ad1abb0ef7072764c01ceb5cf61b2d373fda400cf60f0bad69b7e095  fish.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/fishbin"
+          tar -xJf fish.tar.xz -C "$RUNNER_TEMP/fishbin"
+      - name: Unix CLI, shell & tmux hub smoke tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "macOS" ] && ! command -v tmux >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install tmux
+          fi
+          BIN="$PWD/target/debug/grace"
+          export GRACE_DATA_DIR="$RUNNER_TEMP/gracedata"
+          export GRACE_CONFIG="$RUNNER_TEMP/missing-config.toml"
+          rm -rf "$GRACE_DATA_DIR"
+
+          # Syntax + runtime checks for bash & zsh (including set -u / NO_UNSET).
+          "$BIN" init bash > "$RUNNER_TEMP/init.bash"
+          "$BIN" init zsh > "$RUNNER_TEMP/init.zsh"
+          bash -n "$RUNNER_TEMP/init.bash"
+          zsh -n "$RUNNER_TEMP/init.zsh"
+
+          # Runtime bash hook smoke test under set -u.
+          PATH="$PWD/target/debug:$PATH" bash -eu -c '
+            source "$1"
+            test "$GRACE_SHELL" = "bash"
+            __grace_hook || true
+            grace --full list --json >/dev/null
+          ' _ "$RUNNER_TEMP/init.bash"
+
+          # Runtime zsh hook smoke test under NO_UNSET.
+          PATH="$PWD/target/debug:$PATH" zsh -eu -c '
+            source "$1"
+            test "$GRACE_SHELL" = "zsh"
+            grace --full list --json >/dev/null
+            grace sessions --json >/dev/null
+          ' _ "$RUNNER_TEMP/init.zsh"
+
+          # Fish syntax + empty-Enter preexec smoke test on Linux.
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            FISH=$(find "$RUNNER_TEMP/fishbin" -name fish -type f | head -1)
+            "$BIN" init fish > "$RUNNER_TEMP/init.fish"
+            "$FISH" --no-execute "$RUNNER_TEMP/init.fish"
+            PATH="$PWD/target/debug:$PATH" "$FISH" -c "
+              source $RUNNER_TEMP/init.fish
+              __grace_preexec ''
+              __grace_preexec '   '
+              grace list --json >/dev/null
+            "
+          fi
+
+          # New subcommands & completions.
+          "$BIN" add -- "$PWD"
+          "$BIN" stats >/dev/null
+          "$BIN" doctor >/dev/null
+          "$BIN" prune --dry-run >/dev/null
+          for sh in zsh bash fish powershell; do
+            "$BIN" completions "$sh" | grep -q "doctor"
+          done
+          "$BIN" list --json | grep -q "grace"
+
+          # tmux hub smoke test (create detached session + quit).
+          SOCK="graceci$$"
+          export GRACE_TMUX_SOCKET="$SOCK"
+          "$BIN" hub --no-attach "$PWD"
+          tmux -L "$SOCK" has-session -t "=grace"
+          "$BIN" hub quit
+
+      - name: Check PowerShell init & completions parse (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $src = (& ./target/debug/grace init powershell | Out-String)
-          $errs = $null
-          [void][System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$errs)
-          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
-      - name: PowerShell smoke test (Windows)
+          foreach ($src in @(
+            (& ./target/debug/grace init powershell | Out-String),
+            (& ./target/debug/grace completions powershell | Out-String)
+          )) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$errs)
+            if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          }
+
+      - name: PowerShell smoke test (Windows pwsh & powershell 5.1)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -56,13 +138,36 @@ jobs:
           Invoke-Expression (& grace init powershell | Out-String)
           $dir = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'proj one')
           Set-Location $dir
+          $global:LASTEXITCODE = 42
           prompt | Out-Null
-          grace tag $dir.FullName agy
+          if ($global:LASTEXITCODE -ne 42) { Write-Error "LASTEXITCODE clobbered: $global:LASTEXITCODE"; exit 1 }
+          Start-Sleep -Milliseconds 400
+          grace tag -- $dir.FullName agy
           $list = grace list | Out-String
           Write-Output $list
           if ($list -notmatch 'proj one') { Write-Error 'folder not recorded'; exit 1 }
           if ($list -notmatch '\[antigravity\]') { Write-Error 'tag not recorded'; exit 1 }
           if ($list -match '\\\\\?\\') { Write-Error 'verbatim prefix leaked'; exit 1 }
+          grace doctor
+          grace stats | Out-Null
+          grace --full list --json | Out-Null
+          grace prune --dry-run | Out-Null
+
+      - name: Windows PowerShell 5.1 hook smoke test
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:GRACE_DATA_DIR = Join-Path $env:RUNNER_TEMP 'gracedata51'
+          $env:PATH = "$PWD\target\debug;$env:PATH"
+          Invoke-Expression (& grace.exe init powershell | Out-String)
+          $dir = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'proj51')
+          Set-Location $dir
+          $global:LASTEXITCODE = 7
+          $null = prompt
+          if ($global:LASTEXITCODE -ne 7) { throw "LASTEXITCODE clobbered in PS 5.1" }
+          Start-Sleep -Milliseconds 400
+          grace.exe doctor
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
   installers:
     name: installer (${{ matrix.os }})
@@ -72,16 +177,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: install.sh (latest release)
         if: runner.os != 'Windows'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           export GRACE_INSTALL_DIR="$RUNNER_TEMP/bin"
           sh install.sh
           "$GRACE_INSTALL_DIR/grace" --version
-      - name: install.ps1 (latest release)
+      - name: install.ps1 (pwsh)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -89,10 +192,11 @@ jobs:
           Get-Content ./install.ps1 -Raw | Invoke-Expression
           & (Join-Path $env:GRACE_INSTALL_DIR 'grace.exe') --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
-      - name: install.ps1 on Windows PowerShell 5.1
+      - name: install.ps1 (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           $env:GRACE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'bin51'
           Get-Content ./install.ps1 -Raw | Invoke-Expression
           & (Join-Path $env:GRACE_INSTALL_DIR 'grace.exe') --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }

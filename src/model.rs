@@ -96,6 +96,27 @@ pub struct Session {
     pub started_at: i64,
     /// Last status change.
     pub updated_at: i64,
+    /// Agent-reported session identifier, when available.
+    pub session_id: Option<String>,
+    /// Concise detail, such as active tool ("Bash") or prompt kind ("permission").
+    pub detail: Option<String>,
+    /// Tmux pane ID where the hook fired, when running inside tmux.
+    pub tmux_pane: Option<String>,
+}
+
+/// Aggregated statistics for `grace stats` and `grace doctor`.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub total_dirs: usize,
+    pub existing_dirs: usize,
+    pub missing_dirs: usize,
+    pub pinned_dirs: usize,
+    pub total_visits: i64,
+    pub total_tags: i64,
+    pub live_sessions: usize,
+    /// (tool, total_runs, folder_count)
+    pub top_tools: Vec<(String, i64, usize)>,
+    pub top_dirs: Vec<Entry>,
 }
 
 #[cfg(test)]
@@ -104,7 +125,12 @@ mod tests {
 
     #[test]
     fn status_round_trip() {
-        for s in [Status::Working, Status::Waiting, Status::Ready, Status::Done] {
+        for s in [
+            Status::Working,
+            Status::Waiting,
+            Status::Ready,
+            Status::Done,
+        ] {
             assert_eq!(Status::parse(s.as_str()), Some(s));
         }
         assert_eq!(Status::Ready.as_str(), "ready");

@@ -1,49 +1,58 @@
 #!/usr/bin/env bash
-# Print the Homebrew formula for a release.
+# Print the Homebrew formula for grace.
 # Usage: formula.sh <tag> <dir with the .tar.gz.sha256 files>
 set -euo pipefail
-tag=$1
-dir=$2
+
+tag=${1:?usage: formula.sh <tag> <sha-dir>}
+dir=${2:?usage: formula.sh <tag> <sha-dir>}
+
+if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.+-]+)?$ ]]; then
+  echo "error: invalid tag format: $tag" >&2
+  exit 1
+fi
+
+ver=${tag#v}
 base="https://github.com/prathameshk421/grace/releases/download/${tag}"
 
-sum() {
+sha() {
   local f="${dir}/grace-${tag}-$1.tar.gz.sha256"
-  [ -s "$f" ] || { echo "missing $f" >&2; exit 1; }
-  awk '{print $1}' "$f"
-}
-
-# Read every sum first, so a missing file stops the script.
-mac_arm=$(sum aarch64-apple-darwin)
-mac_intel=$(sum x86_64-apple-darwin)
-linux_arm=$(sum aarch64-unknown-linux-gnu)
-linux_intel=$(sum x86_64-unknown-linux-gnu)
-
-asset() {
-  printf '      url "%s/grace-%s-%s.tar.gz"\n' "$base" "$tag" "$1"
-  printf '      sha256 "%s"\n' "$2"
+  if [[ ! -f "$f" ]]; then
+    echo "error: missing checksum file $f" >&2
+    exit 1
+  fi
+  local h
+  h=$(awk '{print $1}' "$f" | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$h" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "error: invalid sha256 in $f: $h" >&2
+    exit 1
+  fi
+  printf '%s' "$h"
 }
 
 cat <<EOF
 class Grace < Formula
-  desc "Fast travel between project folders, with tags for the AI tools used there"
+  desc "Site of Grace for project navigation, AI coding tools, and tmux workspaces"
   homepage "https://github.com/prathameshk421/grace"
+  version "${ver}"
   license "MIT"
 
   on_macos do
-    on_arm do
-$(asset aarch64-apple-darwin "$mac_arm")
-    end
-    on_intel do
-$(asset x86_64-apple-darwin "$mac_intel")
+    if Hardware::CPU.arm?
+      url "${base}/grace-${tag}-aarch64-apple-darwin.tar.gz"
+      sha256 "$(sha aarch64-apple-darwin)"
+    else
+      url "${base}/grace-${tag}-x86_64-apple-darwin.tar.gz"
+      sha256 "$(sha x86_64-apple-darwin)"
     end
   end
 
   on_linux do
-    on_arm do
-$(asset aarch64-unknown-linux-gnu "$linux_arm")
-    end
-    on_intel do
-$(asset x86_64-unknown-linux-gnu "$linux_intel")
+    if Hardware::CPU.arm?
+      url "${base}/grace-${tag}-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "$(sha aarch64-unknown-linux-gnu)"
+    else
+      url "${base}/grace-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "$(sha x86_64-unknown-linux-gnu)"
     end
   end
 
@@ -53,26 +62,16 @@ $(asset x86_64-unknown-linux-gnu "$linux_intel")
 
   def caveats
     <<~EOS
-      grace is fast travel for your terminal.
-      It remembers every project folder you work in, on any disk,
-      and tags each one with the AI tools and editors you used there.
-      Type \`grace\` and pick a folder to jump to it.
+      Add one line to your shell config, then open a new terminal:
 
-      Set it up in 2 steps:
-        1. Add one line to your shell, then open a new terminal:
-             zsh:  echo 'eval "\$(grace init zsh)"' >> ~/.zshrc
-             bash: echo 'eval "\$(grace init bash)"' >> ~/.bashrc
-             fish: echo 'grace init fish | source' >> ~/.config/fish/config.fish
-        2. Run \`grace\`. The first run imports your Claude Code and editor history.
+        zsh:   eval "\$(grace init zsh)"
+        bash:  eval "\$(grace init bash)"
+        fish:  grace init fish | source
 
-      More to try:
-        grace hub      agents, shell, live diff and file tree in one window
-        grace diff     the git changes of a folder
-        grace tree     the files of a folder as a tree
-        grace --help   every command
-
-      \`grace hub\` needs tmux: brew install tmux
-      Docs: https://github.com/prathameshk421/grace
+      Optional completions and health diagnostics:
+        grace completions zsh
+        grace setup --all
+        grace doctor
     EOS
   end
 

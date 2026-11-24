@@ -7,9 +7,12 @@ const WEEK: i64 = 7 * DAY;
 const MONTH: i64 = 30 * DAY;
 
 pub fn score(e: &Entry, now: i64) -> f64 {
-    let tags: i64 = e.tags.iter().map(|t| t.count).sum();
-    let base = (e.visits + 2 * tags) as f64;
-    let age = (now - e.last_visit).max(0);
+    let tags: i64 = e
+        .tags
+        .iter()
+        .fold(0i64, |acc, t| acc.saturating_add(t.count.max(0)));
+    let base = e.visits.max(0).saturating_add(tags.saturating_mul(2)) as f64;
+    let age = now.saturating_sub(e.last_visit).max(0);
     let mult = if age < HOUR {
         4.0
     } else if age < DAY {
@@ -35,10 +38,10 @@ pub fn sort_entries(entries: &mut [Entry], now: i64) {
 }
 
 pub fn time_ago(ts: i64, now: i64) -> String {
-    if ts == 0 {
+    if ts <= 0 {
         return "never".to_string();
     }
-    let d = (now - ts).max(0);
+    let d = now.saturating_sub(ts).max(0);
     if d < 60 {
         "now".to_string()
     } else if d < HOUR {
@@ -63,7 +66,13 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, visits: i64, last_visit: i64, pinned: bool) -> Entry {
-        Entry { path: path.into(), visits, last_visit, pinned, tags: vec![] }
+        Entry {
+            path: path.into(),
+            visits,
+            last_visit,
+            pinned,
+            tags: vec![],
+        }
     }
 
     #[test]
@@ -77,7 +86,10 @@ mod tests {
     #[test]
     fn recent_beats_old() {
         let now = 10_000_000;
-        let mut v = vec![entry("/old", 5, now - 60 * DAY, false), entry("/new", 5, now - 60, false)];
+        let mut v = vec![
+            entry("/old", 5, now - 60 * DAY, false),
+            entry("/new", 5, now - 60, false),
+        ];
         sort_entries(&mut v, now);
         assert_eq!(v[0].path, "/new");
     }

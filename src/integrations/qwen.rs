@@ -1,22 +1,6 @@
 //! qwen: Qwen Code. Hooks go in `~/.qwen/settings.json` (Claude-style `hooks` map).
-//!
-//! Verified in the docs (https://raw.githubusercontent.com/QwenLM/qwen-code/main/docs/users/features/hooks.md,
-//! and docs/users/configuration/settings.md for the path):
-//! - User settings file: `~/.qwen/settings.json`. User hooks load without folder trust.
-//! - Config: `hooks.<Event>: [{ "matcher"?, "hooks": [{ "type": "command", "command": "..." }] }]`.
-//! - Input is JSON on stdin with `hook_event_name` and `cwd`.
-//! - All events we install are in the docs' event table: UserPromptSubmit, PreToolUse,
-//!   PostToolUse, PermissionRequest, Notification, Stop, SessionStart, SessionEnd.
-//! - `Notification` has `notification_type`: `permission_prompt`, `idle_prompt`, `auth_success`
-//!   (`elicitation_dialog` is "defined but not implemented"). We map idle_prompt to Ready,
-//!   auth_success to ignored, anything else to Waiting.
-//! - Stdout on exit 0: a JSON object controls behavior. Other text goes into the model context on
-//!   SessionStart and UserPromptSubmit. So we print `{}` (no decision, no context).
-//!
-//! Assumed: a group without `matcher` matches everything. `GRACE_QWEN_DIR` replaces `~/.qwen`
-//! (grace only, not an official variable). StopFailure (API error ends the turn) is not hooked.
-use super::gemini::{json_hooks_add, json_hooks_remove, parse_event_json};
-use super::{HookResult, Integration};
+use super::gemini::{json_hooks_add, json_hooks_check, json_hooks_remove, parse_event_json};
+use super::{HookResult, HookStatus, Integration};
 use crate::model::Status;
 use crate::setup::env_dir;
 use anyhow::Result;
@@ -24,8 +8,10 @@ use std::path::PathBuf;
 
 pub static INTEGRATION: Integration = Integration {
     name: "qwen",
+    label: "Qwen Code",
     tool: "qwen",
     setup,
+    check,
     reads_stdin: true,
     hook,
     stdout: "{}",
@@ -53,6 +39,13 @@ fn setup(exe: &str, remove: bool) -> Result<String> {
     } else {
         json_hooks_add(&path, exe, "qwen", EVENTS, "Qwen Code")
     }
+}
+
+fn check(exe: &str) -> HookStatus {
+    let Ok(path) = settings_path() else {
+        return HookStatus::NotInstalled;
+    };
+    json_hooks_check(&path, exe, "qwen", EVENTS)
 }
 
 fn status_for(event: &str, ntype: &str) -> Option<Status> {
@@ -95,7 +88,10 @@ mod tests {
         let msg = json_hooks_add(&p, EXE, "qwen", EVENTS, "Qwen Code").unwrap();
         assert!(msg.ends_with("Restart running Qwen Code sessions to pick this up."));
         let v = read(&p);
-        assert_eq!(v.to_string().matches("session hook qwen").count(), EVENTS.len());
+        assert_eq!(
+            v.to_string().matches("session hook qwen").count(),
+            EVENTS.len()
+        );
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2);
         let again = json_hooks_add(&p, EXE, "qwen", EVENTS, "Qwen Code").unwrap();
         assert!(again.ends_with("already set up. Nothing to do."));
@@ -126,7 +122,10 @@ mod tests {
             assert_eq!(s(e, ""), Some(Status::Working));
         }
         assert_eq!(s("PermissionRequest", ""), Some(Status::Waiting));
-        assert_eq!(s("Notification", "permission_prompt"), Some(Status::Waiting));
+        assert_eq!(
+            s("Notification", "permission_prompt"),
+            Some(Status::Waiting)
+        );
         assert_eq!(s("Notification", "idle_prompt"), Some(Status::Ready));
         assert_eq!(s("Notification", "auth_success"), None);
         assert_eq!(s("Stop", ""), Some(Status::Ready));
@@ -142,7 +141,10 @@ mod tests {
         assert_eq!(r.cwd.as_deref(), Some("/w"));
         assert_eq!(hook(&[], "garbage"), HookResult::default());
         assert_eq!(hook(&[], "").status, None);
-        let r = hook(&[], r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","cwd":"/w"}"#);
+        let r = hook(
+            &[],
+            r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","cwd":"/w"}"#,
+        );
         assert_eq!(r.status, Some(Status::Ready));
     }
 }

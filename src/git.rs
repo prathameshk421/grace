@@ -1,4 +1,7 @@
-//! Small git helpers for `grace diff` and `grace tree`. They run the git CLI.
+//! Small git helpers for `grace diff`, `grace tree`, and picker previews. They run the git CLI.
+use crate::platform;
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -6,6 +9,32 @@ use std::process::{Command, Stdio};
 pub const MAX_DIFF_LINES: usize = 5000;
 /// Max bytes read from git or from an untracked file.
 const MAX_BYTES: usize = 2 << 20;
+
+/// Diff scope filter in `grace diff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffScope {
+    #[default]
+    All,
+    Unstaged,
+    Staged,
+}
+
+impl DiffScope {
+    pub fn next(self) -> DiffScope {
+        match self {
+            DiffScope::All => DiffScope::Unstaged,
+            DiffScope::Unstaged => DiffScope::Staged,
+            DiffScope::Staged => DiffScope::All,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            DiffScope::All => "all",
+            DiffScope::Unstaged => "unstaged",
+            DiffScope::Staged => "staged",
+        }
+    }
+}
 
 /// One changed file from `git status --porcelain=v1 -z`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +47,10 @@ pub struct Change {
     pub path: String,
     /// The old path of a rename or copy.
     pub orig: Option<String>,
+    /// Line additions (from numstat / untracked).
+    pub added: Option<u32>,
+    /// Line deletions (from numstat).
+    pub deleted: Option<u32>,
 }
 
 /// How a change shows: the letter and its color group.
@@ -66,6 +99,7 @@ pub struct Branch {
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    pub has_commits: bool,
 }
 
 /// Parse `## main...origin/main [ahead 1, behind 2]` (without the "## ").
@@ -74,9 +108,16 @@ pub fn parse_branch(s: &str) -> Branch {
         Some(i) => (&s[..i], s[i + 2..].trim_end_matches(']')),
         None => (s, ""),
     };
-    let mut b = Branch::default();
+    let mut b = Branch {
+        has_commits: true,
+        ..Branch::default()
+    };
     if let Some(rest) = head.strip_prefix("No commits yet on ") {
         b.name = rest.to_string();
+        b.has_commits = false;
+    } else if let Some(rest) = head.strip_prefix("Initial commit on ") {
+        b.name = rest.to_string();
+        b.has_commits = false;
     } else if let Some((name, up)) = head.split_once("...") {
         b.name = name.to_string();
         b.upstream = Some(up.to_string());
@@ -111,8 +152,19 @@ pub fn parse_porcelain(out: &[u8]) -> (Option<Branch>, Vec<Change>) {
         let (x, y) = (chars[0], chars[1]);
         let path: String = chars[3..].iter().collect();
         // A rename or copy is followed by the old path.
-        let orig = if x == 'R' || x == 'C' { fields.next().map(str::to_string) } else { None };
-        changes.push(Change { x, y, path, orig });
+        let orig = if x == 'R' || x == 'C' {
+            fields.next().map(str::to_string)
+        } else {
+            None
+        };
+        changes.push(Change {
+            x,
+            y,
+            path,
+            orig,
+            added: None,
+            deleted: None,
+        });
     }
     (branch, changes)
 }
@@ -129,6 +181,15 @@ pub enum LineKind {
     Context,
     /// Notes such as "Binary files differ" or "\ No newline at end of file".
     Meta,
+}
+
+/// A parsed line of a unified diff, with optional old/new line numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: LineKind,
+    pub old_no: Option<u32>,
+    pub new_no: Option<u32>,
+    pub text: String,
 }
 
 /// Classify one line of a unified diff. `in_hunk` is true after the first "@@".
@@ -153,43 +214,89 @@ pub fn classify(line: &str, in_hunk: bool) -> LineKind {
     }
 }
 
-/// Classify all lines of a diff.
-pub fn classify_all(text: &str) -> Vec<(LineKind, String)> {
+/// Parse `@@ -old[,count] +new[,count] @@` into `(old_start, new_start)`.
+fn parse_hunk_start(line: &str) -> Option<(u32, u32)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old_part, rest) = rest.split_once(" +")?;
+    let (new_part, _) = rest.split_once(" @@")?;
+    let old = old_part.split(',').next()?.parse::<u32>().ok()?;
+    let new = new_part.split(',').next()?.parse::<u32>().ok()?;
+    Some((old, new))
+}
+
+/// Classify all lines of a diff and track old/new line numbers.
+pub fn classify_lines(text: &str) -> Vec<DiffLine> {
     let mut in_hunk = false;
+    let mut old_ln = 0u32;
+    let mut new_ln = 0u32;
     let mut out = Vec::new();
     for line in text.lines() {
         if line.starts_with("diff ") {
             in_hunk = false;
         }
-        let k = classify(line, in_hunk);
-        if k == LineKind::Hunk {
-            in_hunk = true;
-        }
-        out.push((k, printable(line)));
+        let kind = classify(line, in_hunk);
+        let (old_no, new_no) = match kind {
+            LineKind::Hunk => {
+                in_hunk = true;
+                if let Some((o, n)) = parse_hunk_start(line) {
+                    old_ln = o;
+                    new_ln = n;
+                }
+                (None, None)
+            }
+            LineKind::Add => {
+                let n = Some(new_ln);
+                new_ln = new_ln.saturating_add(1);
+                (None, n)
+            }
+            LineKind::Del => {
+                let o = Some(old_ln);
+                old_ln = old_ln.saturating_add(1);
+                (o, None)
+            }
+            LineKind::Context => {
+                let res = (Some(old_ln), Some(new_ln));
+                old_ln = old_ln.saturating_add(1);
+                new_ln = new_ln.saturating_add(1);
+                res
+            }
+            LineKind::Header | LineKind::Meta => (None, None),
+        };
+        out.push(DiffLine {
+            kind,
+            old_no,
+            new_no,
+            text: printable(line),
+        });
     }
     out
 }
 
-/// A line that is safe to draw: tabs become spaces, other control bytes become "?".
-/// Raw ESC or CR bytes from a file would move the cursor or change colors.
+/// Classify all lines of a diff (kind + text tuples).
+#[cfg(test)]
+pub fn classify_all(text: &str) -> Vec<(LineKind, String)> {
+    classify_lines(text)
+        .into_iter()
+        .map(|d| (d.kind, d.text))
+        .collect()
+}
+
+/// Safe terminal text: delegates to `platform::sanitize_display`.
 pub fn printable(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\t' => o.push_str("    "),
-            c if c.is_control() => o.push('?'),
-            c => o.push(c),
-        }
-    }
-    o
+    platform::sanitize_display(s)
 }
 
 /// Cut a diff to `max` lines. Adds a note when it cuts.
-pub fn cap_lines(mut lines: Vec<(LineKind, String)>, max: usize) -> Vec<(LineKind, String)> {
+pub fn cap_diff_lines(mut lines: Vec<DiffLine>, max: usize) -> Vec<DiffLine> {
     if lines.len() > max {
         let n = lines.len();
         lines.truncate(max);
-        lines.push((LineKind::Meta, format!("… {} more lines not shown", n - max)));
+        lines.push(DiffLine {
+            kind: LineKind::Meta,
+            old_no: None,
+            new_no: None,
+            text: format!("… {} more lines not shown", n - max),
+        });
     }
     lines
 }
@@ -200,17 +307,37 @@ pub fn looks_binary(b: &[u8]) -> bool {
 }
 
 /// An untracked file as an "added" diff.
-pub fn untracked_diff(path: &str, content: &[u8]) -> Vec<(LineKind, String)> {
-    let mut out = vec![(LineKind::Header, format!("new file {path} (untracked)"))];
+pub fn untracked_diff(path: &str, content: &[u8]) -> Vec<DiffLine> {
+    let mut out = vec![DiffLine {
+        kind: LineKind::Header,
+        old_no: None,
+        new_no: None,
+        text: format!("new file {} (untracked)", printable(path)),
+    }];
     if looks_binary(content) {
-        out.push((LineKind::Meta, "Binary file".into()));
+        out.push(DiffLine {
+            kind: LineKind::Meta,
+            old_no: None,
+            new_no: None,
+            text: "Binary file".into(),
+        });
         return out;
     }
     let text = String::from_utf8_lossy(content);
     let n = text.lines().count();
-    out.push((LineKind::Hunk, format!("@@ -0,0 +1,{n} @@")));
-    for l in text.lines() {
-        out.push((LineKind::Add, format!("+{}", printable(l))));
+    out.push(DiffLine {
+        kind: LineKind::Hunk,
+        old_no: None,
+        new_no: None,
+        text: format!("@@ -0,0 +1,{n} @@"),
+    });
+    for (idx, l) in text.lines().enumerate() {
+        out.push(DiffLine {
+            kind: LineKind::Add,
+            old_no: None,
+            new_no: Some(idx as u32 + 1),
+            text: format!("+{}", printable(l)),
+        });
     }
     out
 }
@@ -218,26 +345,52 @@ pub fn untracked_diff(path: &str, content: &[u8]) -> Vec<(LineKind, String)> {
 // ---------------------------------------------------------------------------
 // Running git
 
-fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git")
-        .arg("-C")
+/// Run git safely with `LC_ALL=C`, disabled fsmonitor/pager, and bounded streaming stdout read.
+/// Returns `(bytes, truncated)`.
+fn git_raw(dir: &Path, args: &[&str]) -> Option<(Vec<u8>, bool)> {
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.fsmonitor=false", "-c", "core.pager=cat", "-C"])
         .arg(dir)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    platform::apply_no_window(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let mut buf = Vec::new();
+    let read_ok = stdout
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .is_ok();
+    let truncated = buf.len() > MAX_BYTES;
+    if truncated {
+        buf.truncate(MAX_BYTES);
+        let _ = child.kill();
+    }
+    let status = child.wait().ok()?;
+    if !read_ok || (!truncated && !status.success()) {
         return None;
     }
-    let mut b = out.stdout;
-    b.truncate(MAX_BYTES);
-    Some(b)
+    Some((buf, truncated))
 }
 
-fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
-    git(dir, args).map(|b| String::from_utf8_lossy(&b).trim_end_matches(['\n', '\r']).to_string())
+fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    git_raw(dir, args).map(|(b, _)| b)
+}
+
+/// Drop the final partial NUL-delimited record when stdout hit `MAX_BYTES`.
+fn trim_last_nul_record(mut b: Vec<u8>, truncated: bool) -> Vec<u8> {
+    if truncated {
+        if let Some(pos) = b.iter().rposition(|&c| c == 0) {
+            b.truncate(pos + 1);
+        } else {
+            b.clear();
+        }
+    }
+    b
 }
 
 /// A repository as `grace diff` and `grace tree` see it.
@@ -251,53 +404,226 @@ pub struct Repo {
     pub changes: Vec<Change>,
 }
 
-/// Status of the repository that holds `dir`. None: not a git repository (or no git).
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Status of the repository that holds `dir`, including per-file `+N -M` numstat.
 pub fn status(dir: &Path) -> Option<Repo> {
-    let root = git_line(dir, &["rev-parse", "--show-toplevel"])?;
-    let prefix = git_line(dir, &["rev-parse", "--show-prefix"]).unwrap_or_default();
-    let out = git(Path::new(&root), &["status", "--porcelain=v1", "-z", "--branch", "--untracked-files=all"])?;
-    let (branch, changes) = parse_porcelain(&out);
-    Some(Repo { root, prefix, branch: branch.unwrap_or_default(), changes })
+    let rp = git(dir, &["rev-parse", "--show-toplevel", "--show-prefix"])?;
+    let rp_str = String::from_utf8_lossy(&rp);
+    let mut rp_lines = rp_str.lines();
+    let root = rp_lines.next()?.trim_end_matches('\r').to_string();
+    let prefix = rp_lines
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\r')
+        .to_string();
+
+    let (raw, trunc) = git_raw(
+        Path::new(&root),
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--branch",
+            "--untracked-files=all",
+        ],
+    )?;
+    let out = trim_last_nul_record(raw, trunc);
+    let (branch, mut changes) = parse_porcelain(&out);
+    let branch = branch.unwrap_or_default();
+
+    // Populate line diffstats (`+N -M`) in one fast numstat call.
+    let base = if branch.has_commits {
+        "HEAD"
+    } else {
+        EMPTY_TREE
+    };
+    let stats = numstat(Path::new(&root), base);
+    for c in &mut changes {
+        if c.untracked() {
+            let full = Path::new(&root).join(&c.path);
+            if let Ok(m) = std::fs::symlink_metadata(&full) {
+                if m.file_type().is_file() {
+                    if let Some(b) = read_capped(&full) {
+                        if !looks_binary(&b) {
+                            c.added = Some(String::from_utf8_lossy(&b).lines().count() as u32);
+                            c.deleted = Some(0);
+                        }
+                    }
+                }
+            }
+        } else if let Some(&(a, d)) = stats.get(&c.path) {
+            c.added = Some(a);
+            c.deleted = Some(d);
+        }
+    }
+    Some(Repo {
+        root,
+        prefix,
+        branch,
+        changes,
+    })
 }
 
-/// Unified diff of one changed file against HEAD (staged and unstaged together).
-pub fn file_diff(repo: &Repo, c: &Change) -> Vec<(LineKind, String)> {
+fn numstat(root: &Path, base: &str) -> HashMap<String, (u32, u32)> {
+    let mut map = HashMap::new();
+    let Some(out) = git(root, &["diff", "--numstat", "-z", "--no-ext-diff", base]) else {
+        return map;
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut fields = text.split('\0');
+    while let Some(f) = fields.next() {
+        if f.is_empty() {
+            continue;
+        }
+        let mut parts = f.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let path = if p.is_empty() {
+            // `-z` rename format: `<add>\t<del>\t\0<orig>\0<new>\0`
+            let _orig = fields.next();
+            match fields.next() {
+                Some(newp) if !newp.is_empty() => newp,
+                _ => continue,
+            }
+        } else {
+            p
+        };
+        if let (Ok(an), Ok(dn)) = (a.parse::<u32>(), d.parse::<u32>()) {
+            map.insert(path.to_string(), (an, dn));
+        }
+    }
+    map
+}
+
+/// Unified diff of one changed file according to `scope`.
+pub fn file_diff(repo: &Repo, c: &Change, scope: DiffScope) -> Vec<DiffLine> {
     let root = Path::new(&repo.root);
     if c.untracked() {
-        let full = root.join(&c.path);
-        // A symlink: show where it points, like git does. Do not follow it: it may
-        // point at a folder, at nothing, or at itself.
-        if let Ok(target) = std::fs::read_link(&full) {
-            return vec![
-                (LineKind::Header, format!("new symlink {} (untracked)", printable(&c.path))),
-                (LineKind::Meta, format!("points to {}", printable(&target.to_string_lossy()))),
-            ];
+        if scope == DiffScope::Staged {
+            return vec![DiffLine {
+                kind: LineKind::Meta,
+                old_no: None,
+                new_no: None,
+                text: "untracked file (not staged)".into(),
+            }];
         }
-        if full.is_dir() {
-            return vec![(LineKind::Meta, "untracked folder".into())];
+        let full = root.join(&c.path);
+        // Never follow symlinks or open FIFOs/sockets!
+        let Ok(meta) = std::fs::symlink_metadata(&full) else {
+            return vec![DiffLine {
+                kind: LineKind::Meta,
+                old_no: None,
+                new_no: None,
+                text: "cannot inspect file".into(),
+            }];
+        };
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = std::fs::read_link(&full) {
+                return vec![
+                    DiffLine {
+                        kind: LineKind::Header,
+                        old_no: None,
+                        new_no: None,
+                        text: format!("new symlink {} (untracked)", printable(&c.path)),
+                    },
+                    DiffLine {
+                        kind: LineKind::Meta,
+                        old_no: None,
+                        new_no: None,
+                        text: format!("points to {}", printable(&target.to_string_lossy())),
+                    },
+                ];
+            }
+        }
+        if meta.file_type().is_dir() {
+            return vec![DiffLine {
+                kind: LineKind::Meta,
+                old_no: None,
+                new_no: None,
+                text: "untracked folder".into(),
+            }];
+        }
+        if !meta.file_type().is_file() {
+            return vec![DiffLine {
+                kind: LineKind::Meta,
+                old_no: None,
+                new_no: None,
+                text: "special file (skipped)".into(),
+            }];
         }
         return match read_capped(&full) {
-            Some(b) => cap_lines(untracked_diff(&c.path, &b), MAX_DIFF_LINES),
-            None => vec![(LineKind::Meta, "cannot read the file".into())],
+            Some(b) => cap_diff_lines(untracked_diff(&c.path, &b), MAX_DIFF_LINES),
+            None => vec![DiffLine {
+                kind: LineKind::Meta,
+                old_no: None,
+                new_no: None,
+                text: "cannot read the file".into(),
+            }],
         };
     }
-    // Without commits, compare with the empty tree.
-    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    let base = if git(root, &["rev-parse", "--verify", "-q", "HEAD"]).is_some() { "HEAD" } else { EMPTY_TREE };
-    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "-M", base, "--"];
+    let base = if repo.branch.has_commits {
+        "HEAD"
+    } else {
+        EMPTY_TREE
+    };
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M"];
+    match scope {
+        DiffScope::All => args.push(base),
+        DiffScope::Staged => {
+            args.push("--cached");
+            args.push(base);
+        }
+        DiffScope::Unstaged => {}
+    }
+    args.push("--");
     if let Some(o) = &c.orig {
         args.push(o);
     }
     args.push(&c.path);
     match git(root, &args) {
-        Some(b) if !b.is_empty() => cap_lines(classify_all(&String::from_utf8_lossy(&b)), MAX_DIFF_LINES),
-        Some(_) => vec![(LineKind::Meta, "no changes against HEAD".into())],
-        None => vec![(LineKind::Meta, "git diff failed".into())],
+        Some(b) if !b.is_empty() => {
+            cap_diff_lines(classify_lines(&String::from_utf8_lossy(&b)), MAX_DIFF_LINES)
+        }
+        Some(_) => vec![DiffLine {
+            kind: LineKind::Meta,
+            old_no: None,
+            new_no: None,
+            text: format!("no {} changes", scope.label()),
+        }],
+        None => vec![DiffLine {
+            kind: LineKind::Meta,
+            old_no: None,
+            new_no: None,
+            text: "git diff failed".into(),
+        }],
     }
 }
 
+/// Stage or unstage one file relative to `repo.root`.
+pub fn stage_file(repo: &Repo, c: &Change, stage: bool) -> bool {
+    let root = Path::new(&repo.root);
+    let args: Vec<&str> = if stage {
+        vec!["add", "--", &c.path]
+    } else if repo.branch.has_commits {
+        vec!["restore", "--staged", "--", &c.path]
+    } else {
+        vec!["rm", "--cached", "-f", "--", &c.path]
+    };
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(root)
+        .args(args);
+    platform::apply_no_window(&mut cmd);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 fn read_capped(p: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
     let f = std::fs::File::open(p).ok()?;
     let mut b = Vec::new();
     f.take(MAX_BYTES as u64).read_to_end(&mut b).ok()?;
@@ -307,11 +633,88 @@ fn read_capped(p: &Path) -> Option<Vec<u8>> {
 /// Files below `dir` that git does not ignore, relative to `dir`, with '/' separators.
 /// None: not a repository.
 pub fn ls_files(dir: &Path) -> Option<Vec<String>> {
-    let out = git(dir, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"])?;
+    let (raw, trunc) = git_raw(
+        dir,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let out = trim_last_nul_record(raw, trunc);
     let text = String::from_utf8_lossy(&out);
-    let mut v: Vec<String> = text.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let mut v: Vec<String> = text
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
     v.dedup();
     Some(v)
+}
+
+/// Zero-subprocess fast branch + worktree check from `.git/HEAD` (or `.git` file).
+/// Returns `(branch_or_short_oid, is_worktree)`. Safe & < 0.1 ms.
+pub fn fast_branch(dir: &Path) -> Option<(String, bool)> {
+    let dot_git = dir.join(".git");
+    let (git_dir, is_worktree) = if dot_git.is_dir() {
+        (dot_git, false)
+    } else if dot_git.is_file() {
+        let content = platform::read_to_string_capped(&dot_git, 4096).ok()?;
+        let rest = content.trim().strip_prefix("gitdir:")?.trim();
+        let target = Path::new(rest);
+        let gd = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            dir.join(target)
+        };
+        let wt = rest.contains("/worktrees/") || rest.contains("\\worktrees\\");
+        (gd, wt)
+    } else {
+        return None;
+    };
+    let head = platform::read_to_string_capped(&git_dir.join("HEAD"), 512).ok()?;
+    let h = head.trim();
+    let label = if let Some(r) = h.strip_prefix("ref: refs/heads/") {
+        r.to_string()
+    } else if let Some(r) = h.strip_prefix("ref: ") {
+        r.to_string()
+    } else if h.chars().count() >= 7 {
+        h.chars().take(7).collect()
+    } else {
+        return None;
+    };
+    Some((printable(&label), is_worktree))
+}
+
+/// Compact summary for the picker Inspector drawer.
+#[derive(Debug, Clone, Default)]
+pub struct RepoSummary {
+    pub branch: Branch,
+    pub changed: usize,
+    pub stashes: usize,
+    pub commits: Vec<String>,
+    pub worktree: bool,
+}
+
+pub fn summary(dir: &Path) -> Option<RepoSummary> {
+    let repo = status(dir)?;
+    let root = Path::new(&repo.root);
+    let commits = git(root, &["log", "--oneline", "-n", "3", "--no-decorate"])
+        .map(|b| String::from_utf8_lossy(&b).lines().map(printable).collect())
+        .unwrap_or_default();
+    let stashes = git(root, &["stash", "list"])
+        .map(|b| String::from_utf8_lossy(&b).lines().count())
+        .unwrap_or(0);
+    let worktree = dir.join(".git").is_file();
+    Some(RepoSummary {
+        branch: repo.branch,
+        changed: repo.changes.len(),
+        stashes,
+        commits,
+        worktree,
+    })
 }
 
 #[cfg(test)]
@@ -326,7 +729,7 @@ mod tests {
         assert_eq!((b.name.as_str(), b.ahead, b.behind), ("main", 2, 1));
         assert_eq!(b.upstream.as_deref(), Some("origin/main"));
         assert_eq!(c.len(), 6);
-        assert_eq!(c[0], Change { x: ' ', y: 'M', path: "src/a.rs".into(), orig: None });
+        assert_eq!(c[0].path, "src/a.rs");
         assert_eq!(c[0].mark(), Mark::Modified);
         assert_eq!(c[1].mark(), Mark::Added);
         assert_eq!(c[2].orig.as_deref(), Some("old b.rs"));
@@ -341,17 +744,25 @@ mod tests {
     fn branch_lines() {
         assert_eq!(parse_branch("main").name, "main");
         assert_eq!(parse_branch("No commits yet on dev").name, "dev");
+        assert!(!parse_branch("No commits yet on dev").has_commits);
         let b = parse_branch("feat...up/feat [behind 3]");
         assert_eq!((b.ahead, b.behind), (0, 3));
         assert_eq!(parse_branch("HEAD (no branch)").name, "HEAD (no branch)");
     }
 
     #[test]
-    fn diff_lines() {
-        let d = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n\\ No newline at end of file\ndiff --git a/y b/y\nBinary files a/y and b/y differ\n";
-        let kinds: Vec<LineKind> = classify_all(d).into_iter().map(|(k, _)| k).collect();
+    fn diff_lines_and_numbers() {
+        let d = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -10,2 +10,2 @@\n ctx\n-old\n+new\n\\ No newline at end of file\ndiff --git a/y b/y\nBinary files a/y and b/y differ\n";
+        let lines = classify_lines(d);
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
         use LineKind::*;
-        assert_eq!(kinds, vec![Header, Header, Header, Header, Hunk, Context, Del, Add, Meta, Header, Meta]);
+        assert_eq!(
+            kinds,
+            vec![Header, Header, Header, Header, Hunk, Context, Del, Add, Meta, Header, Meta]
+        );
+        assert_eq!((lines[5].old_no, lines[5].new_no), (Some(10), Some(10)));
+        assert_eq!((lines[6].old_no, lines[6].new_no), (Some(11), None));
+        assert_eq!((lines[7].old_no, lines[7].new_no), (None, Some(11)));
         // "---" in a hunk is a removed line, not a header.
         assert_eq!(classify("--- x", true), Del);
         assert_eq!(classify("--- x", false), Header);
@@ -359,15 +770,23 @@ mod tests {
 
     #[test]
     fn caps_and_untracked() {
-        let lines: Vec<_> = (0..10).map(|i| (LineKind::Context, i.to_string())).collect();
-        let c = cap_lines(lines, 4);
+        let lines: Vec<_> = (0..10)
+            .map(|i| DiffLine {
+                kind: LineKind::Context,
+                old_no: None,
+                new_no: None,
+                text: i.to_string(),
+            })
+            .collect();
+        let c = cap_diff_lines(lines, 4);
         assert_eq!(c.len(), 5);
-        assert_eq!(c[4].1, "… 6 more lines not shown");
+        assert_eq!(c[4].text, "… 6 more lines not shown");
         let u = untracked_diff("a.txt", b"one\ntwo\n");
-        assert_eq!(u[1], (LineKind::Hunk, "@@ -0,0 +1,2 @@".into()));
-        assert_eq!(u[3], (LineKind::Add, "+two".into()));
+        assert_eq!(u[1].text, "@@ -0,0 +1,2 @@");
+        assert_eq!(u[3].text, "+two");
+        assert_eq!(u[3].new_no, Some(2));
         let bin = untracked_diff("a.bin", b"\x00\x01");
-        assert_eq!(bin[1], (LineKind::Meta, "Binary file".into()));
+        assert_eq!(bin[1].text, "Binary file");
     }
 
     #[test]
@@ -378,15 +797,23 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path();
         let run = |args: &[&str]| {
-            Command::new("git").arg("-C").arg(p).args(args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
         };
-        run(&["init", "-q"]);
+        run(&["init", "-q", "-b", "main"]);
         std::fs::write(p.join("a.txt"), "x\n").unwrap();
         let r = status(p).unwrap();
         assert_eq!(r.changes.len(), 1);
         assert!(r.changes[0].untracked());
-        let diff = file_diff(&r, &r.changes[0]);
-        assert!(diff.iter().any(|(k, l)| *k == LineKind::Add && l == "+x"));
+        let diff = file_diff(&r, &r.changes[0], DiffScope::All);
+        assert!(diff
+            .iter()
+            .any(|l| l.kind == LineKind::Add && l.text == "+x"));
         assert_eq!(ls_files(p).unwrap(), vec!["a.txt".to_string()]);
+        assert_eq!(fast_branch(p), Some(("main".into(), false)));
     }
 }
