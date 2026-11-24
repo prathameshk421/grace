@@ -97,7 +97,10 @@ fn yaml_quote(s: &str) -> String {
 fn cmd_line_for(exe: &str) -> String {
     format!(
         "notifications_command: {}  {MARK}",
-        yaml_quote(&format!("{} session hook aider", platform::quote_cmd(exe)))
+        yaml_quote(&format!(
+            "{} session hook aider",
+            platform::quote_posix(exe)
+        ))
     )
 }
 

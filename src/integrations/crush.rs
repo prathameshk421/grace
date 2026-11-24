@@ -83,7 +83,10 @@ fn is_ours(line: &str) -> bool {
 }
 
 fn block(exe: &str) -> String {
-    let cmd = platform::quote_posix(&format!("{} session hook crush", platform::quote_cmd(exe)));
+    let cmd = platform::quote_posix(&format!(
+        "{} session hook crush",
+        platform::quote_posix(exe)
+    ));
     let mut s = format!("{HEADER}\n");
     for e in EVENTS {
         s.push_str(&format!("hook add {e} --name grace --command {cmd}\n"));

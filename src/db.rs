@@ -152,14 +152,40 @@ impl Db {
             }
         }
         let conn = Connection::open(path)?;
-        configure_defensive(&conn, 2000);
+        configure_defensive(&conn, 5000);
         conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")?;
 
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         if fresh || ver < SCHEMA_VER {
-            conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+            // `PRAGMA journal_mode=WAL` can return SQLITE_BUSY immediately during concurrent
+            // first-open transitions even when busy_timeout is set; retry briefly.
+            let mut last_err = None;
+            for attempt in 0..40u32 {
+                match conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if matches!(
+                            err.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) && attempt < 39 =>
+                    {
+                        last_err = Some(rusqlite::Error::SqliteFailure(err, None));
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e.into());
+            }
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
             let inner_ver: i64 = tx
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -203,7 +229,7 @@ impl Db {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        configure_defensive(&conn, 2000);
+        configure_defensive(&conn, 5000);
         let _ = conn.execute_batch("PRAGMA temp_store = MEMORY;");
         Ok(Some(Db { conn }))
     }
@@ -1142,5 +1168,29 @@ mod tests {
         assert!(db.remove_tool("kiro").unwrap());
         assert!(!db.remove_tool("kiro").unwrap());
         assert_eq!(db.custom_tools().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_fresh_open_does_not_fail_busy() {
+        let d = tempfile::tempdir().unwrap();
+        let db_path = std::sync::Arc::new(d.path().join("race/grace.db"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = db_path.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    let db = Db::open(&p).expect("concurrent fresh Db::open should succeed");
+                    db.record_visit(&format!("/proj/{i}"), 1000 + i as i64)
+                        .expect("record_visit should succeed");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(db.count_dirs().unwrap(), 8);
     }
 }
