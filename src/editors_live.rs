@@ -5,7 +5,6 @@ use crate::import_editors::{config_root, uri_to_path};
 use crate::platform;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 const MAX_STORAGE_JSON_BYTES: usize = 8 << 20;
 
@@ -277,6 +276,7 @@ fn process_listing() -> String {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
+        use std::process::{Command, Stdio};
         // SAFETY: geteuid is always safe and returns the effective user ID.
         let uid = unsafe { libc::geteuid() }.to_string();
         // Both macOS and BSD pgrep support `-u <uid> -lf <pattern>`.
