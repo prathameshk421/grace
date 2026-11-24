@@ -1,13 +1,15 @@
 //! SQLite storage.
 use crate::model::{now, Entry, Session, Stats, Status, Tag};
 use anyhow::{Context, Result};
-use rusqlite::{config::DbConfig, params, Transaction, TransactionBehavior};
+use rusqlite::{config::DbConfig, params, Connection, OpenFlags, Transaction, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct Db {
-    pub conn: rusqlite::Connection,
+    pub conn: Connection,
 }
+
+const SCHEMA_VER: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS dirs(
@@ -41,13 +43,23 @@ CREATE TABLE IF NOT EXISTS sessions(
     tmux_pane TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_path_tool ON sessions(path, tool);
+CREATE INDEX IF NOT EXISTS sessions_open_path_tool ON sessions(path, tool, id DESC) WHERE status != 'done';
 CREATE INDEX IF NOT EXISTS sessions_shell_pid ON sessions(shell_pid);
 CREATE INDEX IF NOT EXISTS sessions_status_updated ON sessions(status, updated_at);
+CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions(updated_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS meta(
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 ";
+
+const UPSERT_DIR_SQL: &str = "INSERT INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)
+ ON CONFLICT(path) DO UPDATE SET
+    last_visit = max(last_visit, ?2),
+    visits = CASE WHEN visits = 0 THEN 1 ELSE visits END";
+
+const UPSERT_TAG_SQL: &str = "INSERT INTO tags(path, tool, count, last_used) VALUES(?1, ?2, 1, ?3)
+ ON CONFLICT(path, tool) DO UPDATE SET count = count + 1, last_used = ?3";
 
 /// Seconds a done session stays visible.
 const DONE_VISIBLE: i64 = 30 * 60;
@@ -56,44 +68,98 @@ const STALE_AFTER: i64 = 12 * 3600;
 /// Seconds before a done row is deleted.
 const PRUNE_AFTER: i64 = 7 * 86400;
 
+/// Optional metadata attached to a live session update.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionMeta<'a> {
+    pub session_id: Option<&'a str>,
+    pub detail: Option<&'a str>,
+    pub tmux_pane: Option<&'a str>,
+}
+
 /// Directory that holds the database file.
 pub fn data_dir() -> Result<PathBuf> {
-    let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    if let Some(d) = non_empty("GRACE_DATA_DIR") {
+    if let Some(d) = crate::platform::env_non_empty("GRACE_DATA_DIR") {
         return Ok(PathBuf::from(d));
     }
     if cfg!(windows) {
-        if let Some(d) = non_empty("LOCALAPPDATA") {
+        if let Some(d) = crate::platform::env_non_empty("LOCALAPPDATA") {
             return Ok(PathBuf::from(d).join("grace"));
         }
     }
-    if let Some(d) = non_empty("XDG_DATA_HOME").filter(|d| Path::new(d).is_absolute()) {
+    if let Some(d) =
+        crate::platform::env_non_empty("XDG_DATA_HOME").filter(|d| Path::new(d).is_absolute())
+    {
         return Ok(PathBuf::from(d).join("grace"));
     }
     let home = crate::platform::home_dir().context("HOME is not set")?;
     Ok(home.join(".local").join("share").join("grace"))
 }
 
+fn configure_defensive(conn: &Connection, timeout_ms: u64) {
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(timeout_ms));
+    let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
+    let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false);
+}
+
+fn restrict_db_files(path: &Path) {
+    crate::platform::restrict_file_0600(path);
+    let s = path.to_string_lossy();
+    let wal = PathBuf::from(format!("{s}-wal"));
+    if wal.exists() {
+        crate::platform::restrict_file_0600(&wal);
+    }
+    let shm = PathBuf::from(format!("{s}-shm"));
+    if shm.exists() {
+        crate::platform::restrict_file_0600(&shm);
+    }
+}
+
+/// Open an arbitrary SQLite file read-only with URI fallback (`mode=ro`, then `immutable=1`).
+pub(crate) fn open_readonly_uri(path: &Path, timeout_ms: u64) -> Option<Connection> {
+    let raw = path.to_string_lossy();
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let conn =
+        Connection::open_with_flags(crate::import_editors::sqlite_uri(&raw, "mode=ro"), flags)
+            .or_else(|_| {
+                Connection::open_with_flags(
+                    crate::import_editors::sqlite_uri(&raw, "immutable=1"),
+                    flags,
+                )
+            })
+            .ok()?;
+    configure_defensive(&conn, timeout_ms);
+    Some(conn)
+}
+
 impl Db {
     /// Open (and create if needed) the database at `path`.
     pub fn open(path: &Path) -> Result<Db> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                crate::platform::create_dir_private(parent)?;
+        let fresh = !path.exists();
+        if fresh {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    crate::platform::create_dir_private(parent)?;
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path);
             }
         }
-        let conn = rusqlite::Connection::open(path)?;
-        crate::platform::restrict_file_0600(path);
-        conn.busy_timeout(std::time::Duration::from_millis(2000))?;
-        let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
-        let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false);
-        conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA synchronous = NORMAL;")?;
-        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+        let conn = Connection::open(path)?;
+        configure_defensive(&conn, 2000);
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")?;
 
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
-        if ver < 1 {
+        if fresh || ver < SCHEMA_VER {
+            conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
             let inner_ver: i64 = tx
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -106,9 +172,17 @@ impl Db {
                         tx.execute(&format!("ALTER TABLE sessions ADD COLUMN {col} TEXT"), [])?;
                     }
                 }
-                tx.execute_batch("PRAGMA user_version = 1;")?;
+            } else if inner_ver < 2 {
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS sessions_open_path_tool ON sessions(path, tool, id DESC) WHERE status != 'done';
+                     CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions(updated_at DESC, id DESC);",
+                )?;
+            }
+            if inner_ver < SCHEMA_VER {
+                tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VER};"))?;
             }
             tx.commit()?;
+            restrict_db_files(path);
         }
         Ok(Db { conn })
     }
@@ -120,11 +194,74 @@ impl Db {
         Ok((Db::open(&file)?, fresh))
     }
 
+    /// Open an existing database read-only. Returns `None` if it does not exist yet.
+    pub fn open_readonly(path: &Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        configure_defensive(&conn, 2000);
+        let _ = conn.execute_batch("PRAGMA temp_store = MEMORY;");
+        Ok(Some(Db { conn }))
+    }
+
+    /// Open the default database read-only when present. Never creates files or acquires write locks.
+    pub fn open_readonly_default() -> Result<Option<Db>> {
+        let file = data_dir()?.join("grace.db");
+        Self::open_readonly(&file)
+    }
+
     fn immediate_tx(&self) -> Result<Transaction<'_>> {
         Ok(Transaction::new_unchecked(
             &self.conn,
             TransactionBehavior::Immediate,
         )?)
+    }
+
+    pub fn data_version(&self) -> i64 {
+        self.conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    pub fn count_dirs(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM dirs", [], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Fast tag normalization without materializing the full Registry.
+    pub fn normalize_tool_tag(&self, name: &str) -> String {
+        let trimmed = name.trim();
+        if let Ok(tag) = self.conn.query_row(
+            "SELECT tag FROM tools WHERE command = ?1 COLLATE NOCASE LIMIT 1",
+            params![trimmed],
+            |r| r.get::<_, String>(0),
+        ) {
+            return tag.to_ascii_lowercase();
+        }
+        if let Some((_, tag, _, _)) = crate::tools::TOOLS
+            .iter()
+            .find(|(cmd, ..)| cmd.eq_ignore_ascii_case(trimmed))
+        {
+            return (*tag).to_string();
+        }
+        let low = trimmed.to_ascii_lowercase();
+        if let Ok(tag) = self.conn.query_row(
+            "SELECT tag FROM tools WHERE LOWER(tag) = ?1 LIMIT 1",
+            params![low],
+            |r| r.get::<_, String>(0),
+        ) {
+            return tag.to_ascii_lowercase();
+        }
+        if let Some((_, tag, _, _)) = crate::tools::TOOLS.iter().find(|(_, tag, ..)| *tag == low) {
+            return (*tag).to_string();
+        }
+        low
     }
 
     pub fn record_visit(&self, path: &str, ts: i64) -> Result<()> {
@@ -138,18 +275,8 @@ impl Db {
 
     pub fn record_tool(&self, path: &str, tool: &str, ts: i64) -> Result<()> {
         let tx = self.immediate_tx()?;
-        tx.execute(
-            "INSERT INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)
-             ON CONFLICT(path) DO UPDATE SET
-                last_visit = max(last_visit, ?2),
-                visits = CASE WHEN visits = 0 THEN 1 ELSE visits END",
-            params![path, ts],
-        )?;
-        tx.execute(
-            "INSERT INTO tags(path, tool, count, last_used) VALUES(?1, ?2, 1, ?3)
-             ON CONFLICT(path, tool) DO UPDATE SET count = count + 1, last_used = ?3",
-            params![path, tool, ts],
-        )?;
+        tx.execute(UPSERT_DIR_SQL, params![path, ts])?;
+        tx.execute(UPSERT_TAG_SQL, params![path, tool, ts])?;
         tx.commit()?;
         Ok(())
     }
@@ -172,19 +299,14 @@ impl Db {
     }
 
     pub fn forget(&self, path: &str) -> Result<bool> {
-        let tx = self.immediate_tx()?;
-        tx.execute("DELETE FROM tags WHERE path = ?1", params![path])?;
-        let n = tx.execute("DELETE FROM dirs WHERE path = ?1", params![path])?;
-        tx.execute("DELETE FROM sessions WHERE path = ?1", params![path])?;
-        tx.commit()?;
-        Ok(n > 0)
+        Ok(self.delete_paths(&[path.to_string()])? > 0)
     }
 
     pub fn list_entries(&self) -> Result<Vec<Entry>> {
         let mut tags: HashMap<String, Vec<Tag>> = HashMap::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT path, tool, count, last_used FROM tags ORDER BY last_used DESC, tool ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, tool, count, last_used FROM tags")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -214,7 +336,14 @@ impl Db {
         let mut out = Vec::new();
         for row in rows {
             let mut e = row?;
-            e.tags = tags.remove(&e.path).unwrap_or_default();
+            if let Some(mut ts) = tags.remove(&e.path) {
+                ts.sort_by(|a, b| {
+                    b.last_used
+                        .cmp(&a.last_used)
+                        .then_with(|| a.tool.cmp(&b.tool))
+                });
+                e.tags = ts;
+            }
             out.push(e);
         }
         Ok(out)
@@ -256,37 +385,17 @@ impl Db {
     }
 
     /// The CLI starts in a folder: mark the session working (new or existing).
-    #[cfg(test)]
     pub fn session_start(
         &self,
         path: &str,
         tool: &str,
         shell_pid: Option<i64>,
+        meta: SessionMeta<'_>,
         ts: i64,
     ) -> Result<()> {
-        self.session_start_ex(path, tool, shell_pid, None, None, None, ts)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn session_start_ex(
-        &self,
-        path: &str,
-        tool: &str,
-        shell_pid: Option<i64>,
-        session_id: Option<&str>,
-        detail: Option<&str>,
-        tmux_pane: Option<&str>,
-        ts: i64,
-    ) -> Result<()> {
-        let sid = session_id.filter(|s| !s.is_empty());
+        let sid = meta.session_id.filter(|s| !s.is_empty());
         let tx = self.immediate_tx()?;
-        tx.execute(
-            "INSERT INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)
-             ON CONFLICT(path) DO UPDATE SET
-                last_visit = max(last_visit, ?2),
-                visits = CASE WHEN visits = 0 THEN 1 ELSE visits END",
-            params![path, ts],
-        )?;
+        tx.execute(UPSERT_DIR_SQL, params![path, ts])?;
         let existing: Option<i64> = if let Some(sid) = sid {
             tx.query_row(
                 "SELECT id FROM sessions WHERE path = ?1 AND tool = ?2 AND session_id = ?3 AND status != 'done'
@@ -319,53 +428,58 @@ impl Db {
                     "UPDATE sessions SET status = 'working', updated_at = ?2,
                         shell_pid = COALESCE(?3, shell_pid),
                         session_id = COALESCE(?4, session_id),
-                        detail = COALESCE(?5, detail),
+                        detail = ?5,
                         tmux_pane = COALESCE(?6, tmux_pane)
                      WHERE id = ?1",
-                    params![id, ts, shell_pid, sid, detail, tmux_pane],
+                    params![id, ts, shell_pid, sid, meta.detail, meta.tmux_pane],
                 )?;
             }
             None => {
                 tx.execute(
                     "INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at, session_id, detail, tmux_pane)
                      VALUES(?1, ?2, 'working', ?3, ?4, ?4, ?5, ?6, ?7)",
-                    params![path, tool, shell_pid, ts, sid, detail, tmux_pane],
+                    params![path, tool, shell_pid, ts, sid, meta.detail, meta.tmux_pane],
                 )?;
             }
         }
-        Self::prune_sessions_tx(&tx, ts)?;
+        // Throttle periodic session table pruning during rapid hook bursts.
+        if (ts & 0xff) == 0 {
+            Self::prune_sessions_tx(&tx, ts)?;
+        }
         tx.commit()?;
         Ok(())
     }
 
     /// An agent hook reports a new status for the matching open session.
-    #[cfg(test)]
-    pub fn session_set(&self, path: &str, tool: &str, status: Status, ts: i64) -> Result<()> {
-        self.session_set_ex(path, tool, status, None, None, None, ts)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn session_set_ex(
+    pub fn session_set(
         &self,
         path: &str,
         tool: &str,
         status: Status,
-        session_id: Option<&str>,
-        detail: Option<&str>,
-        tmux_pane: Option<&str>,
+        meta: SessionMeta<'_>,
         ts: i64,
     ) -> Result<()> {
-        let sid = session_id.filter(|s| !s.is_empty());
+        let sid = meta.session_id.filter(|s| !s.is_empty());
         let tx = self.immediate_tx()?;
         let target_id: Option<i64> = if let Some(sid) = sid {
-            tx.query_row(
-                "SELECT id FROM sessions WHERE path = ?1 AND tool = ?2 AND status != 'done'
-                 AND (session_id = ?3 OR session_id IS NULL)
-                 ORDER BY CASE WHEN session_id = ?3 THEN 0 ELSE 1 END, id DESC LIMIT 1",
-                params![path, tool, sid],
-                |r| r.get(0),
-            )
-            .ok()
+            if status == Status::Done {
+                tx.query_row(
+                    "SELECT id FROM sessions WHERE path = ?1 AND tool = ?2 AND status != 'done' AND session_id = ?3
+                     ORDER BY id DESC LIMIT 1",
+                    params![path, tool, sid],
+                    |r| r.get(0),
+                )
+                .ok()
+            } else {
+                tx.query_row(
+                    "SELECT id FROM sessions WHERE path = ?1 AND tool = ?2 AND status != 'done'
+                     AND (session_id = ?3 OR session_id IS NULL)
+                     ORDER BY CASE WHEN session_id = ?3 THEN 0 ELSE 1 END, id DESC LIMIT 1",
+                    params![path, tool, sid],
+                    |r| r.get(0),
+                )
+                .ok()
+            }
         } else {
             tx.query_row(
                 "SELECT id FROM sessions WHERE path = ?1 AND tool = ?2 AND status != 'done'
@@ -377,47 +491,27 @@ impl Db {
         };
         let mut updated = 0usize;
         if let Some(id) = target_id {
-            let clear_detail = matches!(status, Status::Ready | Status::Done);
-            updated = if clear_detail {
-                tx.execute(
-                    "UPDATE sessions SET status = ?2, updated_at = ?3,
-                        session_id = COALESCE(?4, session_id),
-                        detail = ?5,
-                        tmux_pane = COALESCE(?6, tmux_pane)
-                     WHERE id = ?1",
-                    params![id, status.as_str(), ts, sid, detail, tmux_pane],
-                )?
-            } else {
-                tx.execute(
-                    "UPDATE sessions SET status = ?2, updated_at = ?3,
-                        session_id = COALESCE(?4, session_id),
-                        detail = COALESCE(?5, detail),
-                        tmux_pane = COALESCE(?6, tmux_pane)
-                     WHERE id = ?1",
-                    params![id, status.as_str(), ts, sid, detail, tmux_pane],
-                )?
-            };
+            updated = tx.execute(
+                "UPDATE sessions SET status = ?2, updated_at = ?3,
+                    session_id = COALESCE(?4, session_id),
+                    detail = ?5,
+                    tmux_pane = COALESCE(?6, tmux_pane)
+                 WHERE id = ?1",
+                params![id, status.as_str(), ts, sid, meta.detail, meta.tmux_pane],
+            )?;
         }
         if updated == 0 && status != Status::Done {
-            tx.execute(
-                "INSERT INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)
-                 ON CONFLICT(path) DO UPDATE SET
-                    last_visit = max(last_visit, ?2),
-                    visits = CASE WHEN visits = 0 THEN 1 ELSE visits END",
-                params![path, ts],
-            )?;
-            tx.execute(
-                "INSERT INTO tags(path, tool, count, last_used) VALUES(?1, ?2, 1, ?3)
-                 ON CONFLICT(path, tool) DO UPDATE SET count = count + 1, last_used = ?3",
-                params![path, tool, ts],
-            )?;
+            tx.execute(UPSERT_DIR_SQL, params![path, ts])?;
+            tx.execute(UPSERT_TAG_SQL, params![path, tool, ts])?;
             tx.execute(
                 "INSERT INTO sessions(path, tool, status, shell_pid, started_at, updated_at, session_id, detail, tmux_pane)
                  VALUES(?1, ?2, ?3, NULL, ?4, ?4, ?5, ?6, ?7)",
-                params![path, tool, status.as_str(), ts, sid, detail, tmux_pane],
+                params![path, tool, status.as_str(), ts, sid, meta.detail, meta.tmux_pane],
             )?;
         }
-        Self::prune_sessions_tx(&tx, ts)?;
+        if status == Status::Done || (ts & 0xff) == 0 {
+            Self::prune_sessions_tx(&tx, ts)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -435,46 +529,13 @@ impl Db {
         Ok(())
     }
 
-    /// Open sessions plus sessions done in the last 30 minutes.
-    /// Dead shells and stale sessions are marked done first without resurrecting old ones as "now".
-    pub fn sessions(&self, now: i64) -> Result<Vec<Session>> {
-        let open: Vec<(i64, Option<i64>, i64)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, shell_pid, updated_at FROM sessions WHERE status != 'done'")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
-        let to_close: Vec<(i64, i64)> = open
-            .into_iter()
-            .filter_map(|(id, pid, updated)| {
-                let dead = pid.is_some_and(|p| !crate::platform::pid_alive(p));
-                let stale = now.saturating_sub(updated) > STALE_AFTER;
-                if dead {
-                    Some((id, updated))
-                } else if stale {
-                    Some((id, updated.saturating_add(STALE_AFTER).min(now)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !to_close.is_empty() {
-            let tx = self.immediate_tx()?;
-            for (id, end_ts) in to_close {
-                tx.execute(
-                    "UPDATE sessions SET status = 'done', updated_at = ?2, detail = NULL WHERE id = ?1",
-                    params![id, end_ts],
-                )?;
-            }
-            Self::prune_sessions_tx(&tx, now)?;
-            tx.commit()?;
-        }
+    fn load_visible_sessions(&self, now: i64) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, tool, status, shell_pid, started_at, updated_at, session_id, detail, tmux_pane
-             FROM sessions
-             WHERE status != 'done' OR updated_at >= ?1
-             ORDER BY updated_at DESC, id DESC",
+             FROM sessions WHERE status != 'done'
+             UNION ALL
+             SELECT id, path, tool, status, shell_pid, started_at, updated_at, session_id, detail, tmux_pane
+             FROM sessions WHERE status = 'done' AND updated_at >= ?1",
         )?;
         let rows = stmt.query_map(params![now.saturating_sub(DONE_VISIBLE)], |r| {
             let st: String = r.get(3)?;
@@ -491,7 +552,87 @@ impl Db {
                 tmux_pane: r.get(9)?,
             })
         })?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Read-only inspection of `(live_active_count, dead_or_stale_count)` for `grace doctor`.
+    pub fn inspect_sessions(&self, now: i64) -> Result<(usize, usize)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT shell_pid, updated_at FROM sessions WHERE status != 'done'")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let (mut active, mut stale_or_dead) = (0usize, 0usize);
+        for row in rows {
+            let (pid, updated) = row?;
+            let dead = pid.is_some_and(|p| !crate::platform::pid_alive(p));
+            let stale = now.saturating_sub(updated) > STALE_AFTER;
+            if dead || stale {
+                stale_or_dead += 1;
+            } else {
+                active += 1;
+            }
+        }
+        Ok((active, stale_or_dead))
+    }
+
+    /// Open sessions plus sessions done in the last 30 minutes.
+    /// Dead shells and stale sessions are marked done first without resurrecting old ones as "now".
+    pub fn sessions(&self, now: i64) -> Result<Vec<Session>> {
+        let mut all = self.load_visible_sessions(now)?;
+        let to_close: Vec<(i64, i64, i64)> = all
+            .iter()
+            .filter(|s| s.status != Status::Done)
+            .filter_map(|s| {
+                let dead = s.shell_pid.is_some_and(|p| !crate::platform::pid_alive(p));
+                let stale = now.saturating_sub(s.updated_at) > STALE_AFTER;
+                if dead {
+                    Some((s.id, s.updated_at, s.updated_at))
+                } else if stale {
+                    Some((
+                        s.id,
+                        s.updated_at.saturating_add(STALE_AFTER).min(now),
+                        s.updated_at,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !to_close.is_empty() {
+            let tx = self.immediate_tx()?;
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE sessions SET status = 'done', updated_at = ?2, detail = NULL
+                     WHERE id = ?1 AND status != 'done' AND updated_at = ?3",
+                )?;
+                for &(id, end_ts, prev_ts) in &to_close {
+                    stmt.execute(params![id, end_ts, prev_ts])?;
+                }
+            }
+            Self::prune_sessions_tx(&tx, now)?;
+            tx.commit()?;
+
+            let cutoff = now.saturating_sub(DONE_VISIBLE);
+            for (id, end_ts, prev_ts) in to_close {
+                if let Some(s) = all
+                    .iter_mut()
+                    .find(|s| s.id == id && s.status != Status::Done && s.updated_at == prev_ts)
+                {
+                    s.status = Status::Done;
+                    s.updated_at = end_ts;
+                    s.detail = None;
+                }
+            }
+            all.retain(|s| s.status != Status::Done || s.updated_at >= cutoff);
+        }
+        all.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(all)
     }
 
     /// Read a value from the `meta` table.
@@ -514,7 +655,27 @@ impl Db {
         Ok(())
     }
 
+    /// Write multiple meta key-value pairs in a single transaction.
+    pub fn save_meta_batch(&self, pairs: &[(&str, &str)]) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let tx = self.immediate_tx()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+            )?;
+            for (k, v) in pairs {
+                stmt.execute(params![k, v])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Insert a dir only if missing. Returns true if inserted.
+    #[cfg(test)]
     pub fn import_dir(&self, path: &str, ts: i64, tool: Option<&str>) -> Result<bool> {
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)",
@@ -529,43 +690,103 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Batch import open-editor `(path, tag)` entries in a single immediate transaction.
+    pub fn import_open_editors_batch(&self, items: &[(&str, &str)], ts: i64) -> Result<usize> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.immediate_tx()?;
+        let mut inserted = 0usize;
+        {
+            let mut dir_stmt = tx.prepare(
+                "INSERT OR IGNORE INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)",
+            )?;
+            let mut tag_stmt = tx.prepare(
+                "INSERT OR IGNORE INTO tags(path, tool, count, last_used) VALUES(?1, ?2, 1, ?3)",
+            )?;
+            for &(path, tag) in items {
+                inserted += dir_stmt.execute(params![path, ts])?;
+                tag_stmt.execute(params![path, tag, ts])?;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Batch import many `(path, ts)` entries in a single immediate transaction.
-    /// Returns the number of distinct entries attempted.
+    /// Returns the number of newly inserted folder entries.
     pub fn import_dirs_batch(&self, items: &[(String, i64)], tool: Option<&str>) -> Result<usize> {
         if items.is_empty() {
             return Ok(0);
         }
         let tx = self.immediate_tx()?;
-        let mut dir_stmt =
-            tx.prepare("INSERT OR IGNORE INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)")?;
-        let mut tag_stmt = if tool.is_some() {
-            Some(tx.prepare(
-                "INSERT OR IGNORE INTO tags(path, tool, count, last_used) VALUES(?1, ?2, 1, ?3)",
-            )?)
-        } else {
-            None
-        };
-        for (path, ts) in items {
-            dir_stmt.execute(params![path, ts])?;
-            if let (Some(t), Some(ref mut st)) = (tool, &mut tag_stmt) {
-                st.execute(params![path, t, ts])?;
+        let mut added = 0usize;
+        {
+            let mut dir_stmt = tx.prepare(
+                "INSERT OR IGNORE INTO dirs(path, visits, last_visit) VALUES(?1, 1, ?2)",
+            )?;
+            let mut tag_stmt = if tool.is_some() {
+                Some(tx.prepare(
+                    "INSERT OR IGNORE INTO tags(path, tool, count, last_used) VALUES(?1, ?2, 1, ?3)",
+                )?)
+            } else {
+                None
+            };
+            for (path, ts) in items {
+                added += dir_stmt.execute(params![path, ts])?;
+                if let (Some(t), Some(ref mut st)) = (tool, &mut tag_stmt) {
+                    st.execute(params![path, t, ts])?;
+                }
             }
         }
-        drop(dir_stmt);
-        drop(tag_stmt);
         tx.commit()?;
-        Ok(items.len())
+        Ok(added)
+    }
+
+    /// List `(path, pinned)` directly from `dirs` without touching `tags`.
+    pub fn list_dir_flags(&self) -> Result<Vec<(String, bool)>> {
+        let mut stmt = self.conn.prepare("SELECT path, pinned FROM dirs")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Tracked directories that no longer exist on disk (optionally older than `older_than_days`).
     pub fn list_missing(&self, older_than_days: Option<i64>, now: i64) -> Result<Vec<Entry>> {
         let cutoff = older_than_days.map(|d| now.saturating_sub(d.saturating_mul(86400)));
-        let entries = self.list_entries()?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| !Path::new(&e.path).is_dir())
-            .filter(|e| cutoff.is_none_or(|c| e.last_visit <= c))
-            .collect())
+        let mut out = Vec::new();
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(Entry {
+                path: r.get(0)?,
+                visits: r.get(1)?,
+                last_visit: r.get(2)?,
+                pinned: r.get::<_, i64>(3)? != 0,
+                tags: Vec::new(),
+            })
+        };
+        if let Some(c) = cutoff {
+            let mut stmt = self.conn.prepare(
+                "SELECT path, visits, last_visit, pinned FROM dirs WHERE last_visit <= ?1",
+            )?;
+            let rows = stmt.query_map(params![c], map_row)?;
+            for r in rows {
+                let e = r?;
+                if !Path::new(&e.path).is_dir() {
+                    out.push(e);
+                }
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, visits, last_visit, pinned FROM dirs")?;
+            let rows = stmt.query_map([], map_row)?;
+            for r in rows {
+                let e = r?;
+                if !Path::new(&e.path).is_dir() {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Delete multiple folder paths and their tags/sessions in one transaction.
@@ -575,24 +796,24 @@ impl Db {
         }
         let tx = self.immediate_tx()?;
         let mut n = 0usize;
-        for p in paths {
-            tx.execute("DELETE FROM tags WHERE path = ?1", params![p])?;
-            n += tx.execute("DELETE FROM dirs WHERE path = ?1", params![p])?;
-            tx.execute("DELETE FROM sessions WHERE path = ?1", params![p])?;
+        {
+            let mut del_tags = tx.prepare("DELETE FROM tags WHERE path = ?1")?;
+            let mut del_dirs = tx.prepare("DELETE FROM dirs WHERE path = ?1")?;
+            let mut del_sess = tx.prepare("DELETE FROM sessions WHERE path = ?1")?;
+            for p in paths {
+                del_tags.execute(params![p])?;
+                n += del_dirs.execute(params![p])?;
+                del_sess.execute(params![p])?;
+            }
         }
         tx.commit()?;
         Ok(n)
     }
 
-    /// Collect aggregate stats for `grace stats` and `grace doctor`.
+    /// Collect aggregate stats for `grace stats`.
     pub fn stats(&self, now: i64) -> Result<Stats> {
         let mut entries = self.list_entries()?;
         let total_dirs = entries.len();
-        let existing_dirs = entries
-            .iter()
-            .filter(|e| Path::new(&e.path).is_dir())
-            .count();
-        let missing_dirs = total_dirs.saturating_sub(existing_dirs);
         let pinned_dirs = entries.iter().filter(|e| e.pinned).count();
         let total_visits: i64 = entries
             .iter()
@@ -612,15 +833,14 @@ impl Db {
             .map(|(k, (runs, folders))| (k, runs, folders))
             .collect();
         top_tools.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-        crate::rank::sort_entries(&mut entries, now);
+
+        // Single pass of `is_dir()` before sorting top dirs.
         entries.retain(|e| Path::new(&e.path).is_dir());
+        let existing_dirs = entries.len();
+        let missing_dirs = total_dirs.saturating_sub(existing_dirs);
+        crate::rank::sort_entries(&mut entries, now);
         entries.truncate(5);
-        let live_sessions = self
-            .sessions(now)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| s.status != Status::Done)
-            .count();
+        let (live_sessions, _) = self.inspect_sessions(now).unwrap_or((0, 0));
         Ok(Stats {
             total_dirs,
             existing_dirs,
@@ -643,7 +863,7 @@ impl Db {
     }
 }
 
-fn has_column(conn: &rusqlite::Connection, table: &str, col: &str) -> Result<bool> {
+fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
     for r in rows {
@@ -696,7 +916,6 @@ mod tests {
     #[test]
     fn pin_and_forget() {
         let (_d, db) = temp_db();
-        // Unpin on untracked folder inserts nothing.
         assert!(!db.set_pinned("/missing", false).unwrap());
         assert!(find(&db, "/missing").is_none());
         db.set_pinned("/p", true).unwrap();
@@ -710,13 +929,17 @@ mod tests {
     }
 
     #[test]
-    fn import_does_not_overwrite() {
+    fn import_does_not_overwrite_and_counts_new_rows() {
         let (_d, db) = temp_db();
         db.record_visit("/i", 100).unwrap();
         assert!(!db.import_dir("/i", 5, Some("claude")).unwrap());
         assert_eq!(find(&db, "/i").unwrap().last_visit, 100);
         assert!(db.import_dir("/j", 5, Some("claude")).unwrap());
         assert_eq!(find(&db, "/j").unwrap().tags.len(), 1);
+        let added = db
+            .import_dirs_batch(&[("/j".into(), 9), ("/k".into(), 10)], Some("claude"))
+            .unwrap();
+        assert_eq!(added, 1);
     }
 
     fn status_of(db: &Db, now: i64, path: &str) -> Option<Status> {
@@ -731,14 +954,16 @@ mod tests {
     fn session_lifecycle() {
         let (_d, db) = temp_db();
         let me = std::process::id() as i64;
-        db.session_start("/s", "claude", Some(me), 100).unwrap();
+        db.session_start("/s", "claude", Some(me), SessionMeta::default(), 100)
+            .unwrap();
         assert_eq!(status_of(&db, 101, "/s"), Some(Status::Working));
         assert!(find(&db, "/s").is_some());
-        db.session_set("/s", "claude", Status::Waiting, 110)
+        db.session_set("/s", "claude", Status::Waiting, SessionMeta::default(), 110)
             .unwrap();
         assert_eq!(status_of(&db, 111, "/s"), Some(Status::Waiting));
         // A second start reuses the open session.
-        db.session_start("/s", "claude", None, 120).unwrap();
+        db.session_start("/s", "claude", None, SessionMeta::default(), 120)
+            .unwrap();
         let all = db.sessions(121).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(
@@ -750,45 +975,87 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_sessions_by_session_id() {
+    fn concurrent_sessions_by_session_id_and_detail_clearing() {
         let (_d, db) = temp_db();
-        db.session_set_ex(
+        db.session_set(
             "/p",
             "claude",
             Status::Working,
-            Some("s1"),
-            Some("Bash"),
-            None,
+            SessionMeta {
+                session_id: Some("s1"),
+                detail: Some("Bash"),
+                tmux_pane: None,
+            },
             100,
         )
         .unwrap();
-        db.session_set_ex(
+        db.session_set(
             "/p",
             "claude",
             Status::Waiting,
-            Some("s2"),
-            Some("permission"),
-            None,
+            SessionMeta {
+                session_id: Some("s2"),
+                detail: Some("permission"),
+                tmux_pane: None,
+            },
             105,
+        )
+        .unwrap();
+        // Working without detail clears prior Waiting detail.
+        db.session_set(
+            "/p",
+            "claude",
+            Status::Working,
+            SessionMeta {
+                session_id: Some("s2"),
+                detail: None,
+                tmux_pane: None,
+            },
+            107,
         )
         .unwrap();
         let all = db.sessions(110).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].session_id.as_deref(), Some("s2"));
-        assert_eq!(all[0].detail.as_deref(), Some("permission"));
+        assert_eq!(all[0].detail, None);
         assert_eq!(all[1].session_id.as_deref(), Some("s1"));
         assert_eq!(all[1].detail.as_deref(), Some("Bash"));
     }
 
     #[test]
-    fn session_set_without_start() {
+    fn done_with_session_id_never_closes_unrelated_session() {
         let (_d, db) = temp_db();
-        db.session_set("/h", "codex", Status::Waiting, 10).unwrap();
+        let me = std::process::id() as i64;
+        db.session_start("/p", "claude", Some(me), SessionMeta::default(), 100)
+            .unwrap();
+        // Ending unknown session "other" must NOT touch the null-session_id session.
+        db.session_set(
+            "/p",
+            "claude",
+            Status::Done,
+            SessionMeta {
+                session_id: Some("other"),
+                detail: None,
+                tmux_pane: None,
+            },
+            105,
+        )
+        .unwrap();
+        assert_eq!(status_of(&db, 106, "/p"), Some(Status::Working));
+    }
+
+    #[test]
+    fn session_set_without_start_and_tag() {
+        let (_d, db) = temp_db();
+        db.session_set("/h", "codex", Status::Waiting, SessionMeta::default(), 10)
+            .unwrap();
         assert_eq!(status_of(&db, 11, "/h"), Some(Status::Waiting));
-        db.session_set("/h", "codex", Status::Done, 12).unwrap();
+        assert!(find(&db, "/h").unwrap().has_tag("codex"));
+        db.session_set("/h", "codex", Status::Done, SessionMeta::default(), 12)
+            .unwrap();
         assert_eq!(status_of(&db, 13, "/h"), Some(Status::Done));
-        // Done for an unknown session inserts nothing.
-        db.session_set("/none", "codex", Status::Done, 14).unwrap();
+        db.session_set("/none", "codex", Status::Done, SessionMeta::default(), 14)
+            .unwrap();
         assert_eq!(status_of(&db, 15, "/none"), None);
     }
 
@@ -796,28 +1063,45 @@ mod tests {
     #[test]
     fn dead_pid_is_done() {
         let (_d, db) = temp_db();
-        db.session_start("/d", "claude", Some(999_999_999), 100)
-            .unwrap();
+        db.session_start(
+            "/d",
+            "claude",
+            Some(999_999_999),
+            SessionMeta::default(),
+            100,
+        )
+        .unwrap();
         assert_eq!(status_of(&db, 101, "/d"), Some(Status::Done));
-        // Dead session from days ago does NOT resurrect as "done now".
-        db.session_start("/old-dead", "claude", Some(999_999_998), 100)
-            .unwrap();
+        db.session_start(
+            "/old-dead",
+            "claude",
+            Some(999_999_998),
+            SessionMeta::default(),
+            100,
+        )
+        .unwrap();
         assert_eq!(status_of(&db, 3 * 86400, "/old-dead"), None);
     }
 
     #[test]
     fn stale_and_old_rules() {
         let (_d, db) = temp_db();
-        db.session_set("/w", "claude", Status::Working, 0).unwrap();
+        db.session_set("/w", "claude", Status::Working, SessionMeta::default(), 0)
+            .unwrap();
         assert_eq!(status_of(&db, 11 * 3600, "/w"), Some(Status::Working));
-        // Stale after 12 h, then visible as done for 30 min only.
         assert_eq!(status_of(&db, 12 * 3600 + 1, "/w"), Some(Status::Done));
         assert_eq!(status_of(&db, 12 * 3600 + 33 * 60, "/w"), None);
-        // Old done rows are pruned.
-        db.session_set("/r", "claude", Status::Ready, 0).unwrap();
-        assert_eq!(status_of(&db, 12 * 3600 + 1, "/r"), Some(Status::Done));
-        db.session_set("/x", "claude", Status::Waiting, 8 * 86400)
+        db.session_set("/r", "claude", Status::Ready, SessionMeta::default(), 0)
             .unwrap();
+        assert_eq!(status_of(&db, 12 * 3600 + 1, "/r"), Some(Status::Done));
+        db.session_set(
+            "/x",
+            "claude",
+            Status::Waiting,
+            SessionMeta::default(),
+            8 * 86400,
+        )
+        .unwrap();
         let n: i64 = db
             .conn
             .query_row("SELECT count(*) FROM sessions WHERE path = '/w'", [], |r| {
@@ -828,13 +1112,20 @@ mod tests {
     }
 
     #[test]
-    fn meta_round_trip_and_integrity() {
-        let (_d, db) = temp_db();
+    fn meta_round_trip_and_integrity_and_readonly() {
+        let (d, db) = temp_db();
+        let db_path = d.path().join("sub/grace.db");
         assert!(db.integrity_check().unwrap());
         assert_eq!(db.get_meta("k").unwrap(), None);
-        db.set_meta("k", "1").unwrap();
-        db.set_meta("k", "2").unwrap();
-        assert_eq!(db.get_meta("k").unwrap().as_deref(), Some("2"));
+        db.save_meta_batch(&[("k", "1"), ("k2", "2")]).unwrap();
+        assert_eq!(db.get_meta("k").unwrap().as_deref(), Some("1"));
+        assert_eq!(db.get_meta("k2").unwrap().as_deref(), Some("2"));
+        assert_eq!(db.data_version(), db.data_version());
+        let ro = Db::open_readonly(&db_path).unwrap().unwrap();
+        assert_eq!(ro.get_meta("k").unwrap().as_deref(), Some("1"));
+        assert!(Db::open_readonly(&d.path().join("missing.db"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -847,25 +1138,9 @@ mod tests {
         let t = db.custom_tools().unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(t[0], ("kiro".into(), "kiro2".into(), "kiro x".into()));
+        assert_eq!(db.normalize_tool_tag("KIRO"), "kiro2");
         assert!(db.remove_tool("kiro").unwrap());
         assert!(!db.remove_tool("kiro").unwrap());
         assert_eq!(db.custom_tools().unwrap().len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod session_tag_tests {
-    use super::*;
-    use crate::model::Status;
-
-    #[test]
-    fn hook_session_tags_the_folder() {
-        let d = tempfile::tempdir().unwrap();
-        let db = Db::open(&d.path().join("g.db")).unwrap();
-        db.session_set("/p", "claude", Status::Waiting, 100)
-            .unwrap();
-        let e = db.list_entries().unwrap();
-        assert_eq!(e.len(), 1);
-        assert!(e[0].has_tag("claude"));
     }
 }

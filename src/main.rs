@@ -176,7 +176,7 @@ enum Cmd {
         /// Agent name (e.g. claude, codex, gemini, agy). Omit to inspect all.
         target: Option<String>,
         /// Setup (or --remove) all detected CLI agents at once
-        #[arg(long)]
+        #[arg(long, conflicts_with = "target")]
         all: bool,
         /// Undo the setup
         #[arg(long)]
@@ -278,6 +278,12 @@ enum SessionCmd {
         /// PID of the shell that runs the agent
         #[arg(long)]
         pid: Option<i64>,
+        /// Also record the tool run for this folder
+        #[arg(long)]
+        tag: bool,
+        /// Folder argument of the command, relative to <path>
+        #[arg(long)]
+        target: Option<String>,
     },
     /// The shell finished the agent command
     End {
@@ -371,14 +377,16 @@ fn current_tmux_pane() -> Option<String> {
 pub(crate) fn load(
     db: &db::Db,
     reg: &tools::Registry,
+    ignore: &platform::IgnoreMatcher,
     tag: Option<&str>,
 ) -> Result<Vec<model::Entry>> {
     let now = model::now();
+    let norm_tag = tag.map(|t| reg.normalize_tag(t));
     let mut entries: Vec<_> = db
         .list_entries()?
         .into_iter()
-        .filter(|e| Path::new(&e.path).is_dir())
-        .filter(|e| tag.is_none_or(|t| e.has_tag(&reg.normalize_tag(t))))
+        .filter(|e| norm_tag.as_deref().is_none_or(|t| e.has_tag(t)))
+        .filter(|e| !ignore.is_ignored(&e.path) && Path::new(&e.path).is_dir())
         .collect();
     rank::sort_entries(&mut entries, now);
     Ok(entries)
@@ -394,55 +402,79 @@ fn collect_branches(entries: &[model::Entry]) -> std::collections::HashMap<Strin
     out
 }
 
-fn collect_hub_paths() -> Vec<String> {
-    if cfg!(windows) {
-        return Vec::new();
-    }
-    let t = hub::Tmux::new();
-    if !t.ok(&["has-session", "-t", &format!("={}", hub::SESSION)]) {
-        return Vec::new();
-    }
-    t.windows()
-        .map(|ws| ws.into_iter().map(|(_, p)| p).collect())
-        .unwrap_or_default()
-}
-
 /// Session commands: no first-run import, so they stay fast.
 fn run_session(action: SessionCmd) -> Result<()> {
-    if let SessionCmd::Hook { agent } = action {
-        // A hook must never fail loudly and never print to stdout.
-        let _ = run_hook(agent);
-        return Ok(());
-    }
-    let (db, _) = db::Db::open_default()?;
-    let reg = tools::Registry::from_db(&db)?;
-    let now = model::now();
-    let pane = current_tmux_pane();
     match action {
-        SessionCmd::Start { path, tool, pid } => {
-            let tool = reg.normalize_tag(&tool);
-            let p = resolve(Some(path))?;
-            if reg.is_ai_tag(&tool) && !platform::ignored(&p) {
-                db.session_start_ex(&p, &tool, pid, None, None, pane.as_deref(), now)?;
-                hub::sync_glyphs_if_running(&db);
-            }
+        SessionCmd::Hook { agent } => {
+            // A hook must never fail loudly and never print to stdout.
+            let _ = run_hook(agent);
+            return Ok(());
         }
         SessionCmd::End { pid } => {
-            db.session_end_pid(pid, now)?;
-            hub::sync_glyphs_if_running(&db);
+            let (db, _) = db::Db::open_default()?;
+            db.session_end_pid(pid, model::now())?;
+            hub::sync_glyphs_if_running(&db, None);
+            return Ok(());
+        }
+        SessionCmd::Start {
+            path,
+            tool,
+            pid,
+            tag,
+            target,
+        } => {
+            let cfg = config::load();
+            let ignore = platform::IgnoreMatcher::new(&cfg.ignore);
+            let (db, _) = db::Db::open_default()?;
+            let reg = tools::Registry::from_db(&db)?;
+            let now = model::now();
+            let pane = current_tmux_pane();
+            let tool = reg.normalize_tag(&tool);
+            let cwd = resolve(Some(path))?;
+            let p = platform::tag_target(&cwd, target.as_deref());
+            if reg.is_ai_tag(&tool) && !ignore.is_ignored(&p) {
+                if tag {
+                    db.record_tool(&p, &tool, now)?;
+                }
+                db.session_start(
+                    &p,
+                    &tool,
+                    pid,
+                    db::SessionMeta {
+                        tmux_pane: pane.as_deref(),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+                hub::sync_glyphs_if_running(&db, Some(&cfg));
+            }
         }
         SessionCmd::Set { path, tool, status } => {
             let Some(status) = model::Status::parse(&status) else {
                 bail!("status must be working, waiting, ready or done");
             };
+            let cfg = config::load();
+            let ignore = platform::IgnoreMatcher::new(&cfg.ignore);
+            let (db, _) = db::Db::open_default()?;
+            let reg = tools::Registry::from_db(&db)?;
+            let now = model::now();
+            let pane = current_tmux_pane();
             let tool = reg.normalize_tag(&tool);
             let p = resolve(Some(path))?;
-            if reg.is_ai_tag(&tool) && !platform::ignored(&p) {
-                db.session_set_ex(&p, &tool, status, None, None, pane.as_deref(), now)?;
-                hub::sync_glyphs_if_running(&db);
+            if reg.is_ai_tag(&tool) && !ignore.is_ignored(&p) {
+                db.session_set(
+                    &p,
+                    &tool,
+                    status,
+                    db::SessionMeta {
+                        tmux_pane: pane.as_deref(),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+                hub::sync_glyphs_if_running(&db, Some(&cfg));
             }
         }
-        SessionCmd::Hook { .. } => {}
     }
     Ok(())
 }
@@ -511,27 +543,31 @@ fn set_hook_status(
     session_id: Option<&str>,
     detail: Option<&str>,
 ) -> Result<()> {
+    let cfg = config::load();
+    let ignore = platform::IgnoreMatcher::new(&cfg.ignore);
     let p = resolve(cwd.map(PathBuf::from))?;
-    if platform::ignored(&p) {
+    if ignore.is_ignored(&p) {
         return Ok(());
     }
     let (db, _) = db::Db::open_default()?;
-    let tool = tools::Registry::from_db(&db)?.normalize_tag(tool);
+    let tool = db.normalize_tool_tag(tool);
     let pane = current_tmux_pane();
     let sid = session_id.filter(|s| !s.is_empty());
     let det = detail
         .map(platform::sanitize_display)
         .filter(|s| !s.is_empty());
-    db.session_set_ex(
+    db.session_set(
         &p,
         &tool,
         status,
-        sid,
-        det.as_deref(),
-        pane.as_deref(),
+        db::SessionMeta {
+            session_id: sid,
+            detail: det.as_deref(),
+            tmux_pane: pane.as_deref(),
+        },
         model::now(),
     )?;
-    hub::sync_glyphs_if_running(&db);
+    hub::sync_glyphs_if_running(&db, Some(&cfg));
     Ok(())
 }
 
@@ -550,10 +586,11 @@ fn editor_choice(
         });
     }
     if let Some(tag) = e.tags.iter().find(|t| reg.is_editor_tag(&t.tool)) {
-        if let Some((prog, in_terminal)) = reg.editor_launch(&tag.tool) {
+        if let Some((prog, mut args, in_terminal)) = reg.editor_launch(&tag.tool) {
+            args.push(e.path.clone());
             return Some(picker::EditorChoice {
                 prog,
-                args: vec![e.path.clone()],
+                args,
                 in_terminal,
             });
         }
@@ -564,11 +601,7 @@ fn editor_choice(
             if tools::valid_launch(prog) {
                 let mut args: Vec<String> = parts.map(String::from).collect();
                 args.push(e.path.clone());
-                let base = Path::new(prog)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(prog);
-                let in_terminal = matches!(base, "nvim" | "vim" | "vi" | "nano" | "hx" | "helix");
+                let in_terminal = tools::is_terminal_editor(prog);
                 return Some(picker::EditorChoice {
                     prog: prog.to_string(),
                     args,
@@ -609,15 +642,21 @@ fn resume_tag<'a>(reg: &tools::Registry, e: &'a model::Entry) -> Option<&'a str>
 /// Folders with a live session, most urgent first, and the sessions.
 fn session_data(
     db: &db::Db,
-    reg: &tools::Registry,
+    ignore: &platform::IgnoreMatcher,
     now: i64,
 ) -> Result<(Vec<model::Entry>, Vec<model::Session>)> {
     let mut sessions = db.sessions(now)?;
     session::sort_sessions(&mut sessions);
     let best = picker::best_by_path(&sessions);
-    let mut entries: Vec<_> = load(db, reg, None)?
+    if best.is_empty() {
+        return Ok((Vec::new(), sessions));
+    }
+    let mut entries: Vec<_> = db
+        .list_entries()?
         .into_iter()
-        .filter(|e| best.contains_key(&e.path))
+        .filter(|e| {
+            best.contains_key(&e.path) && !ignore.is_ignored(&e.path) && Path::new(&e.path).is_dir()
+        })
         .collect();
     let key = |e: &model::Entry| {
         let b = &best[&e.path];
@@ -667,66 +706,91 @@ fn detect_missing_shell_hook() -> Option<String> {
     Some(line.into())
 }
 
-/// Run the picker and print the result for the shell function.
-/// Line 1 is the folder to cd to (empty: stay). Line 2, if present, is a static command to run.
-#[allow(clippy::too_many_arguments)]
-fn travel(
-    db: &db::Db,
-    reg: &tools::Registry,
-    cfg: &config::Config,
-    data: picker::Data,
+struct TravelOpts<'a> {
+    db: &'a db::Db,
+    reg: &'a tools::Registry,
+    cfg: &'a config::Config,
+    ignore: &'a platform::IgnoreMatcher,
     view: picker::View,
-    tag: Option<&str>,
-    query: &str,
+    tag: Option<&'a str>,
+    query: &'a str,
     open: bool,
     full: bool,
     initial_toast: Option<(String, theme::ToastKind)>,
-) -> Result<()> {
-    let editors_snap = data.editors.clone();
+}
+
+/// Run the picker and print the result for the shell function.
+/// Line 1 is the folder to cd to (empty: stay). Line 2, if present, is a static command to run.
+fn travel(t: TravelOpts<'_>, data: picker::Data) -> Result<()> {
+    let TravelOpts {
+        db,
+        reg,
+        cfg,
+        ignore,
+        view,
+        tag,
+        query,
+        open,
+        full,
+        initial_toast,
+    } = t;
     let entries_snap = data.entries.clone();
+    let sessions_snap = data.sessions.clone();
     let tag_owned = tag.map(String::from);
     let reload_tag = tag_owned.clone();
     let reload = move |cur_view: picker::View| {
         let now = model::now();
         let (entries, sessions) = match cur_view {
             picker::View::Folders => (
-                load(db, reg, reload_tag.as_deref()).ok()?,
+                load(db, reg, ignore, reload_tag.as_deref()).ok()?,
                 db.sessions(now).unwrap_or_default(),
             ),
-            picker::View::Sessions => session_data(db, reg, now).ok()?,
+            picker::View::Sessions => session_data(db, ignore, now).ok()?,
         };
         let branches = collect_branches(&entries);
-        let hub_paths = collect_hub_paths();
         Some(picker::Data {
             entries,
             sessions,
-            editors: editors_live::open_editors(),
+            editors: editors_live::open_editors(ignore),
             branches,
-            hub_paths,
         })
     };
     let bg_tag = tag_owned;
+    let bg_ignore = ignore.clone();
     let after_first_frame: Option<Box<dyn FnOnce() -> Option<picker::Data> + Send + 'static>> =
         Some(Box::new(move || {
             let branches = collect_branches(&entries_snap);
-            let hub_paths = collect_hub_paths();
-            let (bg_db, _) = db::Db::open_default().ok()?;
-            let bg_reg = tools::Registry::from_db(&bg_db).ok()?;
-            editors_live::refresh_if_stale_with(&bg_db, Some(&editors_snap));
-            let now = model::now();
-            let (entries, sessions) = match view {
-                picker::View::Folders => (
-                    load(&bg_db, &bg_reg, bg_tag.as_deref()).ok()?,
-                    bg_db.sessions(now).unwrap_or_default(),
-                ),
-                picker::View::Sessions => session_data(&bg_db, &bg_reg, now).ok()?,
-            };
+            let editors = editors_live::open_editors(&bg_ignore);
+            let mut entries = entries_snap;
+            let mut sessions = sessions_snap;
+            if let Ok((bg_db, _)) = db::Db::open_default() {
+                if editors_live::refresh_if_stale_with(&bg_db, Some(&editors), &bg_ignore) {
+                    let now = model::now();
+                    if let Ok(bg_reg) = tools::Registry::from_db(&bg_db) {
+                        match view {
+                            picker::View::Folders => {
+                                if let Ok(reloaded) =
+                                    load(&bg_db, &bg_reg, &bg_ignore, bg_tag.as_deref())
+                                {
+                                    entries = reloaded;
+                                }
+                                sessions = bg_db.sessions(now).unwrap_or(sessions);
+                            }
+                            picker::View::Sessions => {
+                                if let Ok((reloaded, s)) = session_data(&bg_db, &bg_ignore, now) {
+                                    entries = reloaded;
+                                    sessions = s;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Some(picker::Data {
                 entries,
                 sessions,
-                editors: editors_snap,
+                editors,
                 branches,
-                hub_paths,
             })
         }));
 
@@ -749,7 +813,7 @@ fn travel(
     );
 
     let import_all_now = Some(Box::new(move || -> std::result::Result<String, String> {
-        let count: usize = import_editors::import_all(db)
+        let count: usize = import_editors::import_all(db, ignore)
             .into_iter()
             .map(|(_, n)| n)
             .sum();
@@ -761,7 +825,7 @@ fn travel(
     let add_cwd_now = Some(Box::new(move || -> std::result::Result<String, String> {
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         let norm = platform::normalize(&cwd);
-        if platform::ignored(&norm) {
+        if ignore.is_ignored(&norm) {
             return Err("Current folder matches an ignore rule".into());
         }
         db.record_visit(&norm, model::now())
@@ -785,15 +849,38 @@ fn travel(
         add_cwd_now,
         after_first_frame,
         reload: Some(Box::new(reload)),
-        reload_every: match view {
+        reload_every: Some(Box::new(|v| match v {
             picker::View::Folders => None,
             picker::View::Sessions => Some(std::time::Duration::from_secs(2)),
-        },
+        })),
     };
-    let Some(choice) = picker::pick(data, query, model::now(), opts)? else {
+    let Some(choice) = picker::pick(data, query, model::now(), cfg, opts)? else {
         std::process::exit(1);
     };
     emit_choice(reg, &choice, open)
+}
+
+fn emit_editor_cmd(ed: &picker::EditorChoice) -> Result<String> {
+    validate_emit_line(&ed.prog, "editor command")?;
+    for a in &ed.args {
+        validate_emit_line(a, "editor argument")?;
+    }
+    let parts = std::iter::once(&ed.prog)
+        .chain(ed.args.iter())
+        .map(|s| {
+            if cfg!(windows) {
+                platform::quote_powershell(s)
+            } else {
+                platform::quote_posix(s)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cfg!(windows) {
+        Ok(format!("& {parts}"))
+    } else {
+        Ok(parts)
+    }
 }
 
 fn emit_choice(reg: &tools::Registry, choice: &picker::Choice, open: bool) -> Result<()> {
@@ -802,9 +889,9 @@ fn emit_choice(reg: &tools::Registry, choice: &picker::Choice, open: bool) -> Re
         picker::Action::Editor(ed) => {
             if ed.in_terminal {
                 validate_emit_line(&e.path, "path")?;
-                validate_emit_line(&ed.prog, "editor command")?;
+                let cmd = emit_editor_cmd(ed)?;
                 println!("{}", e.path);
-                println!("{}", ed.prog);
+                println!("{cmd}");
             } else {
                 spawn_gui_editor(ed)?;
             }
@@ -828,56 +915,21 @@ fn emit_choice(reg: &tools::Registry, choice: &picker::Choice, open: bool) -> Re
     Ok(())
 }
 
-struct TermColors {
-    gold: &'static str,
-    green: &'static str,
-    cyan: &'static str,
-    yellow: &'static str,
-    dim: &'static str,
-    bold: &'static str,
-    reset: &'static str,
-}
-
-impl TermColors {
-    fn stdout() -> Self {
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-        let clicolor_off = std::env::var("CLICOLOR").is_ok_and(|v| v == "0");
-        let dumb = std::env::var("TERM").is_ok_and(|v| v == "dumb");
-        if std::io::stdout().is_terminal() && !no_color && !clicolor_off && !dumb {
-            Self {
-                gold: "\x1b[1;33m",
-                green: "\x1b[32m",
-                cyan: "\x1b[36m",
-                yellow: "\x1b[33m",
-                dim: "\x1b[2m",
-                bold: "\x1b[1m",
-                reset: "\x1b[0m",
-            }
-        } else {
-            Self {
-                gold: "",
-                green: "",
-                cyan: "",
-                yellow: "",
-                dim: "",
-                bold: "",
-                reset: "",
-            }
-        }
-    }
-}
-
-fn first_run_import_if_needed(db: &db::Db, fresh: bool) -> Option<(String, theme::ToastKind)> {
+fn first_run_import_if_needed(
+    db: &db::Db,
+    ignore: &platform::IgnoreMatcher,
+    fresh: bool,
+) -> Option<(String, theme::ToastKind)> {
     if !fresh {
         return None;
     }
-    let _ = import::import_claude(db);
-    let _ = import_editors::import_editors_quiet(db);
+    let _ = import::import_claude(db, ignore);
+    let _ = import_editors::import_editors_quiet(db, ignore);
     editors_live::mark_imported_now(db);
-    let n = db.list_entries().map(|v| v.len()).unwrap_or(0);
+    let n = db.count_dirs().unwrap_or(0);
     if n > 0 {
         Some((
-            format!("✦ Welcome to grace — discovered {n} folder(s)"),
+            format!("Welcome to grace — discovered {n} folder(s)"),
             theme::ToastKind::Info,
         ))
     } else {
@@ -885,12 +937,12 @@ fn first_run_import_if_needed(db: &db::Db, fresh: bool) -> Option<(String, theme
     }
 }
 
-fn print_stats(stats: &model::Stats, home: Option<&str>) {
-    let c = TermColors::stdout();
+fn print_stats(cfg: &config::Config, stats: &model::Stats, home: Option<&str>) {
+    let c = theme::Ansi::stdout(cfg);
     println!();
     println!(
-        "  {}✦ grace stats{} {}— tracked workspace overview{}",
-        c.gold, c.reset, c.dim, c.reset
+        "  {}{} grace stats{} {}— tracked workspace overview{}",
+        c.gold, c.star, c.reset, c.dim, c.reset
     );
     println!();
     println!(
@@ -939,7 +991,8 @@ fn print_stats(stats: &model::Stats, home: Option<&str>) {
         println!("  {}Top folders{}", c.bold, c.reset);
         for e in &stats.top_dirs {
             let pin = if e.pinned { "★ " } else { "  " };
-            let shown = platform::sanitize_display(&picker::display_path(&e.path, home));
+            let disp = picker::display_path(&e.path, home);
+            let shown = platform::sanitize_display(&disp);
             println!(
                 "    {}{}{} {:<44} {}{} visits{}",
                 c.gold, pin, c.reset, shown, c.dim, e.visits, c.reset
@@ -982,30 +1035,39 @@ where
 
 fn run() -> Result<()> {
     let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
-    let cfg = config::load();
     match cli.cmd {
+        Some(Cmd::Completions { shell }) => {
+            let Some(sh) = shell::Shell::parse(&shell) else {
+                bail!("unsupported shell: {shell} (use zsh, bash, fish, powershell or pwsh)");
+            };
+            print!("{}", shell::completions(sh));
+            return Ok(());
+        }
+        Some(Cmd::Init { shell }) => {
+            let Some(sh) = shell::Shell::parse(&shell) else {
+                bail!("unsupported shell: {shell} (use zsh, bash, fish, powershell or pwsh)");
+            };
+            let reg = match db::Db::open_readonly_default()? {
+                Some(db) => tools::Registry::from_db(&db)?,
+                None => tools::Registry::new(&[]),
+            };
+            print!(
+                "{}",
+                shell::init(sh, &reg.command_names(), &reg.ai_command_names())
+            );
+            return Ok(());
+        }
+        Some(Cmd::Setup {
+            target,
+            all,
+            remove,
+        }) => return setup::run(target.as_deref(), all, remove),
         Some(Cmd::Session { action }) => return run_session(action),
         Some(Cmd::Doctor { fix }) => return doctor::run(fix),
-        Some(Cmd::Diff { path }) => {
-            let p = resolve(path)?;
-            let in_hub = hub::pane_in_hub(hub::Role::Diff.as_str());
-            let th = theme::Theme::from_env_and_config(&cfg);
-            tui::run(&mut diffview::DiffView::new(p.into(), th).in_hub(in_hub))?;
-            return hub::pane_closed(in_hub, hub::Role::Diff);
-        }
-        Some(Cmd::Tree { path }) => {
-            let p = resolve(path)?;
-            let in_hub = hub::pane_in_hub(hub::Role::Tree.as_str());
-            let th = theme::Theme::from_env_and_config(&cfg);
-            tui::run(&mut treeview::TreeView::new(p.into(), th).in_hub(in_hub))?;
-            return hub::pane_closed(in_hub, hub::Role::Tree);
-        }
         Some(Cmd::Hub {
             action: Some(HubCmd::Shell { run: cmd }),
             ..
-        }) => {
-            return hub::shell(cmd.as_deref());
-        }
+        }) => return hub::shell(cmd.as_deref()),
         Some(Cmd::Hub {
             action: Some(HubCmd::Keys { wait }),
             ..
@@ -1014,39 +1076,38 @@ fn run() -> Result<()> {
             action: Some(HubCmd::Quit),
             ..
         }) => return hub::quit(),
-        Some(Cmd::Init { shell }) => {
-            let Some(sh) = shell::Shell::parse(&shell) else {
-                bail!("unsupported shell: {shell} (use zsh, bash, fish, powershell or pwsh)");
-            };
-            let (db, _) = db::Db::open_default()?;
-            let reg = tools::Registry::from_db(&db)?;
-            print!(
-                "{}",
-                shell::init(sh, &reg.command_names(), &reg.ai_command_names())
-            );
-            return Ok(());
+        Some(Cmd::Diff { path }) => {
+            let cfg = config::load();
+            let p = resolve(path)?;
+            let in_hub = hub::pane_in_hub(hub::Role::Diff.as_str());
+            let th = theme::Theme::from_env_and_config(&cfg);
+            tui::run(
+                &mut diffview::DiffView::new(p.into(), th)
+                    .in_hub(in_hub)
+                    .with_editor(cfg.editor.clone()),
+            )?;
+            return hub::pane_closed(in_hub, hub::Role::Diff);
         }
-        Some(Cmd::Completions { shell }) => {
-            let Some(sh) = shell::Shell::parse(&shell) else {
-                bail!("unsupported shell: {shell} (use zsh, bash, fish, powershell or pwsh)");
-            };
-            print!("{}", shell::completions(sh));
-            return Ok(());
-        }
-        Some(Cmd::Setup {
-            target,
-            all,
-            remove,
-        }) => {
-            return setup::run(target.as_deref(), all, remove);
+        Some(Cmd::Tree { path }) => {
+            let cfg = config::load();
+            let p = resolve(path)?;
+            let in_hub = hub::pane_in_hub(hub::Role::Tree.as_str());
+            let th = theme::Theme::from_env_and_config(&cfg);
+            tui::run(
+                &mut treeview::TreeView::new(p.into(), th)
+                    .in_hub(in_hub)
+                    .with_editor(cfg.editor.clone()),
+            )?;
+            return hub::pane_closed(in_hub, hub::Role::Tree);
         }
         _ => {}
     }
 
     let full = cli.full || std::env::var("GRACE_FULLSCREEN").is_ok_and(|v| v == "1");
-    let (db, fresh) = db::Db::open_default()?;
-    let reg = tools::Registry::from_db(&db)?;
     let now = model::now();
+    let cfg = config::load();
+    let ignore = platform::IgnoreMatcher::new(&cfg.ignore);
+    let (db, fresh) = db::Db::open_default()?;
     let home = platform::home_dir().map(|h| platform::clean_path_str(&h.to_string_lossy()));
 
     let default_pick = || Cmd::Pick {
@@ -1057,27 +1118,30 @@ fn run() -> Result<()> {
 
     match cli.cmd.unwrap_or_else(default_pick) {
         Cmd::Pick { tag, open, query } => {
-            let toast = first_run_import_if_needed(&db, fresh);
-            let entries = load(&db, &reg, tag.as_deref())?;
+            let reg = tools::Registry::from_db(&db)?;
+            let toast = first_run_import_if_needed(&db, &ignore, fresh);
+            let entries = load(&db, &reg, &ignore, tag.as_deref())?;
             let data = picker::Data {
                 entries,
                 sessions: db.sessions(now).unwrap_or_default(),
-                editors: editors_live::open_editors(),
+                editors: Vec::new(),
                 branches: std::collections::HashMap::new(),
-                hub_paths: Vec::new(),
             };
             let q = query.as_deref().unwrap_or("");
             travel(
-                &db,
-                &reg,
-                &cfg,
+                TravelOpts {
+                    db: &db,
+                    reg: &reg,
+                    cfg: &cfg,
+                    ignore: &ignore,
+                    view: picker::View::Folders,
+                    tag: tag.as_deref(),
+                    query: q,
+                    open,
+                    full,
+                    initial_toast: toast,
+                },
                 data,
-                picker::View::Folders,
-                tag.as_deref(),
-                q,
-                open,
-                full,
-                toast,
             )?;
         }
         Cmd::Sessions {
@@ -1111,7 +1175,7 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             if list {
-                let c = TermColors::stdout();
+                let c = theme::Ansi::stdout(&cfg);
                 let mut sessions = db.sessions(now)?;
                 session::sort_sessions(&mut sessions);
                 for s in &sessions {
@@ -1140,29 +1204,32 @@ fn run() -> Result<()> {
                 }
                 return Ok(());
             }
-            let (entries, sessions) = session_data(&db, &reg, now)?;
+            let (entries, sessions) = session_data(&db, &ignore, now)?;
             if entries.is_empty() {
                 bail!("no live sessions. Run `grace setup --all` (or `grace setup claude`), then start the agent");
             }
+            let reg = tools::Registry::from_db(&db)?;
             let data = picker::Data {
                 entries,
                 sessions,
-                editors: editors_live::open_editors(),
+                editors: Vec::new(),
                 branches: std::collections::HashMap::new(),
-                hub_paths: Vec::new(),
             };
             let q = query.as_deref().unwrap_or("");
             travel(
-                &db,
-                &reg,
-                &cfg,
+                TravelOpts {
+                    db: &db,
+                    reg: &reg,
+                    cfg: &cfg,
+                    ignore: &ignore,
+                    view: picker::View::Sessions,
+                    tag: None,
+                    query: q,
+                    open,
+                    full,
+                    initial_toast: None,
+                },
                 data,
-                picker::View::Sessions,
-                None,
-                q,
-                open,
-                full,
-                None,
             )?;
         }
         Cmd::Hub {
@@ -1171,7 +1238,7 @@ fn run() -> Result<()> {
             no_attach,
         } => match action {
             None => {
-                let _ = first_run_import_if_needed(&db, fresh);
+                let _ = first_run_import_if_needed(&db, &ignore, fresh);
                 let p = resolve(path)?;
                 if !Path::new(&p).is_dir() {
                     bail!("not a folder: {p}");
@@ -1179,25 +1246,29 @@ fn run() -> Result<()> {
                 hub::start(&db, &p, !no_attach)?
             }
             Some(HubCmd::Toggle { what, window }) => hub::toggle(&db, &what, window.as_deref())?,
-            Some(HubCmd::Sidebar { path }) => hub::run_sidebar(&db, &reg, &resolve(Some(path))?)?,
+            Some(HubCmd::Sidebar { path }) => {
+                let reg = tools::Registry::from_db(&db)?;
+                hub::run_sidebar(&db, &reg, &ignore, &resolve(Some(path))?)?
+            }
             Some(HubCmd::Shell { .. }) | Some(HubCmd::Keys { .. }) | Some(HubCmd::Quit) => {}
         },
         Cmd::Add { path } => {
             let p = resolve(Some(path))?;
-            if !platform::ignored(&p) {
+            if !ignore.is_ignored(&p) {
                 db.record_visit(&p, now)?;
             }
         }
         Cmd::Tag { path, tool, target } => {
             let cwd = resolve(Some(path))?;
             let p = platform::tag_target(&cwd, target.as_deref());
-            if !platform::ignored(&p) {
-                db.record_tool(&p, &reg.normalize_tag(&tool), now)?;
+            if !ignore.is_ignored(&p) {
+                db.record_tool(&p, &db.normalize_tool_tag(&tool), now)?;
             }
         }
         Cmd::List { tag, json } => {
-            let _ = first_run_import_if_needed(&db, fresh);
-            let entries = load(&db, &reg, tag.as_deref())?;
+            let reg = tools::Registry::from_db(&db)?;
+            let _ = first_run_import_if_needed(&db, &ignore, fresh);
+            let entries = load(&db, &reg, &ignore, tag.as_deref())?;
             if json {
                 let items: Vec<_> = entries
                     .iter()
@@ -1218,7 +1289,7 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&items)?);
                 return Ok(());
             }
-            let c = TermColors::stdout();
+            let c = theme::Ansi::stdout(&cfg);
             for e in entries {
                 let tags: Vec<_> = e
                     .tags
@@ -1250,9 +1321,16 @@ fn run() -> Result<()> {
         }
         Cmd::Pin { path } => {
             let p = resolve(path)?;
+            if !Path::new(&p).is_dir() {
+                bail!("not a folder: {p}");
+            }
+            if ignore.is_ignored(&p) {
+                bail!("folder matches an ignore rule: {p}");
+            }
             db.set_pinned(&p, true)?;
             if std::io::stderr().is_terminal() {
-                eprintln!("★ pinned {}", platform::sanitize_display(&p));
+                let a = theme::Ansi::stderr(&cfg);
+                eprintln!("{} pinned {}", a.star, platform::sanitize_display(&p));
             }
         }
         Cmd::Unpin { path } => {
@@ -1284,7 +1362,7 @@ fn run() -> Result<()> {
                 println!("No missing folders to prune.");
                 return Ok(());
             }
-            let c = TermColors::stdout();
+            let c = theme::Ansi::stdout(&cfg);
             for e in &missing {
                 println!(
                     "  {}{}{} {}",
@@ -1306,22 +1384,22 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Stats => {
-            let _ = first_run_import_if_needed(&db, fresh);
+            let _ = first_run_import_if_needed(&db, &ignore, fresh);
             let s = db.stats(now)?;
-            print_stats(&s, home.as_deref());
+            print_stats(&cfg, &s, home.as_deref());
         }
         Cmd::Import { source } => {
-            let c = TermColors::stdout();
+            let c = theme::Ansi::stdout(&cfg);
             if source == "all" {
                 let mut total = 0usize;
-                for (name, n) in import_editors::import_all(&db) {
+                for (name, n) in import_editors::import_all(&db, &ignore) {
                     total += n;
                     println!("  {}{:<12}{} {:>4} folders", c.cyan, name, c.reset, n);
                 }
                 editors_live::mark_imported_now(&db);
                 println!("  {}total: {total} imported entries{}", c.dim, c.reset);
             } else {
-                match import_editors::import_source(&db, &source) {
+                match import_editors::import_source(&db, &source, &ignore) {
                     Some(n) => println!("  {}{source}{}: {n} folders", c.cyan, c.reset),
                     None => println!("  {}{source}{}: not found", c.dim, c.reset),
                 }
@@ -1338,7 +1416,10 @@ fn run() -> Result<()> {
                 let launch = launch.unwrap_or_else(|| command.clone());
                 tools::validate(&command, &tag, &launch)?;
                 db.add_tool(&command, &tag, &launch)?;
-                eprintln!("✓ added {command} → [{tag}]. {NEW_TERMINAL}");
+                eprintln!(
+                    "{} added {command} → [{tag}]. {NEW_TERMINAL}",
+                    theme::Ansi::stderr(&cfg).check
+                );
             }
             ToolCmd::Rm { command } => {
                 if db.remove_tool(&command)? {
@@ -1353,8 +1434,8 @@ fn run() -> Result<()> {
                 }
             }
             ToolCmd::List => {
-                let c = TermColors::stdout();
-                for t in reg.tools() {
+                let c = theme::Ansi::stdout(&cfg);
+                for t in tools::Registry::from_db(&db)?.tools() {
                     println!(
                         "{}{:<16}{} {:<16} {:<24} {}{}{}",
                         c.cyan,
@@ -1449,6 +1530,47 @@ mod tests {
                 ..
             })
         ));
+
+        assert!(parse_cli_from(["grace", "setup", "--all", "claude"]).is_err());
+
+        let c = parse_cli_from([
+            "grace", "session", "start", "--tag", "--pid", "42", "--target", "sub", "--", "/proj",
+            "claude",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Session {
+                action: SessionCmd::Start {
+                    pid: Some(42),
+                    tag: true,
+                    target: Some(ref tgt),
+                    ref tool,
+                    ..
+                }
+            }) if tgt == "sub" && tool == "claude"
+        ));
+    }
+
+    #[test]
+    fn emit_editor_cmd_preserves_args_and_quotes() {
+        let ed = picker::EditorChoice {
+            prog: "nvim".into(),
+            args: vec!["-u".into(), "NONE".into(), "/tmp/my project".into()],
+            in_terminal: true,
+        };
+        let cmd = emit_editor_cmd(&ed).unwrap();
+        assert!(cmd.contains("nvim"), "{cmd}");
+        assert!(cmd.contains("-u"), "{cmd}");
+        assert!(cmd.contains("NONE"), "{cmd}");
+        assert!(cmd.contains("'/tmp/my project'"), "{cmd}");
+
+        let bad = picker::EditorChoice {
+            prog: "nvim".into(),
+            args: vec!["bad\narg".into()],
+            in_terminal: true,
+        };
+        assert!(emit_editor_cmd(&bad).is_err());
     }
 
     #[test]

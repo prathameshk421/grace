@@ -25,12 +25,6 @@ pub fn claude_status_for(event: &str, ntype: &str) -> Option<Status> {
     }
 }
 
-/// Backward-compatible status helper for callers/tests without notification_type.
-#[cfg(test)]
-pub fn claude_status(event: &str) -> Option<Status> {
-    claude_status_for(event, "")
-}
-
 pub(crate) fn non_empty_str(v: &Value, key: &str) -> Option<String> {
     v.get(key)
         .and_then(Value::as_str)
@@ -50,11 +44,10 @@ pub fn parse_claude_event(json: &str) -> Option<HookEvent> {
             "permission_prompt" => Some("permission".into()),
             "elicitation_dialog" => Some("question".into()),
             "" => None,
-            other => Some(crate::platform::sanitize_display(other)),
+            other => Some(crate::platform::sanitize_display(other).into_owned()),
         },
-        "PreToolUse" | "PostToolUse" => {
-            non_empty_str(&v, "tool_name").map(|t| crate::platform::sanitize_display(&t))
-        }
+        "PreToolUse" | "PostToolUse" => non_empty_str(&v, "tool_name")
+            .map(|t| crate::platform::sanitize_display(&t).into_owned()),
         _ => None,
     };
     Some(HookEvent {
@@ -63,13 +56,6 @@ pub fn parse_claude_event(json: &str) -> Option<HookEvent> {
         session_id: non_empty_str(&v, "session_id"),
         detail,
     })
-}
-
-/// Parse the Claude Code hook JSON. Returns (status, cwd). None: bad JSON or ignored event.
-#[cfg(test)]
-pub fn parse_claude_hook(json: &str) -> Option<(Status, Option<String>)> {
-    let ev = parse_claude_event(json)?;
-    Some((ev.status, ev.cwd))
 }
 
 /// Split the args of `session hook codex`. The last arg is the Codex JSON.
@@ -95,13 +81,6 @@ pub fn parse_codex_event(json: &str) -> Option<(Option<String>, Option<String>)>
     Some((non_empty_str(&v, "cwd"), non_empty_str(&v, "thread-id")))
 }
 
-/// Parse the Codex CLI `notify` JSON. Returns the cwd (None inside: use the current dir)
-/// when the event is `agent-turn-complete`. Outer None: bad JSON or ignored event.
-#[cfg(test)]
-pub fn parse_codex_notify(json: &str) -> Option<Option<String>> {
-    parse_codex_event(json).map(|(cwd, _)| cwd)
-}
-
 /// Sort key: waiting first, then ready, then working, then done. Newest first inside each group.
 pub fn sort_sessions(list: &mut [Session]) {
     list.sort_by(|a, b| {
@@ -118,11 +97,14 @@ mod tests {
 
     #[test]
     fn claude_events() {
-        assert_eq!(claude_status("SessionStart"), Some(Status::Ready));
-        assert_eq!(claude_status("UserPromptSubmit"), Some(Status::Working));
-        assert_eq!(claude_status("PreToolUse"), Some(Status::Working));
-        assert_eq!(claude_status("PostToolUse"), Some(Status::Working));
-        assert_eq!(claude_status("Notification"), Some(Status::Waiting));
+        assert_eq!(claude_status_for("SessionStart", ""), Some(Status::Ready));
+        assert_eq!(
+            claude_status_for("UserPromptSubmit", ""),
+            Some(Status::Working)
+        );
+        assert_eq!(claude_status_for("PreToolUse", ""), Some(Status::Working));
+        assert_eq!(claude_status_for("PostToolUse", ""), Some(Status::Working));
+        assert_eq!(claude_status_for("Notification", ""), Some(Status::Waiting));
         assert_eq!(
             claude_status_for("Notification", "idle_prompt"),
             Some(Status::Ready)
@@ -132,38 +114,36 @@ mod tests {
             claude_status_for("Notification", "permission_prompt"),
             Some(Status::Waiting)
         );
-        assert_eq!(claude_status("Stop"), Some(Status::Ready));
-        assert_eq!(claude_status("SubagentStop"), None);
-        assert_eq!(claude_status("SessionEnd"), Some(Status::Done));
-        assert_eq!(claude_status("Other"), None);
+        assert_eq!(claude_status_for("Stop", ""), Some(Status::Ready));
+        assert_eq!(claude_status_for("SubagentStop", ""), None);
+        assert_eq!(claude_status_for("SessionEnd", ""), Some(Status::Done));
+        assert_eq!(claude_status_for("Other", ""), None);
     }
 
     #[test]
     fn claude_json() {
         let j = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","cwd":"/tmp/x","session_id":"s1"}"#;
-        assert_eq!(
-            parse_claude_hook(j),
-            Some((Status::Waiting, Some("/tmp/x".into())))
-        );
         let ev = parse_claude_event(j).unwrap();
+        assert_eq!(ev.status, Status::Waiting);
+        assert_eq!(ev.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(ev.session_id.as_deref(), Some("s1"));
         assert_eq!(ev.detail.as_deref(), Some("permission"));
+        let ev2 = parse_claude_event(
+            r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","cwd":"/tmp/x"}"#,
+        )
+        .unwrap();
         assert_eq!(
-            parse_claude_hook(
-                r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","cwd":"/tmp/x"}"#
-            ),
-            Some((Status::Ready, Some("/tmp/x".into())))
+            (ev2.status, ev2.cwd.as_deref()),
+            (Status::Ready, Some("/tmp/x"))
         );
+        let stop = parse_claude_event(r#"{"hook_event_name":"Stop"}"#).unwrap();
+        assert_eq!((stop.status, stop.cwd), (Status::Ready, None));
         assert_eq!(
-            parse_claude_hook(r#"{"hook_event_name":"Stop"}"#),
-            Some((Status::Ready, None))
-        );
-        assert_eq!(
-            parse_claude_hook(r#"{"hook_event_name":"SubagentStop"}"#),
+            parse_claude_event(r#"{"hook_event_name":"SubagentStop"}"#),
             None
         );
-        assert_eq!(parse_claude_hook("not json"), None);
-        assert_eq!(parse_claude_hook(""), None);
+        assert_eq!(parse_claude_event("not json"), None);
+        assert_eq!(parse_claude_event(""), None);
     }
 
     #[test]
@@ -183,17 +163,16 @@ mod tests {
     #[test]
     fn codex_json() {
         let j = r#"{"type":"agent-turn-complete","cwd":"/p","turn-id":"1","thread-id":"t1"}"#;
-        assert_eq!(parse_codex_notify(j), Some(Some("/p".into())));
         assert_eq!(
             parse_codex_event(j),
             Some((Some("/p".into()), Some("t1".into())))
         );
         assert_eq!(
-            parse_codex_notify(r#"{"type":"agent-turn-complete"}"#),
-            Some(None)
+            parse_codex_event(r#"{"type":"agent-turn-complete"}"#),
+            Some((None, None))
         );
-        assert_eq!(parse_codex_notify(r#"{"type":"other","cwd":"/p"}"#), None);
-        assert_eq!(parse_codex_notify("{"), None);
+        assert_eq!(parse_codex_event(r#"{"type":"other","cwd":"/p"}"#), None);
+        assert_eq!(parse_codex_event("{"), None);
     }
 
     #[test]

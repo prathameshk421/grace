@@ -5,8 +5,8 @@ use crate::platform;
 use crate::theme::{Theme, ToastKind};
 use crate::tui::{self, Flow};
 use crate::widgets::{
-    center_msg, cut, cut_tail, fit_end, hint_line, push_fit_coalesced, render_scrollbar, sw,
-    toast_line, Toast,
+    center_msg, cut, cut_tail, fit_end, hint_line, is_plain_char, push_fit_coalesced,
+    render_scrollbar, slice_scrollbar, spaces, sw, toast_line, DoubleClick, Toast,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::{
@@ -17,7 +17,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use std::time::{Duration, Instant};
@@ -69,15 +69,20 @@ pub fn build_rows(entries: &[Entry], best: &Best, query: &str) -> Vec<Row> {
     rows
 }
 
-pub type Reload<'a> = Box<dyn FnMut() -> Option<Data> + 'a>;
+pub type Reload<'a> = Box<dyn FnMut() -> Option<(Data, Vec<String>)> + 'a>;
 pub type Go<'a> = Box<dyn FnMut(&Entry, bool) -> Result<(), String> + 'a>;
 
 pub struct Sidebar<'a> {
     data: Data,
+    hub_paths: Vec<String>,
     best: Best,
     query: String,
     pattern: Option<Pattern>,
     matcher: Matcher,
+    utf32_buf: Vec<char>,
+    idx_buf: Vec<u32>,
+    hl_buf: Vec<usize>,
+    tags_buf: Vec<String>,
     rows: Vec<Row>,
     selected: usize,
     offset: usize,
@@ -85,14 +90,13 @@ pub struct Sidebar<'a> {
     current: String,
     home: Option<String>,
     theme: Theme,
-    in_hub: bool,
     focused: bool,
     meta_cache: String,
     start: Instant,
     toast: Option<Toast>,
     animating: bool,
     list_area: Rect,
-    last_click: Option<(usize, Instant)>,
+    last_click: DoubleClick,
     reload: Reload<'a>,
     go: Go<'a>,
 }
@@ -100,6 +104,7 @@ pub struct Sidebar<'a> {
 impl<'a> Sidebar<'a> {
     pub fn new(
         data: Data,
+        hub_paths: Vec<String>,
         current: &str,
         theme: Theme,
         home: Option<String>,
@@ -108,10 +113,15 @@ impl<'a> Sidebar<'a> {
     ) -> Sidebar<'a> {
         let mut s = Sidebar {
             data: Data::default(),
+            hub_paths: Vec::new(),
             best: Best::new(),
             query: String::new(),
             pattern: None,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            utf32_buf: Vec::new(),
+            idx_buf: Vec::new(),
+            hl_buf: Vec::new(),
+            tags_buf: Vec::new(),
             rows: Vec::new(),
             selected: 0,
             offset: 0,
@@ -119,33 +129,27 @@ impl<'a> Sidebar<'a> {
             current: current.to_string(),
             home,
             theme,
-            in_hub: true,
             focused: true,
             meta_cache: String::new(),
             start: Instant::now(),
             toast: None,
             animating: false,
             list_area: Rect::default(),
-            last_click: None,
+            last_click: DoubleClick::default(),
             reload,
             go,
         };
-        s.set_data(data);
+        s.set_data(data, hub_paths);
         let cur = s.current.clone();
         s.refilter(Some(&cur));
         s
     }
 
-    #[cfg(test)]
-    pub fn in_hub(mut self, yes: bool) -> Sidebar<'a> {
-        self.in_hub = yes;
-        self
-    }
-
-    fn set_data(&mut self, data: Data) {
+    fn set_data(&mut self, data: Data, hub_paths: Vec<String>) {
         let keep = self.selected_entry().map(|e| e.path.clone());
         self.best = best_by_path(&data.sessions);
         self.data = data;
+        self.hub_paths = hub_paths;
         self.refilter(keep.as_deref());
     }
 
@@ -215,12 +219,6 @@ fn picker_first(rows: &[Row]) -> Option<usize> {
     rows.iter().position(|r| matches!(r, Row::Item(_)))
 }
 
-fn is_plain_char(k: &KeyEvent) -> bool {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = k.modifiers.contains(KeyModifiers::ALT);
-    (!ctrl && !alt) || (cfg!(windows) && ctrl && alt)
-}
-
 impl tui::App for Sidebar<'_> {
     fn draw(&mut self, f: &mut Frame) {
         draw(f, self);
@@ -242,11 +240,8 @@ impl tui::App for Sidebar<'_> {
                 if self.list_area.contains(pos) {
                     let idx = self.offset + (m.row - self.list_area.y) as usize;
                     if matches!(self.rows.get(idx), Some(Row::Item(_))) {
-                        let dbl = self.last_click.is_some_and(|(p, at)| {
-                            p == idx && at.elapsed() < Duration::from_millis(400)
-                        });
+                        let dbl = self.last_click.click(idx);
                         self.selected = idx;
-                        self.last_click = Some((idx, Instant::now()));
                         if dbl {
                             self.choose(false);
                         }
@@ -284,10 +279,24 @@ impl tui::App for Sidebar<'_> {
         Flow::Continue
     }
 
-    fn refresh(&mut self) {
-        if let Some(d) = (self.reload)() {
-            self.set_data(d);
+    fn refresh(&mut self) -> bool {
+        let expired = self
+            .toast
+            .as_ref()
+            .is_some_and(|x| Instant::now() >= x.until);
+        if expired {
+            self.toast = None;
         }
+        if let Some((d, hp)) = (self.reload)() {
+            let changed = d.entries != self.data.entries
+                || d.sessions != self.data.sessions
+                || hp != self.hub_paths;
+            if changed {
+                self.set_data(d, hp);
+                return true;
+            }
+        }
+        expired
     }
 
     fn every(&self) -> Duration {
@@ -319,71 +328,41 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
     } else {
         String::new()
     };
-    if sb.in_hub {
-        crate::hub::set_pane_meta(&mut sb.meta_cache, &meta);
-    }
+    crate::hub::set_pane_meta(&mut sb.meta_cache, &meta);
 
     let active_toast = sb
         .toast
         .as_ref()
         .filter(|x| Instant::now() < x.until)
         .cloned();
-    let (inner, footer) = if sb.in_hub {
-        if area.height <= 1 {
-            (area, None)
-        } else {
-            (
-                Rect {
-                    height: area.height - 1,
-                    ..area
-                },
-                Some(Rect {
-                    y: area.y + area.height - 1,
-                    height: 1,
-                    ..area
-                }),
-            )
-        }
+    let (inner, footer) = if area.height <= 1 {
+        (area, None)
     } else {
-        let w = area.width as usize;
-        let right = if agents > 0 && w >= 22 {
-            Line::from(Span::styled(format!(" {agents} live "), t.title_muted())).right_aligned()
-        } else {
-            Line::default()
-        };
-        let bottom = match &active_toast {
-            Some(toast) => toast_line(toast, w.saturating_sub(4), &t),
-            None => hint_line(&HINTS, w.saturating_sub(4), &t),
-        };
-        let block = Block::bordered()
-            .border_type(t.border_type())
-            .border_style(t.border_style(sb.focused))
-            .title_top(
-                Line::from(Span::styled(
-                    format!(" {} grace ", t.star()),
-                    t.title_accent(),
-                ))
-                .left_aligned(),
-            )
-            .title_top(right)
-            .title_bottom(bottom);
-        let inn = block.inner(area);
-        f.render_widget(block, area);
-        (inn, None)
+        (
+            Rect {
+                height: area.height - 1,
+                ..area
+            },
+            Some(Rect {
+                y: area.y + area.height - 1,
+                height: 1,
+                ..area
+            }),
+        )
     };
 
     if let Some(foot) = footer {
         let fw = foot.width as usize;
         let line = match &active_toast {
-            Some(toast) => toast_line(toast, fw, &t),
-            None => hint_line(&HINTS, fw, &t),
+            Some(toast) => toast_line(toast, fw, t),
+            None => hint_line(&HINTS, fw, t),
         };
         f.render_widget(Paragraph::new(line), foot);
     }
 
     sb.animating = false;
+    sb.list_area = Rect::default();
     if inner.width == 0 || inner.height == 0 {
-        sb.list_area = Rect::default();
         return;
     }
     let iw = inner.width as usize;
@@ -415,17 +394,15 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
         ..inner
     };
     if list_full.height == 0 {
-        sb.list_area = Rect::default();
         return;
     }
     if sb.rows.is_empty() {
-        sb.list_area = Rect::default();
         let msg = if sb.data.entries.is_empty() {
             "No folders yet"
         } else {
             "No matches"
         };
-        center_msg(f, list_full, msg, &t);
+        center_msg(f, list_full, msg, t);
         return;
     }
 
@@ -434,22 +411,21 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
         sb.last_h = h;
         sb.offset = 0;
     }
-    sb.offset = picker::scroll(&to_picker_rows(&sb.rows), sb.selected, sb.offset, h);
-    let need_sb = sb.rows.len() > h && list_full.width > 12;
-    let list = if need_sb {
-        Rect {
-            width: list_full.width - 1,
-            ..list_full
-        }
-    } else {
-        list_full
-    };
+    sb.offset = picker::scroll_by(
+        sb.rows.len(),
+        |idx| matches!(sb.rows[idx], Row::Header(_)),
+        sb.selected,
+        sb.offset,
+        h,
+    );
+    let (list, sb_area) = slice_scrollbar(list_full, sb.rows.len(), h);
     sb.list_area = list;
     let lw = list.width as usize;
     let frame = (sb.start.elapsed().as_millis() / 100) as usize;
     let mut lines = Vec::new();
-    for (ri, row) in sb.rows.iter().enumerate().skip(sb.offset).take(h) {
-        match *row {
+    for ri in sb.offset..sb.rows.len().min(sb.offset + h) {
+        let row = sb.rows[ri];
+        match row {
             Row::Header(s) => {
                 lines.push(Line::from(vec![
                     Span::raw(" "),
@@ -463,42 +439,41 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
                 let e = &sb.data.entries[i];
                 let status = sb.best.get(&e.path);
                 sb.animating |= status.is_some_and(|s| s.status == Status::Working);
-                let mut tags: Vec<String> = Vec::new();
+                sb.tags_buf.clear();
                 if let Some(s) = status {
-                    tags.push(platform::sanitize_display(&s.tool));
+                    sb.tags_buf
+                        .push(platform::sanitize_display(&s.tool).into_owned());
                 }
                 for tag in &e.tags {
                     if Some(tag.tool.as_str()) != status.map(|s| s.tool.as_str()) {
-                        tags.push(platform::sanitize_display(&tag.tool));
+                        sb.tags_buf
+                            .push(platform::sanitize_display(&tag.tool).into_owned());
                     }
                 }
-                let name = platform::sanitize_display(&name_of(&e.path, sb.home.as_deref()));
-                let hl = sb
-                    .pattern
-                    .as_ref()
-                    .map(|p| {
-                        let mut buf = Vec::new();
-                        let mut idx = Vec::new();
-                        p.indices(Utf32Str::new(&name, &mut buf), &mut sb.matcher, &mut idx);
-                        idx.into_iter().map(|x| x as usize).collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let raw_name = name_of(&e.path, sb.home.as_deref());
+                let name = platform::sanitize_display(&raw_name);
+                sb.hl_buf.clear();
+                if let Some(p) = &sb.pattern {
+                    sb.idx_buf.clear();
+                    p.indices(
+                        Utf32Str::new(&name, &mut sb.utf32_buf),
+                        &mut sb.matcher,
+                        &mut sb.idx_buf,
+                    );
+                    sb.hl_buf.extend(sb.idx_buf.iter().map(|&x| x as usize));
+                }
                 let current = platform::same_path(&e.path, &sb.current);
-                let open_ws = !current
-                    && sb
-                        .data
-                        .hub_paths
-                        .iter()
-                        .any(|p| platform::same_path(p, &e.path));
+                let open_ws =
+                    !current && sb.hub_paths.iter().any(|p| platform::same_path(p, &e.path));
                 lines.push(item_line(
-                    &t,
+                    t,
                     &name,
-                    &hl,
+                    &sb.hl_buf,
                     status.map(|s| s.status),
                     e.pinned,
                     current,
                     open_ws,
-                    &tags,
+                    &sb.tags_buf,
                     ri == sb.selected,
                     sb.focused,
                     frame,
@@ -508,33 +483,19 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
         }
     }
     f.render_widget(Paragraph::new(lines), list);
-    if need_sb {
-        let sb_area = Rect {
-            x: list_full.x + list_full.width - 1,
-            width: 1,
-            ..list_full
-        };
-        render_scrollbar(f, sb_area, sb.rows.len(), sb.offset, h, &t);
+    if let Some(sb_area) = sb_area {
+        render_scrollbar(f, sb_area, sb.rows.len(), sb.offset, h, t);
     }
 }
 
-fn to_picker_rows(rows: &[Row]) -> Vec<picker::Row> {
-    rows.iter()
-        .map(|r| match r {
-            Row::Header(_) => picker::Row::Header(Status::Done, 0),
-            Row::Item(i) => picker::Row::Item(*i),
-        })
-        .collect()
-}
-
 fn name_of(path: &str, home: Option<&str>) -> String {
-    let shown = picker::display_path(path, home);
-    split_path(&shown).1
+    let shown = platform::display_path(path, home);
+    split_path(&shown).1.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn item_line(
-    t: &Theme,
+    t: Theme,
     name: &str,
     hl: &[usize],
     status: Option<Status>,
@@ -560,7 +521,10 @@ fn item_line(
     } else {
         t.fg(base, t.border_color())
     };
-    spans.push(Span::styled(if sel { "▌" } else { " " }, bar_style));
+    spans.push(Span::styled(
+        if sel { t.bar_glyph() } else { " " },
+        bar_style,
+    ));
     match status {
         Some(s) => {
             let (g, _, style) = t.status_look(s, frame);
@@ -615,7 +579,7 @@ fn item_line(
     let mut name_used = 0;
     push_fit_coalesced(&mut spans, &mut name_used, &fit, hl, name_style, hl_style);
     let pad = avail.saturating_sub(name_used + tags_used);
-    spans.push(Span::styled(" ".repeat(pad), base));
+    spans.push(Span::styled(spaces(pad), base));
     spans.extend(tag_spans);
     spans.push(Span::styled(" ", base));
     Line::from(spans)
@@ -674,20 +638,19 @@ mod tests {
             ],
             editors: vec![],
             branches: HashMap::new(),
-            hub_paths: Vec::new(),
         }
     }
 
     fn sidebar<'a>(go: Go<'a>) -> Sidebar<'a> {
         Sidebar::new(
             data(),
+            Vec::new(),
             "/h/notes",
             Theme::dark(),
             Some("/h".into()),
             Box::new(|| None),
             go,
         )
-        .in_hub(false)
     }
 
     #[test]
@@ -747,36 +710,27 @@ mod tests {
     }
 
     #[test]
-    fn render_narrow_and_frameless_hub() {
+    fn render_narrow_frameless_hub() {
         let mut sb = sidebar(Box::new(|_, _| Err("tmux: no server".into())));
         let out = tui::render_text(30, 12, |f| draw(f, &mut sb));
         let lines: Vec<&str> = out.lines().collect();
+        assert!(!lines[0].contains('╭'), "{}", lines[0]);
         assert!(
-            lines[0].starts_with("╭ ✦ grace ") && lines[0].contains(" 2 live "),
+            lines[0].contains("❯") && lines[0].contains("filter"),
             "{}",
             lines[0]
         );
+        assert_eq!(lines[1].trim(), "NEEDS YOU");
         assert!(
-            lines[1].contains("❯") && lines[1].contains("filter"),
+            lines[2].starts_with(" ● svm") && lines[2].ends_with("codex"),
             "{}",
-            lines[1]
+            lines[2]
         );
-        assert_eq!(lines[2].trim_matches('│').trim(), "NEEDS YOU");
-        assert!(
-            lines[3].starts_with("│ ● svm") && lines[3].ends_with("codex │"),
-            "{}",
-            lines[3]
-        );
-        assert!(lines[8].starts_with("│▌◆ notes"), "{}", lines[8]);
-        assert!(lines[11].starts_with("╰ ⏎ go · ^o resume"), "{}", lines[11]);
+        assert!(lines[7].starts_with("▌◆ notes"), "{}", lines[7]);
+        assert!(lines[11].starts_with(" ⏎ go"), "{}", lines[11]);
         for l in &lines {
-            assert_eq!(l.chars().count(), 30, "{l}");
+            assert!(l.chars().count() <= 30, "{l}");
         }
-        // Frameless hub mode omits the outer Box border.
-        let mut sb_hub = sb.in_hub(true);
-        let hub_out = tui::render_text(28, 10, |f| draw(f, &mut sb_hub));
-        assert!(!hub_out.lines().next().unwrap().contains('╭'));
-        assert!(hub_out.lines().next().unwrap().contains("❯"));
     }
 
     #[test]

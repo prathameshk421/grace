@@ -142,11 +142,18 @@ impl Registry {
 
     /// Map a command name or tag to the canonical tag. Unknown names pass through in lowercase.
     pub fn normalize_tag(&self, name: &str) -> String {
-        let n = name.trim().to_lowercase();
+        let trimmed = name.trim();
+        if let Some(t) = self
+            .tools
+            .iter()
+            .find(|t| t.command.eq_ignore_ascii_case(trimmed))
+        {
+            return t.tag.clone();
+        }
+        let n = trimmed.to_ascii_lowercase();
         self.tools
             .iter()
-            .find(|t| t.command.to_lowercase() == n)
-            .or_else(|| self.tools.iter().find(|t| t.tag == n))
+            .find(|t| t.tag == n)
             .map(|t| t.tag.clone())
             .unwrap_or(n)
     }
@@ -191,9 +198,9 @@ impl Registry {
             || matches!(tag, "cursor" | "antigravity")
     }
 
-    /// Program & terminal-flag for opening a folder in an editor tag.
-    /// Returns `(program, runs_in_terminal)`.
-    pub fn editor_launch(&self, tag: &str) -> Option<(String, bool)> {
+    /// Program, extra flags, and terminal-flag for opening a folder in an editor tag.
+    /// Returns `(program, extra_args, runs_in_terminal)`.
+    pub fn editor_launch(&self, tag: &str) -> Option<(String, Vec<String>, bool)> {
         if let Some(custom) = self
             .tools
             .iter()
@@ -205,36 +212,32 @@ impl Registry {
                 .strip_suffix(" .")
                 .unwrap_or(&custom.launch)
                 .trim();
-            let first = base.split_whitespace().next()?;
-            return Some((
-                first.to_string(),
-                matches!(first, "nvim" | "vim" | "vi" | "nano" | "helix" | "hx"),
-            ));
+            let mut parts = base.split_whitespace();
+            let first = parts.next()?;
+            let args: Vec<String> = parts.map(String::from).collect();
+            return Some((first.to_string(), args, is_terminal_editor(first)));
         }
         match tag {
-            "cursor" => Some(("cursor".into(), false)),
-            "antigravity" => Some(("antigravity".into(), false)),
+            "cursor" => Some(("cursor".into(), Vec::new(), false)),
+            "antigravity" => Some(("antigravity".into(), Vec::new(), false)),
             "jetbrains" => {
                 for bin in ["idea", "pycharm", "webstorm"] {
                     if on_path(bin) {
-                        return Some((bin.into(), false));
+                        return Some((bin.into(), Vec::new(), false));
                     }
                 }
-                Some(("idea".into(), false))
+                Some(("idea".into(), Vec::new(), false))
             }
             _ => {
                 let t = self
                     .tools
                     .iter()
                     .find(|t| t.tag == tag && t.kind == Some(Kind::Editor))?;
-                let base = t
-                    .launch
-                    .strip_suffix(" .")
-                    .unwrap_or(&t.launch)
-                    .trim()
-                    .to_string();
-                let term = matches!(base.as_str(), "nvim" | "vim");
-                Some((base, term))
+                let base = t.launch.strip_suffix(" .").unwrap_or(&t.launch).trim();
+                let mut parts = base.split_whitespace();
+                let first = parts.next()?;
+                let args: Vec<String> = parts.map(String::from).collect();
+                Some((first.to_string(), args, is_terminal_editor(first)))
             }
         }
     }
@@ -243,6 +246,17 @@ impl Registry {
     pub fn command_names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.command.clone()).collect()
     }
+}
+
+pub fn is_terminal_editor(prog: &str) -> bool {
+    let base = std::path::Path::new(prog)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(prog);
+    matches!(
+        base.strip_suffix(".exe").unwrap_or(base),
+        "nvim" | "vim" | "vi" | "nano" | "hx" | "helix"
+    )
 }
 
 pub fn on_path(name: &str) -> bool {
@@ -287,8 +301,23 @@ mod tests {
         assert_eq!(r.launch_command("jetbrains").as_deref(), Some("idea ."));
         assert!(r.is_editor_tag("cursor"));
         assert!(r.is_editor_tag("antigravity"));
-        assert_eq!(r.editor_launch("cursor"), Some(("cursor".into(), false)));
-        assert_eq!(r.editor_launch("neovim"), Some(("nvim".into(), true)));
+        assert_eq!(
+            r.editor_launch("cursor"),
+            Some(("cursor".into(), vec![], false))
+        );
+        assert_eq!(
+            r.editor_launch("neovim"),
+            Some(("nvim".into(), vec![], true))
+        );
+        let custom_ed = Registry::new(&[(
+            "nvim".into(),
+            "neovim".into(),
+            "nvim -u custom.vim .".into(),
+        )]);
+        assert_eq!(
+            custom_ed.editor_launch("neovim"),
+            Some(("nvim".into(), vec!["-u".into(), "custom.vim".into()], true))
+        );
         let t = r.tools().iter().find(|t| t.command == "zed").unwrap();
         assert_eq!(t.kind_label(), "editor");
     }

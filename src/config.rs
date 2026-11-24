@@ -1,7 +1,7 @@
 //! Optional user configuration (`~/.config/grace/config.toml`).
 //!
 //! Strictly zero-config by default: if missing or invalid, defaults apply silently.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,23 +20,15 @@ pub struct Config {
 
 /// Resolve the optional config path.
 pub fn config_path() -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("GRACE_CONFIG") {
-        if !v.is_empty() {
-            return Some(PathBuf::from(v));
-        }
+    if let Some(v) = crate::platform::env_non_empty("GRACE_CONFIG") {
+        return Some(PathBuf::from(v));
     }
     if cfg!(windows) {
-        if let Ok(v) = std::env::var("APPDATA") {
-            if !v.is_empty() {
-                return Some(PathBuf::from(v).join("grace").join("config.toml"));
-            }
-        }
-    } else if let Ok(v) = std::env::var("XDG_CONFIG_HOME") {
-        if !v.is_empty() && Path::new(&v).is_absolute() {
+        if let Some(v) = crate::platform::env_non_empty("APPDATA") {
             return Some(PathBuf::from(v).join("grace").join("config.toml"));
         }
     }
-    crate::platform::home_dir().map(|h| h.join(".config").join("grace").join("config.toml"))
+    crate::platform::xdg_config_dir(None, "grace").map(|d| d.join("config.toml"))
 }
 
 /// Load config from disk; missing or malformed files fall back cleanly to defaults.
@@ -88,43 +80,75 @@ pub fn parse(text: &str) -> Config {
     }
 }
 
-/// Match simple glob pattern (`*` matches any sequence, `?` matches one char; leading `~/` expands to home).
-pub fn glob_match(pattern: &str, path: &str, home: Option<&str>) -> bool {
-    let pat = if let Some(h) = home {
-        let h = crate::platform::trim_separators(h);
-        if pattern == "~" {
-            h
-        } else if let Some(rest) = pattern
-            .strip_prefix("~/")
-            .or_else(|| pattern.strip_prefix("~\\"))
-        {
-            let sep = if cfg!(windows) { '\\' } else { '/' };
-            format!("{h}{sep}{rest}")
+/// Expand a leading `~` or `~/` (or `~\`) in `pattern` using `home`.
+pub(crate) fn expand_tilde(pattern: &str, home: Option<&str>) -> String {
+    let Some(h) = home else {
+        return pattern.to_string();
+    };
+    let h = crate::platform::trim_separators(h);
+    if pattern == "~" {
+        return h;
+    }
+    if let Some(rest) = pattern
+        .strip_prefix("~/")
+        .or_else(|| pattern.strip_prefix("~\\"))
+    {
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        let rest = rest.trim_start_matches(['/', '\\']);
+        if h.ends_with(['/', '\\']) {
+            format!("{h}{rest}")
         } else {
-            pattern.to_string()
+            format!("{h}{sep}{rest}")
         }
     } else {
         pattern.to_string()
-    };
-    let (p, s) = if cfg!(windows) {
+    }
+}
+
+/// Match simple glob pattern (`*` matches any sequence, `?` matches one Unicode char;
+/// leading `~/` expands to home; trailing `/` or `/**` matches directory and descendants).
+pub fn glob_match(pattern: &str, path: &str, home: Option<&str>) -> bool {
+    let pat_raw = expand_tilde(pattern, home);
+    let (mut pat, s) = if cfg!(windows) {
         (
-            pat.replace('/', "\\").to_ascii_lowercase(),
+            pat_raw.replace('/', "\\").to_ascii_lowercase(),
             path.replace('/', "\\").to_ascii_lowercase(),
         )
     } else {
-        (pat, path.to_string())
+        (pat_raw, path.to_string())
     };
-    wildcard_match(p.as_bytes(), s.as_bytes())
+    let sep = if cfg!(windows) { '\\' } else { '/' };
+    let dir_prefix = if pat.ends_with("/**") || pat.ends_with("\\**") {
+        let trimmed = pat[..pat.len() - 3].trim_end_matches(['/', '\\']);
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    } else if !crate::platform::is_root(&pat) && (pat.ends_with('/') || pat.ends_with('\\')) {
+        pat = pat.trim_end_matches(['/', '\\']).to_string();
+        (!pat.is_empty()).then(|| pat.clone())
+    } else {
+        None
+    };
+    if let Some(base) = dir_prefix {
+        if s == base {
+            return true;
+        }
+        let sub_pat = format!("{base}{sep}*");
+        let p_chars: Vec<char> = sub_pat.chars().collect();
+        let s_chars: Vec<char> = s.chars().collect();
+        return wildcard_match(&p_chars, &s_chars);
+    }
+    let p_chars: Vec<char> = pat.chars().collect();
+    let s_chars: Vec<char> = s.chars().collect();
+    wildcard_match(&p_chars, &s_chars)
 }
 
-fn wildcard_match(pat: &[u8], s: &[u8]) -> bool {
+fn wildcard_match(pat: &[char], s: &[char]) -> bool {
     let (mut pi, mut si) = (0, 0);
     let (mut star, mut match_si) = (None, 0);
     while si < s.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == s[si]) {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == s[si]) {
             pi += 1;
             si += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
+        } else if pi < pat.len() && pat[pi] == '*' {
             star = Some(pi);
             pi += 1;
             match_si = si;
@@ -136,7 +160,7 @@ fn wildcard_match(pat: &[u8], s: &[u8]) -> bool {
             return false;
         }
     }
-    while pi < pat.len() && pat[pi] == b'*' {
+    while pi < pat.len() && pat[pi] == '*' {
         pi += 1;
     }
     pi == pat.len()
@@ -180,5 +204,14 @@ layout = "code+diff"
             Some("/Users/me")
         ));
         assert!(glob_match("*/node_modules", "/a/b/node_modules", None));
+        assert!(glob_match("/tmp/caf?", "/tmp/caf\u{00e9}", None));
+        assert!(glob_match("/tmp/", "/tmp", None));
+        assert!(glob_match("/tmp/", "/tmp/sub/x", None));
+        assert!(glob_match("/tmp/**", "/tmp", None));
+        assert!(glob_match("/tmp/**", "/tmp/sub/x", None));
+        assert_eq!(
+            expand_tilde("~/Downloads/*", Some("C:\\")),
+            "C:\\Downloads/*"
+        );
     }
 }

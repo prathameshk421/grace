@@ -1,7 +1,8 @@
 //! copilot: GitHub Copilot CLI. We own one file, `~/.copilot/hooks/grace.json`.
-use super::{HookResult, HookStatus, Integration};
+use super::{managed_file_check, remove_owned_backup, HookResult, HookStatus, Integration};
 use crate::model::Status;
 use crate::platform;
+use crate::session::non_empty_str;
 use crate::setup::{env_dir, read_opt, write_atomic};
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
@@ -30,9 +31,9 @@ const EVENTS: &[&str] = &[
 ];
 
 fn hooks_file() -> Result<PathBuf> {
-    let base = match std::env::var("GRACE_COPILOT_DIR") {
-        Ok(v) if !v.is_empty() => PathBuf::from(v),
-        _ => env_dir("COPILOT_HOME", ".copilot")?,
+    let base = match platform::env_non_empty("GRACE_COPILOT_DIR") {
+        Some(v) => PathBuf::from(v),
+        None => env_dir("COPILOT_HOME", ".copilot")?,
     };
     Ok(base.join("hooks").join("grace.json"))
 }
@@ -46,25 +47,26 @@ fn setup(exe: &str, remove: bool) -> Result<String> {
     }
 }
 
+fn is_ours_text(t: &str) -> bool {
+    t.contains(MARK)
+}
+
 fn check(exe: &str) -> HookStatus {
     let Ok(path) = hooks_file() else {
         return HookStatus::NotInstalled;
     };
-    let Ok(Some(old)) = read_opt(&path) else {
-        let dir = path.parent().and_then(|p| p.parent());
-        if dir.is_some_and(|p| p.is_dir()) || crate::tools::on_path("copilot") {
-            return HookStatus::Available(path);
-        }
-        return HookStatus::NotInstalled;
-    };
-    if !old.contains(MARK) {
-        return HookStatus::Conflict(path, "custom grace.json".into());
-    }
-    if serde_json::from_str::<Value>(&old).ok().as_ref() == Some(&desired(exe)) {
-        HookStatus::Connected(path)
-    } else {
-        HookStatus::OutdatedPath(path)
-    }
+    let dir = path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf);
+    managed_file_check(
+        path,
+        dir.as_deref(),
+        "copilot",
+        "custom grace.json",
+        is_ours_text,
+        |old| serde_json::from_str::<Value>(old).ok().as_ref() == Some(&desired(exe)),
+    )
 }
 
 fn desired(exe: &str) -> Value {
@@ -119,6 +121,7 @@ fn remove_file(path: &Path) -> Result<String> {
         )),
         Some(_) => {
             std::fs::remove_file(path)?;
+            remove_owned_backup(path, MARK);
             Ok(format!(
                 "Removed {}\nRestart running Copilot CLI sessions to pick this up.",
                 path.display()
@@ -152,31 +155,26 @@ fn hook(args: &[String], stdin: &str) -> HookResult {
     let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(stdin) else {
         return HookResult::default();
     };
-    let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
+    let ev_str = non_empty_str(&v, "hook_event_name").unwrap_or_default();
     let event = match args.first() {
         Some(a) if !a.is_empty() => a.as_str(),
-        _ => text("hook_event_name"),
+        _ => ev_str.as_str(),
     };
-    let ntype = text("notification_type");
-    let status = status_for(event, ntype);
-    let cwd = Some(text("cwd"))
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let session_id = Some(text("sessionId"))
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+    let ntype = non_empty_str(&v, "notification_type").unwrap_or_default();
+    let status = status_for(event, &ntype);
     let detail = match status {
-        Some(Status::Waiting) if !ntype.is_empty() => Some(platform::sanitize_display(ntype)),
+        Some(Status::Waiting) if !ntype.is_empty() => {
+            Some(platform::sanitize_display(&ntype).into_owned())
+        }
         Some(Status::Working) => {
-            let tn = text("toolName");
-            (!tn.is_empty()).then(|| platform::sanitize_display(tn))
+            non_empty_str(&v, "toolName").map(|t| platform::sanitize_display(&t).into_owned())
         }
         _ => None,
     };
     HookResult {
         status,
-        cwd,
-        session_id,
+        cwd: non_empty_str(&v, "cwd"),
+        session_id: non_empty_str(&v, "sessionId"),
         detail,
     }
 }

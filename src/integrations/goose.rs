@@ -1,7 +1,8 @@
 //! goose: a plugin folder we own, `~/.agents/plugins/grace/`.
-use super::{HookResult, HookStatus, Integration};
+use super::{ensure_not_symlink, plugin_dir_check, HookResult, HookStatus, Integration};
 use crate::model::Status;
 use crate::platform;
+use crate::session::non_empty_str;
 use crate::setup::{env_dir, read_opt, write_atomic};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -47,21 +48,8 @@ fn check(exe: &str) -> HookStatus {
         return HookStatus::NotInstalled;
     };
     let hp = d.join("hooks").join("hooks.json");
-    if !d.exists() {
-        let base = d.parent().and_then(|p| p.parent());
-        if base.is_some_and(|p| p.is_dir()) || crate::tools::on_path("goose") {
-            return HookStatus::Available(hp);
-        }
-        return HookStatus::NotInstalled;
-    }
-    if !is_ours(&d) {
-        return HookStatus::Conflict(hp, "foreign plugin folder".into());
-    }
-    if read_opt(&hp).ok().flatten().as_deref() == Some(hooks_json(exe).as_str()) {
-        HookStatus::Connected(hp)
-    } else {
-        HookStatus::OutdatedPath(hp)
-    }
+    let base = d.parent().and_then(|p| p.parent());
+    plugin_dir_check(&d, hp, base, "goose", is_ours, &hooks_json(exe))
 }
 
 fn is_ours(dir: &Path) -> bool {
@@ -73,7 +61,7 @@ fn is_ours(dir: &Path) -> bool {
 }
 
 fn hooks_json(exe: &str) -> String {
-    let cmd = format!("{} session hook goose", platform::quote_posix(exe));
+    let cmd = format!("{} session hook goose", platform::quote_cmd(exe));
     let mut hooks = serde_json::Map::new();
     for e in EVENTS {
         hooks.insert(
@@ -90,15 +78,6 @@ fn plugin_json() -> String {
     )
     .unwrap()
         + "\n"
-}
-
-fn ensure_not_symlink(dir: &Path) -> Result<()> {
-    if let Ok(meta) = std::fs::symlink_metadata(dir) {
-        if meta.file_type().is_symlink() {
-            bail!("refusing to touch symlink {}", dir.display());
-        }
-    }
-    Ok(())
 }
 
 fn add_at(dir: &Path, exe: &str) -> Result<String> {
@@ -159,25 +138,12 @@ fn hook(_args: &[String], stdin: &str) -> HookResult {
         "SessionEnd" => Status::Done,
         _ => return HookResult::default(),
     };
-    let cwd = v
-        .get("working_dir")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-        .map(String::from);
-    let session_id = v
-        .get("session_id")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-        .map(String::from);
-    let detail = v
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-        .map(platform::sanitize_display);
+    let detail =
+        non_empty_str(&v, "tool_name").map(|s| platform::sanitize_display(&s).into_owned());
     HookResult {
         status: Some(status),
-        cwd,
-        session_id,
+        cwd: non_empty_str(&v, "working_dir"),
+        session_id: non_empty_str(&v, "session_id"),
         detail,
     }
 }

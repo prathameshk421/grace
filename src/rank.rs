@@ -28,13 +28,35 @@ pub fn score(e: &Entry, now: i64) -> f64 {
 }
 
 pub fn sort_entries(entries: &mut [Entry], now: i64) {
-    entries.sort_by(|a, b| {
-        b.pinned
-            .cmp(&a.pinned)
-            .then_with(|| score(b, now).total_cmp(&score(a, now)))
-            .then_with(|| b.last_visit.cmp(&a.last_visit))
-            .then_with(|| a.path.cmp(&b.path))
+    let mut keys: Vec<(bool, f64, i64, usize)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.pinned, score(e, now), e.last_visit, i))
+        .collect();
+    keys.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.total_cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| entries[a.3].path.cmp(&entries[b.3].path))
     });
+    let sorted: Vec<Entry> = keys
+        .into_iter()
+        .map(|(_, _, _, i)| {
+            std::mem::replace(
+                &mut entries[i],
+                Entry {
+                    path: String::new(),
+                    visits: 0,
+                    last_visit: 0,
+                    pinned: false,
+                    tags: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    for (dst, src) in entries.iter_mut().zip(sorted) {
+        *dst = src;
+    }
 }
 
 pub fn time_ago(ts: i64, now: i64) -> String {

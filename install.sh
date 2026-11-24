@@ -7,7 +7,11 @@ REPO="prathameshk421/grace"
 RELEASES="https://github.com/${REPO}/releases"
 
 tmp=""
+stage=""
 cleanup() {
+  if [ -n "$stage" ] && [ -e "$stage" ]; then
+    rm -f "$stage"
+  fi
   if [ -n "$tmp" ] && [ -d "$tmp" ]; then
     rm -rf "$tmp"
   fi
@@ -135,6 +139,7 @@ stage=$(mktemp "${dir}/.grace.tmp.XXXXXX")
 cp "$extracted" "$stage"
 chmod 755 "$stage"
 mv -f "$stage" "${dir}/grace"
+stage=""
 
 if use_color; then
   c_gold='\033[1;33m'

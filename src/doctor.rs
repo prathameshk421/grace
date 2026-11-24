@@ -3,9 +3,9 @@
 use crate::db::Db;
 use crate::hub::{self, Tmux};
 use crate::integrations::HookStatus;
+use crate::theme::Ansi;
 use crate::{config, import_editors, model, platform, setup, tools};
 use anyhow::Result;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,61 +18,15 @@ enum ShellCheck {
 #[derive(Debug, Default)]
 struct Summary {
     warnings: usize,
+    fixable_warnings: usize,
     fixed: usize,
-}
-
-struct Ansi {
-    gold: &'static str,
-    green: &'static str,
-    yellow: &'static str,
-    red: &'static str,
-    cyan: &'static str,
-    dim: &'static str,
-    bold: &'static str,
-    reset: &'static str,
-}
-
-impl Ansi {
-    fn stderr() -> Self {
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-        let clicolor_off = std::env::var("CLICOLOR").is_ok_and(|v| v == "0");
-        let dumb = std::env::var("TERM").is_ok_and(|v| v == "dumb");
-        if std::io::stderr().is_terminal() && !no_color && !clicolor_off && !dumb {
-            Self {
-                gold: "\x1b[1;33m",
-                green: "\x1b[32m",
-                yellow: "\x1b[33m",
-                red: "\x1b[31m",
-                cyan: "\x1b[36m",
-                dim: "\x1b[2m",
-                bold: "\x1b[1m",
-                reset: "\x1b[0m",
-            }
-        } else {
-            Self {
-                gold: "",
-                green: "",
-                yellow: "",
-                red: "",
-                cyan: "",
-                dim: "",
-                bold: "",
-                reset: "",
-            }
-        }
-    }
-}
-
-fn short_path(p: &Path, home: Option<&str>) -> String {
-    let raw = platform::clean_path_str(&p.to_string_lossy());
-    let sanitized = platform::sanitize_display(&raw);
-    platform::strip_home_prefix(&sanitized, home)
 }
 
 fn ok_line(a: &Ansi, section: &str, msg: &str) {
     eprintln!(
-        "  {g}✓{r} {b}{section:<11}{r} {msg}",
+        "  {g}{c}{r} {b}{section:<11}{r} {msg}",
         g = a.green,
+        c = a.check,
         b = a.bold,
         r = a.reset
     );
@@ -91,11 +45,17 @@ fn warn_line(a: &Ansi, s: &mut Summary, section: &str, msg: &str, hint: Option<&
     }
 }
 
+fn warn_fixable(a: &Ansi, s: &mut Summary, section: &str, msg: &str, hint: Option<&str>) {
+    s.fixable_warnings += 1;
+    warn_line(a, s, section, msg, hint);
+}
+
 fn err_line(a: &Ansi, s: &mut Summary, section: &str, msg: &str, hint: Option<&str>) {
     s.warnings += 1;
     eprintln!(
-        "  {rd}✗{r} {b}{section:<11}{r} {msg}",
+        "  {rd}{c}{r} {b}{section:<11}{r} {msg}",
         rd = a.red,
+        c = a.cross,
         b = a.bold,
         r = a.reset
     );
@@ -118,21 +78,32 @@ fn check_shell(home: Option<&Path>) -> ShellCheck {
     if let Ok(sh) = std::env::var("GRACE_SHELL") {
         let trimmed = sh.trim();
         if !trimmed.is_empty() {
-            return ShellCheck::Active(platform::sanitize_display(trimmed));
+            return ShellCheck::Active(platform::sanitize_display(trimmed).into_owned());
         }
     }
     let Some(h) = home else {
         return ShellCheck::Missing;
     };
-    let mut candidates = vec![
-        h.join(".zshrc"),
-        h.join(".bashrc"),
-        h.join(".bash_profile"),
-        h.join(".config/fish/config.fish"),
-    ];
+    let mut candidates = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    };
+    if let Some(zdotdir) = platform::env_non_empty("ZDOTDIR") {
+        push_unique(PathBuf::from(zdotdir).join(".zshrc"));
+    }
+    push_unique(h.join(".zshrc"));
+    push_unique(h.join(".bashrc"));
+    push_unique(h.join(".bash_profile"));
+    push_unique(h.join(".profile"));
+    if let Some(fish_dir) = platform::xdg_config_dir(None, "fish") {
+        push_unique(fish_dir.join("config.fish"));
+    }
+    push_unique(h.join(".config/fish/config.fish"));
     if cfg!(windows) {
-        candidates.push(h.join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1"));
-        candidates.push(h.join("Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1"));
+        push_unique(h.join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1"));
+        push_unique(h.join("Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1"));
     }
     if let Some(found) = find_grace_init_in_files(&candidates) {
         return ShellCheck::Configured(found);
@@ -167,9 +138,75 @@ fn mode_is_private(_path: &Path) -> Option<(u32, bool)> {
     None
 }
 
+/// Validate parsed config TOML keys and value types/enums against `Config`.
+fn validate_config(text: &str) -> std::result::Result<Vec<String>, toml_edit::TomlError> {
+    let doc = text.parse::<toml_edit::DocumentMut>()?;
+    let mut issues = Vec::new();
+    let valid_layout = |v: &str| matches!(v.trim(), "full" | "code+diff" | "sidebar+main" | "zen");
+
+    for (key, item) in doc.as_table().iter() {
+        match key {
+            "theme" => match item.as_str() {
+                Some(v) if matches!(v.trim(), "auto" | "dark" | "light") => {}
+                Some(v) => issues.push(format!("`theme` must be auto/dark/light (got `{v}`)")),
+                None => issues.push("`theme` must be a string".into()),
+            },
+            "editor" => match item.as_str() {
+                Some(v) if !v.trim().is_empty() => {}
+                Some(_) => issues.push("`editor` must not be empty".into()),
+                None => issues.push("`editor` must be a string".into()),
+            },
+            "ascii" => {
+                if item.as_bool().is_none() {
+                    issues.push("`ascii` must be a boolean".into());
+                }
+            }
+            "hub_layout" => match item.as_str() {
+                Some(v) if valid_layout(v) => {}
+                Some(v) => issues.push(format!(
+                    "`hub_layout` must be full/code+diff/sidebar+main/zen (got `{v}`)"
+                )),
+                None => issues.push("`hub_layout` must be a string".into()),
+            },
+            "ignore" => match item.as_array() {
+                Some(arr) => {
+                    for (idx, val) in arr.iter().enumerate() {
+                        match val.as_str() {
+                            Some(s) if !s.trim().is_empty() => {}
+                            _ => issues.push(format!("`ignore[{idx}]` must be a non-empty string")),
+                        }
+                    }
+                }
+                None => issues.push("`ignore` must be an array of strings".into()),
+            },
+            "hub" => match item.as_table_like() {
+                Some(tbl) => {
+                    for (sub_k, sub_v) in tbl.iter() {
+                        if sub_k == "layout" {
+                            match sub_v.as_str() {
+                                Some(v) if valid_layout(v) => {}
+                                Some(v) => issues.push(format!(
+                                    "`hub.layout` must be full/code+diff/sidebar+main/zen (got `{v}`)"
+                                )),
+                                None => issues.push("`hub.layout` must be a string".into()),
+                            }
+                        } else {
+                            issues.push(format!("unknown key `hub.{sub_k}`"));
+                        }
+                    }
+                }
+                None => issues.push("`hub` must be a table".into()),
+            },
+            other => issues.push(format!("unknown key `{other}`")),
+        }
+    }
+    Ok(issues)
+}
+
 /// Run `grace doctor [--fix]`.
 pub fn run(fix: bool) -> Result<()> {
-    let a = Ansi::stderr();
+    let cfg = config::load();
+    let a = Ansi::stderr(&cfg);
     let mut sum = Summary::default();
     let home_pb = platform::home_dir();
     let home_str = home_pb
@@ -179,7 +216,8 @@ pub fn run(fix: bool) -> Result<()> {
 
     eprintln!();
     eprintln!(
-        "  {g}✦ grace doctor{r} {d}v{}{}{r}",
+        "  {g}{} grace doctor{r} {d}v{}{}{r}",
+        a.star,
         env!("CARGO_PKG_VERSION"),
         if fix { " (--fix)" } else { "" },
         g = a.gold,
@@ -191,7 +229,7 @@ pub fn run(fix: bool) -> Result<()> {
     // 1. Binary & PATH
     let exe_str = setup::exe_string()?;
     let exe_path = Path::new(&exe_str);
-    let exe_shown = short_path(exe_path, home_ref);
+    let exe_shown = platform::short_path(exe_path, home_ref);
     if tools::on_path("grace") {
         ok_line(
             &a,
@@ -219,7 +257,7 @@ pub fn run(fix: bool) -> Result<()> {
                 "shell",
                 &format!(
                     "configured in {} {d}(restart shell if not active yet){r}",
-                    short_path(&rc, home_ref),
+                    platform::short_path(&rc, home_ref),
                     d = a.dim,
                     r = a.reset
                 ),
@@ -238,25 +276,36 @@ pub fn run(fix: bool) -> Result<()> {
 
     // 3. Optional config file
     if let Some(cfg_path) = config::config_path() {
-        let cfg_shown = short_path(&cfg_path, home_ref);
+        let cfg_shown = platform::short_path(&cfg_path, home_ref);
         if cfg_path.is_file() {
             match platform::read_to_string_capped(&cfg_path, 256 * 1024) {
-                Ok(txt) if txt.parse::<toml_edit::DocumentMut>().is_ok() => {
-                    ok_line(
-                        &a,
-                        "config",
-                        &format!("{cfg_shown} {d}(valid TOML){r}", d = a.dim, r = a.reset),
-                    );
-                }
-                Ok(_) => {
-                    warn_line(
-                        &a,
-                        &mut sum,
-                        "config",
-                        &format!("{cfg_shown} has invalid TOML (using defaults)"),
-                        Some("Fix TOML syntax in your config file"),
-                    );
-                }
+                Ok(txt) => match validate_config(&txt) {
+                    Ok(issues) if issues.is_empty() => {
+                        ok_line(
+                            &a,
+                            "config",
+                            &format!("{cfg_shown} {d}(valid TOML){r}", d = a.dim, r = a.reset),
+                        );
+                    }
+                    Ok(issues) => {
+                        warn_line(
+                            &a,
+                            &mut sum,
+                            "config",
+                            &format!("{cfg_shown}: {}", issues.join("; ")),
+                            Some("Fix invalid keys or values in your config file"),
+                        );
+                    }
+                    Err(_) => {
+                        warn_line(
+                            &a,
+                            &mut sum,
+                            "config",
+                            &format!("{cfg_shown} has invalid TOML (using defaults)"),
+                            Some("Fix TOML syntax in your config file"),
+                        );
+                    }
+                },
                 Err(e) => {
                     warn_line(&a, &mut sum, "config", &format!("{cfg_shown}: {e}"), None);
                 }
@@ -304,7 +353,8 @@ pub fn run(fix: bool) -> Result<()> {
     eprintln!();
     if sum.fixed > 0 {
         eprintln!(
-            "  {g}✓ Fixed {} issue(s).{r}",
+            "  {g}{} Fixed {} issue(s).{r}",
+            a.check,
             sum.fixed,
             g = a.green,
             r = a.reset
@@ -317,14 +367,14 @@ pub fn run(fix: bool) -> Result<()> {
             r = a.reset
         );
     } else {
+        let fix_hint = if !fix && sum.fixable_warnings > 0 {
+            " Run `grace doctor --fix` to repair auto-fixable items."
+        } else {
+            ""
+        };
         eprintln!(
-            "  {y}{} item(s) need attention.{r}{}",
+            "  {y}{} item(s) need attention.{r}{fix_hint}",
             sum.warnings,
-            if fix {
-                ""
-            } else {
-                " Run `grace doctor --fix` to repair auto-fixable items."
-            },
             y = a.yellow,
             r = a.reset
         );
@@ -333,11 +383,55 @@ pub fn run(fix: bool) -> Result<()> {
     Ok(())
 }
 
+fn check_private_file(
+    a: &Ansi,
+    sum: &mut Summary,
+    path: &Path,
+    shown: &str,
+    section: &str,
+    hint: &str,
+    fix: bool,
+) {
+    let Some((mode, private)) = mode_is_private(path) else {
+        return;
+    };
+    if private {
+        return;
+    }
+    if fix {
+        platform::restrict_file_0600(path);
+        if mode_is_private(path).is_some_and(|(_, p)| p) {
+            sum.fixed += 1;
+            ok_line(
+                a,
+                section,
+                &format!("{shown} permissions tightened to 0600"),
+            );
+        } else {
+            warn_line(
+                a,
+                sum,
+                section,
+                &format!("{shown} permissions still {mode:04o}"),
+                None,
+            );
+        }
+    } else {
+        warn_fixable(
+            a,
+            sum,
+            section,
+            &format!("{shown} permissions are {mode:04o} (expected 0600)"),
+            Some(hint),
+        );
+    }
+}
+
 fn check_database(a: &Ansi, sum: &mut Summary, home_ref: Option<&str>, fix: bool) -> Result<()> {
     let dir = crate::db::data_dir()?;
     let db_path = dir.join("grace.db");
-    let shown_dir = short_path(&dir, home_ref);
-    let shown_db = short_path(&db_path, home_ref);
+    let shown_dir = platform::short_path(&dir, home_ref);
+    let shown_db = platform::short_path(&db_path, home_ref);
 
     if let Some((mode, private)) = mode_is_private(&dir) {
         if !private {
@@ -349,19 +443,32 @@ fn check_database(a: &Ansi, sum: &mut Summary, home_ref: Option<&str>, fix: bool
                     &format!("{shown_dir} permissions tightened to 0700"),
                 );
             } else {
-                warn_line(
-                    a,
-                    sum,
-                    "data dir",
-                    &format!("{shown_dir} permissions are {mode:04o} (expected 0700)"),
-                    Some("Run `grace doctor --fix` or `chmod 700` on the data directory"),
-                );
+                let msg = format!("{shown_dir} permissions are {mode:04o} (expected 0700)");
+                let hint = Some("Run `grace doctor --fix` or `chmod 700` on the data directory");
+                if fix {
+                    warn_line(a, sum, "data dir", &msg, hint);
+                } else {
+                    warn_fixable(a, sum, "data dir", &msg, hint);
+                }
             }
         }
     }
 
-    let pre_db_mode = mode_is_private(&db_path);
-    if !fix && !db_path.is_file() {
+    let lock_path = dir.join("hub.lock");
+    if lock_path.is_file() {
+        let shown_lock = platform::short_path(&lock_path, home_ref);
+        check_private_file(
+            a,
+            sum,
+            &lock_path,
+            &shown_lock,
+            "hub lock",
+            "Run `grace doctor --fix` to restrict hub.lock to owner-only",
+            fix,
+        );
+    }
+
+    if !db_path.is_file() {
         info_line(
             a,
             "database",
@@ -369,35 +476,28 @@ fn check_database(a: &Ansi, sum: &mut Summary, home_ref: Option<&str>, fix: bool
         );
         return Ok(());
     }
-    if let Some((mode, private)) = pre_db_mode {
-        if !private {
-            if fix {
-                platform::restrict_file_0600(&db_path);
-                if mode_is_private(&db_path).is_some_and(|(_, p)| p) {
-                    sum.fixed += 1;
-                    ok_line(
-                        a,
-                        "db perms",
-                        &format!("{shown_db} permissions tightened to 0600"),
-                    );
-                } else {
-                    warn_line(
-                        a,
-                        sum,
-                        "db perms",
-                        &format!("{shown_db} permissions still {mode:04o}"),
-                        None,
-                    );
-                }
-            } else {
-                warn_line(
-                    a,
-                    sum,
-                    "db perms",
-                    &format!("{shown_db} permissions are {mode:04o} (expected 0600)"),
-                    Some("Run `grace doctor --fix` to restrict permissions to owner-only"),
-                );
-            }
+
+    for (path, shown) in [
+        (db_path.clone(), shown_db.clone()),
+        (
+            dir.join("grace.db-wal"),
+            platform::short_path(&dir.join("grace.db-wal"), home_ref),
+        ),
+        (
+            dir.join("grace.db-shm"),
+            platform::short_path(&dir.join("grace.db-shm"), home_ref),
+        ),
+    ] {
+        if path.is_file() {
+            check_private_file(
+                a,
+                sum,
+                &path,
+                &shown,
+                "db perms",
+                "Run `grace doctor --fix` to restrict permissions to owner-only",
+                fix,
+            );
         }
     }
 
@@ -405,59 +505,49 @@ fn check_database(a: &Ansi, sum: &mut Summary, home_ref: Option<&str>, fix: bool
     let db = if fix {
         Db::open(&db_path)?
     } else {
-        let conn = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        let _ = conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
-        let _ = conn.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA,
-            false,
-        );
-        Db { conn }
+        let Some(db) = Db::open_readonly(&db_path)? else {
+            return Ok(());
+        };
+        db
     };
 
-    let live_before: i64 = db
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE status != 'done'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if fix {
-        let sessions_after = db.sessions(now).unwrap_or_default();
-        let live_after = sessions_after
-            .iter()
-            .filter(|s| s.status != model::Status::Done)
-            .count() as i64;
-        if live_before > live_after {
-            let cleaned = live_before - live_after;
-            sum.fixed += 1;
-            ok_line(
+    let (active, stale_or_dead) = db.inspect_sessions(now).unwrap_or((0, 0));
+    let live_sessions = if fix {
+        if stale_or_dead > 0 {
+            let _ = db.sessions(now);
+            let (active_after, stale_after) =
+                db.inspect_sessions(now).unwrap_or((active, stale_or_dead));
+            let cleaned = (active + stale_or_dead).saturating_sub(active_after + stale_after);
+            if cleaned > 0 {
+                sum.fixed += 1;
+                ok_line(
+                    a,
+                    "sessions",
+                    &format!("cleaned {cleaned} stale/dead session(s)"),
+                );
+            }
+            active_after + stale_after
+        } else {
+            active
+        }
+    } else {
+        if stale_or_dead > 0 {
+            warn_fixable(
                 a,
+                sum,
                 "sessions",
-                &format!("cleaned {cleaned} stale/dead session(s)"),
+                &format!("{stale_or_dead} stale/dead session(s) still open"),
+                Some("Run `grace doctor --fix` to mark them done"),
             );
         }
-    }
+        active + stale_or_dead
+    };
 
     let ok = db.integrity_check().unwrap_or(false);
-    let entries = db.list_entries().unwrap_or_default();
-    let total_dirs = entries.len();
-    let missing_dirs = entries
-        .iter()
-        .filter(|e| !Path::new(&e.path).is_dir())
-        .count();
-    let pinned_dirs = entries.iter().filter(|e| e.pinned).count();
-    let live_sessions: i64 = db
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE status != 'done'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let dirs = db.list_dir_flags().unwrap_or_default();
+    let total_dirs = dirs.len();
+    let missing_dirs = dirs.iter().filter(|(p, _)| !Path::new(p).is_dir()).count();
+    let pinned_dirs = dirs.iter().filter(|(_, pinned)| *pinned).count();
     if ok {
         ok_line(
             a,
@@ -525,7 +615,7 @@ fn check_agent_hooks(a: &Ansi, sum: &mut Summary, exe: &str, home_ref: Option<&s
                         "agent hook",
                         &format!(
                             "{name} hook updated to current grace binary ({})",
-                            short_path(&p, home_ref)
+                            platform::short_path(&p, home_ref)
                         ),
                     );
                     continue;
@@ -542,13 +632,13 @@ fn check_agent_hooks(a: &Ansi, sum: &mut Summary, exe: &str, home_ref: Option<&s
                 }
             }
         }
-        warn_line(
+        warn_fixable(
             a,
             sum,
             "agent hook",
             &format!(
                 "{name} points to an older grace binary ({})",
-                short_path(&p, home_ref)
+                platform::short_path(&p, home_ref)
             ),
             Some(&format!("Run `grace setup {name}` or `grace doctor --fix`")),
         );
@@ -576,7 +666,7 @@ fn check_agent_hooks(a: &Ansi, sum: &mut Summary, exe: &str, home_ref: Option<&s
             "agent hook",
             &format!(
                 "{name} in {}: {}",
-                short_path(&p, home_ref),
+                platform::short_path(&p, home_ref),
                 platform::sanitize_display(&why)
             ),
             None,
@@ -596,9 +686,12 @@ fn check_tmux(a: &Ansi, sum: &mut Summary) {
     match hub::tmux_version() {
         Ok((maj, min)) => {
             let t = Tmux::new();
-            let running = t.ok(&["has-session", "-t", &format!("={}", hub::SESSION)]);
-            if running {
-                let n = t.windows().map(|w| w.len()).unwrap_or(0);
+            let active = if hub::socket_exists(&t.socket) {
+                t.windows().ok().map(|w| w.len())
+            } else {
+                None
+            };
+            if let Some(n) = active {
                 ok_line(
                     a,
                     "hub",
@@ -670,13 +763,47 @@ mod tests {
     #[test]
     fn short_path_masks_home_and_sanitizes() {
         assert_eq!(
-            short_path(Path::new("/home/me/.config/grace"), Some("/home/me")),
+            platform::short_path(Path::new("/home/me/.config/grace"), Some("/home/me")),
             "~/.config/grace"
         );
         assert_eq!(
-            short_path(Path::new("/home/me2/proj"), Some("/home/me")),
+            platform::short_path(Path::new("/home/me2/proj"), Some("/home/me")),
             "/home/me2/proj"
         );
-        assert_eq!(short_path(Path::new("/tmp/x\x1b[31m"), None), "/tmp/x?[31m");
+        assert_eq!(
+            platform::short_path(Path::new("/tmp/x\x1b[31m"), None),
+            "/tmp/x?[31m"
+        );
+    }
+
+    #[test]
+    fn validates_config_schema_and_values() {
+        let ok_issues = validate_config(
+            r#"
+theme = "dark"
+editor = "nvim"
+ascii = false
+hub_layout = "code+diff"
+ignore = ["/tmp/*", "~/Downloads/*"]
+"#,
+        )
+        .unwrap();
+        assert!(ok_issues.is_empty(), "{ok_issues:?}");
+
+        let ok_table = validate_config("[hub]\nlayout = \"zen\"\n").unwrap();
+        assert!(ok_table.is_empty(), "{ok_table:?}");
+
+        let bad = validate_config(
+            r#"
+theme = "blue"
+ascii = "yes"
+ignore = [""]
+extra = 1
+[hub]
+foo = "bar"
+"#,
+        )
+        .unwrap();
+        assert_eq!(bad.len(), 5, "{bad:?}");
     }
 }

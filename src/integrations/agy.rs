@@ -1,8 +1,9 @@
 //! agy (Antigravity CLI): a plugin folder we own, `<gemini>/config/plugins/grace/`
 //! with `plugin.json` and `hooks.json`. The user's own hooks files stay untouched.
-use super::{HookResult, HookStatus, Integration};
+use super::{ensure_not_symlink, plugin_dir_check, HookResult, HookStatus, Integration};
 use crate::model::Status;
 use crate::platform;
+use crate::session::non_empty_str;
 use crate::setup::{read_opt, write_atomic};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -42,20 +43,8 @@ fn check(exe: &str) -> HookStatus {
     };
     let dir = base.join("config").join("plugins").join("grace");
     let hp = dir.join("hooks.json");
-    if !dir.exists() {
-        if base.join("config").is_dir() || crate::tools::on_path("agy") {
-            return HookStatus::Available(hp);
-        }
-        return HookStatus::NotInstalled;
-    }
-    if !is_ours(&dir) {
-        return HookStatus::Conflict(hp, "foreign plugin folder".into());
-    }
-    if read_opt(&hp).ok().flatten().as_deref() == Some(hooks_json(exe).as_str()) {
-        HookStatus::Connected(hp)
-    } else {
-        HookStatus::OutdatedPath(hp)
-    }
+    let cfg_dir = base.join("config");
+    plugin_dir_check(&dir, hp, Some(&cfg_dir), "agy", is_ours, &hooks_json(exe))
 }
 
 fn plugin_json() -> String {
@@ -66,10 +55,11 @@ fn plugin_json() -> String {
 fn hooks_json(exe: &str) -> String {
     let mut hooks = serde_json::Map::new();
     hooks.insert("enabled".into(), json!(true));
+    let q = platform::quote_cmd(exe);
     for ev in EVENTS {
         let handler = json!({
             "type": "command",
-            "command": format!("{} session hook agy {ev}", platform::quote_posix(exe)),
+            "command": format!("{q} session hook agy {ev}"),
             "timeout": 10
         });
         let entry = if ev == "PostToolUse" {
@@ -93,15 +83,6 @@ fn is_ours(dir: &Path) -> bool {
                     .and_then(Value::as_str)
                     .is_some_and(|d| d.contains("Managed by grace"))
         })
-}
-
-fn ensure_not_symlink(dir: &Path) -> Result<()> {
-    if let Ok(meta) = std::fs::symlink_metadata(dir) {
-        if meta.file_type().is_symlink() {
-            bail!("refusing to touch symlink {}", dir.display());
-        }
-    }
-    Ok(())
 }
 
 fn setup_in(base: &Path, exe: &str, remove: bool) -> Result<String> {
@@ -158,18 +139,11 @@ fn hook(args: &[String], stdin: &str) -> HookResult {
     });
     let session_id = v
         .as_ref()
-        .and_then(|v| {
-            v.get("invocationId")
-                .or_else(|| v.get("sessionId"))
-                .and_then(Value::as_str)
-        })
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+        .and_then(|v| non_empty_str(v, "invocationId").or_else(|| non_empty_str(v, "sessionId")));
     let detail = v
         .as_ref()
-        .and_then(|v| v.get("toolName").and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
-        .map(platform::sanitize_display);
+        .and_then(|v| non_empty_str(v, "toolName"))
+        .map(|s| platform::sanitize_display(&s).into_owned());
     HookResult {
         status: Some(status),
         cwd,

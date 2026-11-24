@@ -1,8 +1,9 @@
 //! Unified "Site of Grace" visual language: adaptive dark/light/256/NO_COLOR tokens,
-//! status glyphs, brand tool colors, and border/title helpers.
+//! status glyphs, brand tool colors, and CLI ANSI helpers.
 use crate::config::Config;
 use crate::model::Status;
 use ratatui::style::{Color, Modifier, Style};
+use std::io::IsTerminal;
 
 pub const GOLD: Color = Color::Rgb(232, 185, 74);
 pub const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -14,6 +15,80 @@ pub enum ToastKind {
     Success,
     Warn,
     Error,
+}
+
+/// Shared CLI ANSI palette and glyph tokens for stdout/stderr commands (`doctor`, `setup`, `stats`, etc.).
+#[derive(Debug, Clone, Copy)]
+pub struct Ansi {
+    pub gold: &'static str,
+    pub green: &'static str,
+    pub yellow: &'static str,
+    pub red: &'static str,
+    pub cyan: &'static str,
+    pub dim: &'static str,
+    pub bold: &'static str,
+    pub reset: &'static str,
+    pub star: &'static str,
+    pub check: &'static str,
+    pub cross: &'static str,
+}
+
+impl Ansi {
+    pub fn stdout(cfg: &Config) -> Self {
+        Self::new(std::io::stdout().is_terminal(), cfg)
+    }
+
+    pub fn stderr(cfg: &Config) -> Self {
+        Self::new(std::io::stderr().is_terminal(), cfg)
+    }
+
+    fn new(is_tty: bool, cfg: &Config) -> Self {
+        let th = Theme::from_env_and_config(cfg);
+        let (star, check, cross) = if th.ascii {
+            ("*", "+", "x")
+        } else {
+            ("✦", "✓", "✗")
+        };
+        if !is_tty || !th.color {
+            return Self {
+                gold: "",
+                green: "",
+                yellow: "",
+                red: "",
+                cyan: "",
+                dim: "",
+                bold: "",
+                reset: "",
+                star,
+                check,
+                cross,
+            };
+        }
+        let gold = if th.light {
+            if th.truecolor {
+                "\x1b[1;38;2;176;121;8m"
+            } else {
+                "\x1b[1;33m"
+            }
+        } else if th.truecolor {
+            "\x1b[1;38;2;232;185;74m"
+        } else {
+            "\x1b[1;33m"
+        };
+        Self {
+            gold,
+            green: "\x1b[32m",
+            yellow: "\x1b[33m",
+            red: "\x1b[31m",
+            cyan: "\x1b[36m",
+            dim: "\x1b[2m",
+            bold: "\x1b[1m",
+            reset: "\x1b[0m",
+            star,
+            check,
+            cross,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +135,7 @@ impl Theme {
             ct || wt || known_tc_prog || direct_term
         };
 
-        let theme_choice = std::env::var("GRACE_THEME")
-            .ok()
-            .filter(|s| !s.is_empty())
+        let theme_choice = crate::platform::env_non_empty("GRACE_THEME")
             .or_else(|| cfg.theme.clone())
             .unwrap_or_else(|| "auto".into());
         let light = match theme_choice.to_ascii_lowercase().as_str() {
@@ -71,7 +144,14 @@ impl Theme {
             _ => detect_light_env(),
         };
 
-        let ascii = std::env::var("GRACE_ASCII").is_ok_and(|v| v == "1") || cfg.ascii == Some(true);
+        let ascii_env = crate::platform::env_non_empty("GRACE_ASCII").and_then(|v| {
+            match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Some(true),
+                "0" | "false" | "no" => Some(false),
+                _ => None,
+            }
+        });
+        let ascii = ascii_env.or(cfg.ascii).unwrap_or(false);
 
         Theme {
             color,
@@ -92,7 +172,7 @@ impl Theme {
     }
 
     /// Map a color to what the terminal can show. None means no color.
-    pub fn map(&self, c: Color) -> Option<Color> {
+    pub fn map(self, c: Color) -> Option<Color> {
         if !self.color {
             return None;
         }
@@ -102,7 +182,7 @@ impl Theme {
         }
     }
 
-    pub fn fg(&self, s: Style, c: Color) -> Style {
+    pub fn fg(self, s: Style, c: Color) -> Style {
         match self.map(c) {
             Some(c) => s.fg(c),
             None => s,
@@ -110,7 +190,7 @@ impl Theme {
     }
 
     /// Apply the theme rules (NO_COLOR, 256 colors) to a style preserving both fg and bg.
-    pub fn apply(&self, s: Style) -> Style {
+    pub fn apply(self, s: Style) -> Style {
         let mut out = Style::default()
             .add_modifier(s.add_modifier)
             .remove_modifier(s.sub_modifier);
@@ -123,155 +203,125 @@ impl Theme {
         out
     }
 
-    pub fn accent(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(130)
-            } else {
-                Color::Yellow
-            }
-        } else if self.light {
-            Color::Rgb(176, 121, 8)
-        } else {
-            GOLD
+    fn pick(self, dark_rgb: Color, light_rgb: Color, dark_256: Color, light_256: Color) -> Color {
+        match (self.truecolor, self.light) {
+            (true, false) => dark_rgb,
+            (true, true) => light_rgb,
+            (false, false) => dark_256,
+            (false, true) => light_256,
         }
     }
 
-    pub fn accent_hi(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(94)
-            } else {
-                Color::LightYellow
-            }
-        } else if self.light {
-            Color::Rgb(122, 79, 0)
+    fn pick_opt(
+        self,
+        dark_rgb: Color,
+        light_rgb: Color,
+        dark_256: Color,
+        light_256: Color,
+    ) -> Option<Color> {
+        self.color
+            .then(|| self.pick(dark_rgb, light_rgb, dark_256, light_256))
+    }
+
+    pub fn sym(self, uni: &'static str, asc: &'static str) -> &'static str {
+        if self.ascii {
+            asc
         } else {
-            Color::Rgb(255, 233, 163)
+            uni
         }
     }
 
-    pub fn fg_muted(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(242)
-            } else {
-                Color::Gray
-            }
-        } else if self.light {
-            Color::Rgb(92, 99, 112)
-        } else {
-            Color::Rgb(139, 145, 160)
-        }
+    pub fn accent(self) -> Color {
+        self.pick(
+            GOLD,
+            Color::Rgb(176, 121, 8),
+            Color::Yellow,
+            Color::Indexed(130),
+        )
     }
 
-    pub fn border_color(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(246)
-            } else {
-                Color::Indexed(240)
-            }
-        } else if self.light {
-            Color::Rgb(200, 205, 216)
-        } else {
-            Color::Rgb(63, 68, 82)
-        }
+    pub fn accent_hi(self) -> Color {
+        self.pick(
+            Color::Rgb(255, 233, 163),
+            Color::Rgb(122, 79, 0),
+            Color::LightYellow,
+            Color::Indexed(94),
+        )
     }
 
-    pub fn sel_bg(&self) -> Option<Color> {
-        if !self.color {
-            None
-        } else if !self.truecolor {
-            Some(if self.light {
-                Color::Indexed(254)
-            } else {
-                Color::Indexed(237)
-            })
-        } else if self.light {
-            Some(Color::Rgb(236, 231, 218))
-        } else {
-            Some(Color::Rgb(40, 44, 56))
-        }
+    pub fn fg_muted(self) -> Color {
+        self.pick(
+            Color::Rgb(139, 145, 160),
+            Color::Rgb(92, 99, 112),
+            Color::Gray,
+            Color::Indexed(242),
+        )
     }
 
-    pub fn sel_bg_dim(&self) -> Option<Color> {
-        if !self.color {
-            None
-        } else if !self.truecolor {
-            Some(if self.light {
-                Color::Indexed(255)
-            } else {
-                Color::Indexed(235)
-            })
-        } else if self.light {
-            Some(Color::Rgb(243, 241, 235))
-        } else {
-            Some(Color::Rgb(31, 34, 43))
-        }
+    pub fn border_color(self) -> Color {
+        self.pick(
+            Color::Rgb(63, 68, 82),
+            Color::Rgb(200, 205, 216),
+            Color::Indexed(240),
+            Color::Indexed(246),
+        )
     }
 
-    pub fn pill_bg(&self) -> Option<Color> {
-        if !self.color {
-            None
-        } else if !self.truecolor {
-            Some(if self.light {
-                Color::Indexed(253)
-            } else {
-                Color::Indexed(235)
-            })
-        } else if self.light {
-            Some(Color::Rgb(229, 232, 240))
-        } else {
-            Some(Color::Rgb(35, 39, 50))
-        }
+    pub fn sel_bg(self) -> Option<Color> {
+        self.pick_opt(
+            Color::Rgb(40, 44, 56),
+            Color::Rgb(236, 231, 218),
+            Color::Indexed(237),
+            Color::Indexed(254),
+        )
     }
 
-    pub fn modal_bg(&self) -> Option<Color> {
-        if !self.color {
-            None
-        } else if !self.truecolor {
-            Some(if self.light {
-                Color::Indexed(255)
-            } else {
-                Color::Indexed(234)
-            })
-        } else if self.light {
-            Some(Color::Rgb(248, 247, 243))
-        } else {
-            Some(Color::Rgb(26, 29, 36))
-        }
+    pub fn sel_bg_dim(self) -> Option<Color> {
+        self.pick_opt(
+            Color::Rgb(31, 34, 43),
+            Color::Rgb(243, 241, 235),
+            Color::Indexed(235),
+            Color::Indexed(255),
+        )
     }
 
-    pub fn open_blue(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(25)
-            } else {
-                Color::Blue
-            }
-        } else if self.light {
-            Color::Rgb(9, 105, 218)
-        } else {
-            Color::Rgb(97, 175, 239)
-        }
+    pub fn pill_bg(self) -> Option<Color> {
+        self.pick_opt(
+            Color::Rgb(35, 39, 50),
+            Color::Rgb(229, 232, 240),
+            Color::Indexed(235),
+            Color::Indexed(253),
+        )
     }
 
-    pub fn diff_add_fg(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(28)
-            } else {
-                Color::Green
-            }
-        } else if self.light {
-            Color::Rgb(17, 99, 41)
-        } else {
-            Color::Rgb(133, 211, 155)
-        }
+    pub fn modal_bg(self) -> Option<Color> {
+        self.pick_opt(
+            Color::Rgb(26, 29, 36),
+            Color::Rgb(248, 247, 243),
+            Color::Indexed(234),
+            Color::Indexed(255),
+        )
     }
 
-    pub fn diff_add_bg(&self) -> Option<Color> {
+    pub fn open_blue(self) -> Color {
+        self.pick(
+            Color::Rgb(97, 175, 239),
+            Color::Rgb(9, 105, 218),
+            Color::Blue,
+            Color::Indexed(25),
+        )
+    }
+
+    pub fn diff_add_fg(self) -> Color {
+        self.pick(
+            Color::Rgb(133, 211, 155),
+            Color::Rgb(17, 99, 41),
+            Color::Green,
+            Color::Indexed(28),
+        )
+    }
+
+    pub fn diff_add_bg(self) -> Option<Color> {
         if !self.color || !self.truecolor {
             None
         } else if self.light {
@@ -281,21 +331,16 @@ impl Theme {
         }
     }
 
-    pub fn diff_del_fg(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(160)
-            } else {
-                Color::Red
-            }
-        } else if self.light {
-            Color::Rgb(180, 35, 24)
-        } else {
-            Color::Rgb(240, 113, 120)
-        }
+    pub fn diff_del_fg(self) -> Color {
+        self.pick(
+            Color::Rgb(240, 113, 120),
+            Color::Rgb(180, 35, 24),
+            Color::Red,
+            Color::Indexed(160),
+        )
     }
 
-    pub fn diff_del_bg(&self) -> Option<Color> {
+    pub fn diff_del_bg(self) -> Option<Color> {
         if !self.color || !self.truecolor {
             None
         } else if self.light {
@@ -305,35 +350,25 @@ impl Theme {
         }
     }
 
-    pub fn diff_hunk_fg(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(25)
-            } else {
-                Color::Cyan
-            }
-        } else if self.light {
-            Color::Rgb(5, 80, 174)
-        } else {
-            Color::Rgb(103, 183, 209)
-        }
+    pub fn diff_hunk_fg(self) -> Color {
+        self.pick(
+            Color::Rgb(103, 183, 209),
+            Color::Rgb(5, 80, 174),
+            Color::Cyan,
+            Color::Indexed(25),
+        )
     }
 
-    pub fn diff_conflict_fg(&self) -> Color {
-        if !self.truecolor {
-            if self.light {
-                Color::Indexed(127)
-            } else {
-                Color::Magenta
-            }
-        } else if self.light {
-            Color::Rgb(130, 80, 223)
-        } else {
-            Color::Rgb(198, 120, 221)
-        }
+    pub fn diff_conflict_fg(self) -> Color {
+        self.pick(
+            Color::Rgb(198, 120, 221),
+            Color::Rgb(130, 80, 223),
+            Color::Magenta,
+            Color::Indexed(127),
+        )
     }
 
-    pub fn diff_hunk_bg(&self) -> Option<Color> {
+    pub fn diff_hunk_bg(self) -> Option<Color> {
         if !self.color || !self.truecolor {
             None
         } else if self.light {
@@ -343,7 +378,7 @@ impl Theme {
         }
     }
 
-    pub fn toast_style(&self, kind: ToastKind) -> Style {
+    pub fn toast_style(self, kind: ToastKind) -> Style {
         let s = Style::default().remove_modifier(Modifier::DIM);
         match kind {
             ToastKind::Info => self.fg(s, self.accent()),
@@ -354,7 +389,7 @@ impl Theme {
     }
 
     /// Border style without `Modifier::DIM` in color mode so block titles never fade.
-    pub fn border_style(&self, focused: bool) -> Style {
+    pub fn border_style(self, focused: bool) -> Style {
         if !self.color {
             if focused {
                 Style::default().add_modifier(Modifier::BOLD)
@@ -368,23 +403,23 @@ impl Theme {
         }
     }
 
-    pub fn title_accent(&self) -> Style {
+    pub fn title_accent(self) -> Style {
         self.fg(Style::default(), self.accent())
             .add_modifier(Modifier::BOLD)
             .remove_modifier(Modifier::DIM)
     }
 
-    pub fn title_muted(&self) -> Style {
+    pub fn title_muted(self) -> Style {
         self.muted().remove_modifier(Modifier::DIM)
     }
 
-    pub fn keycap_style(&self) -> Style {
+    pub fn keycap_style(self) -> Style {
         Style::default()
             .add_modifier(Modifier::BOLD)
             .remove_modifier(Modifier::DIM)
     }
 
-    pub fn muted(&self) -> Style {
+    pub fn muted(self) -> Style {
         if self.color {
             self.fg(Style::default(), self.fg_muted())
         } else {
@@ -392,15 +427,11 @@ impl Theme {
         }
     }
 
-    pub fn star(&self) -> &'static str {
-        if self.ascii {
-            "*"
-        } else {
-            "✦"
-        }
+    pub fn star(self) -> &'static str {
+        self.sym("✦", "*")
     }
 
-    pub fn pin_glyph(&self) -> char {
+    pub fn pin_glyph(self) -> char {
         if self.ascii {
             '*'
         } else {
@@ -408,55 +439,43 @@ impl Theme {
         }
     }
 
-    pub fn editor_glyph(&self) -> &'static str {
-        if self.ascii {
-            "#"
-        } else {
-            "▣"
-        }
+    pub fn editor_glyph(self) -> &'static str {
+        self.sym("▣", "#")
     }
 
-    pub fn active_ws_glyph(&self) -> &'static str {
-        if self.ascii {
-            ">"
-        } else {
-            "◆"
-        }
+    pub fn active_ws_glyph(self) -> &'static str {
+        self.sym("◆", ">")
     }
 
-    pub fn open_ws_glyph(&self) -> &'static str {
-        if self.ascii {
-            "-"
-        } else {
-            "◇"
-        }
+    pub fn open_ws_glyph(self) -> &'static str {
+        self.sym("◇", "-")
     }
 
-    pub fn branch_glyph(&self) -> &'static str {
-        if self.ascii {
-            "@"
-        } else {
-            "⎇"
-        }
+    pub fn branch_glyph(self) -> &'static str {
+        self.sym("⎇", "@")
     }
 
-    pub fn scroll_thumb(&self) -> &'static str {
-        if self.ascii {
-            "#"
-        } else {
-            "█"
-        }
+    pub fn scroll_thumb(self) -> &'static str {
+        self.sym("█", "#")
     }
 
-    pub fn scroll_track(&self) -> &'static str {
-        if self.ascii {
-            "|"
-        } else {
-            "│"
-        }
+    pub fn scroll_track(self) -> &'static str {
+        self.sym("│", "|")
     }
 
-    pub fn border_type(&self) -> ratatui::widgets::BorderType {
+    pub fn h_rule(self) -> &'static str {
+        self.sym("─", "-")
+    }
+
+    pub fn v_rule(self) -> &'static str {
+        self.sym("│", "|")
+    }
+
+    pub fn dot_sep(self) -> &'static str {
+        self.sym(" · ", " | ")
+    }
+
+    pub fn border_type(self) -> ratatui::widgets::BorderType {
         if self.ascii {
             ratatui::widgets::BorderType::Plain
         } else {
@@ -464,42 +483,28 @@ impl Theme {
         }
     }
 
-    pub fn bar_glyph(&self) -> &'static str {
-        if self.ascii {
-            ">"
-        } else {
-            "▌"
-        }
+    pub fn bar_glyph(self) -> &'static str {
+        self.sym("▌", ">")
     }
 
-    pub fn status_look(&self, s: Status, frame: usize) -> (char, &'static str, Style) {
+    pub fn status_look(self, s: Status, frame: usize) -> (char, &'static str, Style) {
         let spin = if self.ascii {
             SPINNER_ASCII[frame % SPINNER_ASCII.len()]
         } else {
             SPINNER[frame % SPINNER.len()]
         };
-        let wait_c = if !self.truecolor {
-            if self.light {
-                Color::Indexed(136)
-            } else {
-                Color::Yellow
-            }
-        } else if self.light {
-            Color::Rgb(184, 110, 0)
-        } else {
-            Color::Rgb(240, 184, 73)
-        };
-        let work_c = if !self.truecolor {
-            if self.light {
-                Color::Indexed(31)
-            } else {
-                Color::Cyan
-            }
-        } else if self.light {
-            Color::Rgb(14, 124, 134)
-        } else {
-            Color::Rgb(86, 182, 194)
-        };
+        let wait_c = self.pick(
+            Color::Rgb(240, 184, 73),
+            Color::Rgb(184, 110, 0),
+            Color::Yellow,
+            Color::Indexed(136),
+        );
+        let work_c = self.pick(
+            Color::Rgb(86, 182, 194),
+            Color::Rgb(14, 124, 134),
+            Color::Cyan,
+            Color::Indexed(31),
+        );
         let done_c = self.diff_add_fg();
         match s {
             Status::Waiting => (
@@ -522,7 +527,7 @@ impl Theme {
         }
     }
 
-    pub fn tag_color(&self, tool: &str) -> Color {
+    pub fn tag_color(self, tool: &str) -> Color {
         if self.light {
             return match tool {
                 "claude" => Color::Rgb(184, 82, 50),
@@ -658,5 +663,26 @@ mod tests {
         assert_ne!(dark.accent(), light.accent());
         assert_ne!(dark.tag_color("amp"), light.tag_color("amp"));
         assert_ne!(dark.sel_bg(), light.sel_bg());
+    }
+
+    #[test]
+    fn ascii_env_overrides_config() {
+        let prev = std::env::var_os("GRACE_ASCII");
+        std::env::set_var("GRACE_ASCII", "0");
+        let cfg = Config {
+            ascii: Some(true),
+            ..Config::default()
+        };
+        assert!(!Theme::from_env_and_config(&cfg).ascii);
+        std::env::set_var("GRACE_ASCII", "1");
+        let cfg_false = Config {
+            ascii: Some(false),
+            ..Config::default()
+        };
+        assert!(Theme::from_env_and_config(&cfg_false).ascii);
+        match prev {
+            Some(v) => std::env::set_var("GRACE_ASCII", v),
+            None => std::env::remove_var("GRACE_ASCII"),
+        }
     }
 }

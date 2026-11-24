@@ -176,7 +176,7 @@ grace ❯
   ~/code/aiml/knn        [claude]   ● needs you     2m
   ~/code/aiml/svm        [claude]   ○ your turn     5m
   ~/work/api-server      [codex]    ⠋ working       now
-  ~/code/aiml/kmeans     [agy]      ✓ done          12m
+  ~/code/aiml/kmeans     [antigravity] ✓ done       12m
 ```
 
 "Needs you" means the agent is blocked on a question or a permission. "Your turn" means it finished.
@@ -334,7 +334,7 @@ cargo install --git https://github.com/prathameshk421/grace
 | Shell | Line | File |
 |---|---|---|
 | zsh | `eval "$(grace init zsh)"` | `~/.zshrc` |
-| bash | `eval "$(grace init bash)"` | `~/.bashrc` |
+| bash | `eval "$(grace init bash)"` | `~/.bashrc` (or `~/.bash_profile`) |
 | fish | `grace init fish \| source` | `~/.config/fish/config.fish` |
 | PowerShell | `Invoke-Expression (& grace init powershell \| Out-String)` | `$PROFILE` |
 
@@ -357,8 +357,8 @@ cargo install --git https://github.com/prathameshk421/grace
 | `grace hub [path]` | Open the hub on tmux: sidebar, shell, diff and file tree. Inside the hub, switch to the folder. |
 | `grace diff [path]` | Show the changed files of a git repository and a colored diff. |
 | `grace tree [path]` | Show the files of a folder as a tree, with git changes marked. |
-| `grace list` | Print all folders, best first (`--json` for JSON output). |
-| `grace sessions` | Live CLI agent sessions (`-l` plain, `--json` for JSON). |
+| `grace list` | Print all folders, best first (`-t <tag>` to filter, `--json` for JSON). |
+| `grace sessions` | Live CLI agent sessions (`-l` plain, `--json` for JSON, `-o` jump to urgent). |
 | `grace setup [agent]` | Inspect agent hooks, connect one agent, or use `--all`. |
 | `grace doctor [--fix]` | Check shell integration, DB permissions/integrity, hooks, and tmux. |
 | `grace stats` | Show usage statistics across tracked folders and tools. |

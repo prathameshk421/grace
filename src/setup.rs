@@ -1,14 +1,16 @@
 //! `grace setup [target]`: connect CLI agents to grace so it knows their live status.
 use crate::integrations::{self, HookStatus};
 use crate::platform;
+use crate::theme::Ansi;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
 
 /// Text that marks a Claude hook command as ours.
+#[cfg(test)]
 const CLAUDE_MARK: &str = "session hook claude";
 /// Claude events we hook, with the matcher each one needs (None = no matcher).
 const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
@@ -53,6 +55,12 @@ pub fn inspect_all(exe: &str) -> Vec<(&'static str, &'static str, HookStatus)> {
 
 /// Entry point for `grace setup [target] [--all] [--remove]`.
 pub fn run(target: Option<&str>, all: bool, remove: bool) -> Result<()> {
+    if all && target.is_some() {
+        bail!("cannot combine an agent name with `--all`");
+    }
+    if remove && !all && target.is_none() {
+        bail!("specify an agent name or `--all` with `--remove`");
+    }
     let exe = exe_string()?;
     if all {
         return run_all(&exe, remove);
@@ -146,70 +154,60 @@ fn run_all(exe: &str, remove: bool) -> Result<()> {
 }
 
 fn print_overview(exe: &str) -> Result<()> {
-    let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-    let clicolor_off = std::env::var("CLICOLOR").is_ok_and(|v| v == "0");
-    let dumb = std::env::var("TERM").is_ok_and(|v| v == "dumb");
-    let tty = std::io::stderr().is_terminal() && !no_color && !clicolor_off && !dumb;
+    let cfg = crate::config::load();
+    let a = Ansi::stderr(&cfg);
     let home = platform::home_dir().map(|h| platform::clean_path_str(&h.to_string_lossy()));
-    let short = |p: &Path| -> String {
-        let s = platform::sanitize_display(&platform::clean_path_str(&p.to_string_lossy()));
-        platform::strip_home_prefix(&s, home.as_deref())
-    };
-    let (gold, green, yellow, dim, reset) = if tty {
-        ("\x1b[1;33m", "\x1b[32m", "\x1b[33m", "\x1b[2m", "\x1b[0m")
-    } else {
-        ("", "", "", "", "")
-    };
+    let short = |p: &Path| platform::short_path(p, home.as_deref());
     eprintln!();
     eprintln!(
-        "  {gold}✦ grace setup{reset} {dim}— connect CLI agents for live session status{reset}"
+        "  {}{} grace setup{} {}— connect CLI agents for live session status{}",
+        a.gold, a.star, a.reset, a.dim, a.reset
     );
     eprintln!();
-    eprintln!("  {dim}{:<10}  {:<13}  CONFIG{reset}", "AGENT", "STATUS");
+    eprintln!(
+        "  {}{:<10}  {:<13}  CONFIG{}",
+        a.dim, "AGENT", "STATUS", a.reset
+    );
     for (name, _label, st) in inspect_all(exe) {
-        let (badge, cfg, action) = match st {
+        let (badge, cfg_s, action) = match st {
             HookStatus::Connected(p) => (
-                format!("{green}✓ connected{reset}  "),
+                format!("{}{} connected{}  ", a.green, a.check, a.reset),
                 short(&p),
                 String::new(),
             ),
             HookStatus::OutdatedPath(p) => (
-                format!("{yellow}! outdated{reset}   "),
+                format!("{}! outdated{}   ", a.yellow, a.reset),
                 short(&p),
-                format!("  {dim}→ grace setup {name}{reset}"),
+                format!("  {}→ grace setup {name}{}", a.dim, a.reset),
             ),
             HookStatus::Available(p) => (
-                format!("{yellow}○ available{reset}  "),
+                format!("{}○ available{}  ", a.yellow, a.reset),
                 short(&p),
-                format!("  {dim}→ grace setup {name}{reset}"),
+                format!("  {}→ grace setup {name}{}", a.dim, a.reset),
             ),
             HookStatus::NotInstalled => (
-                format!("{dim}· not found{reset}  "),
+                format!("{}· not found{}  ", a.dim, a.reset),
                 String::new(),
                 String::new(),
             ),
             HookStatus::Conflict(p, why) => (
-                format!("{yellow}! conflict{reset}   "),
+                format!("{}! conflict{}   ", a.yellow, a.reset),
                 format!("{} ({})", short(&p), platform::sanitize_display(&why)),
                 String::new(),
             ),
         };
-        eprintln!("  {name:<10}  {badge}  {cfg}{action}");
+        eprintln!("  {name:<10}  {badge}  {cfg_s}{action}");
     }
     eprintln!();
-    eprintln!("  {dim}Run `grace setup <agent>` to connect one, or `grace setup --all` for all installed agents.{reset}");
+    eprintln!(
+        "  {}Run `grace setup <agent>` to connect one, or `grace setup --all` for all installed agents.{}",
+        a.dim, a.reset
+    );
     Ok(())
 }
 
 pub(crate) fn env_dir(var: &str, default_sub: &str) -> Result<PathBuf> {
-    if let Ok(v) = std::env::var(var) {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v));
-        }
-    }
-    platform::home_dir()
-        .map(|h| h.join(default_sub))
-        .ok_or_else(|| anyhow!("cannot find the home folder"))
+    platform::env_dir(var, default_sub).ok_or_else(|| anyhow!("cannot find the home folder"))
 }
 
 pub fn claude_settings_path() -> Result<PathBuf> {
@@ -230,60 +228,11 @@ pub fn exe_string() -> Result<String> {
     Ok(s)
 }
 
-/// Quote a path for the POSIX shell when it has special characters.
-pub(crate) fn shell_quote(s: &str) -> String {
-    platform::quote_posix(s)
-}
-
-fn claude_command(exe: &str) -> String {
-    format!("{} {}", platform::quote_posix(exe), CLAUDE_MARK)
-}
-
 pub fn check_claude(exe: &str) -> HookStatus {
     let Ok(path) = claude_settings_path() else {
         return HookStatus::NotInstalled;
     };
-    let Ok(Some(text)) = read_opt(&path) else {
-        if path.parent().is_some_and(|p| p.is_dir()) || crate::tools::on_path("claude") {
-            return HookStatus::Available(path);
-        }
-        return HookStatus::NotInstalled;
-    };
-    let Ok(root) = parse_settings(&path, Some(&text)) else {
-        return HookStatus::Conflict(path, "invalid JSON".into());
-    };
-    let want = claude_command(exe);
-    let mut has_ours = false;
-    let mut matches_all = true;
-    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
-        return HookStatus::Available(path);
-    };
-    for (event, _) in CLAUDE_EVENTS {
-        let found = hooks
-            .get(*event)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|g| g.get("hooks").and_then(Value::as_array))
-            .flatten()
-            .find(|h| is_ours(h));
-        match found {
-            Some(h) => {
-                has_ours = true;
-                if h.get("command").and_then(Value::as_str) != Some(want.as_str()) {
-                    matches_all = false;
-                }
-            }
-            None => matches_all = false,
-        }
-    }
-    if has_ours && matches_all {
-        HookStatus::Connected(path)
-    } else if has_ours {
-        HookStatus::OutdatedPath(path)
-    } else {
-        HookStatus::Available(path)
-    }
+    json_hooks_check(&path, exe, "claude", CLAUDE_EVENTS)
 }
 
 pub fn check_codex(exe: &str) -> HookStatus {
@@ -360,13 +309,15 @@ pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(orig_mode.unwrap_or(0o600).min(0o600));
+                opts.mode(0o600);
             }
             match opts.open(&backup) {
                 Ok(mut f) => {
                     f.write_all(&existing)
                         .with_context(|| format!("cannot write backup {}", backup.display()))?;
                     let _ = f.sync_all();
+                    drop(f);
+                    platform::restrict_file_0600(&backup);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => {
@@ -450,41 +401,115 @@ pub(crate) fn parse_settings(path: &Path, text: Option<&str>) -> Result<Value> {
     }
 }
 
-fn is_ours(hook: &Value) -> bool {
+fn is_ours_hook(hook: &Value, mark: &str) -> bool {
     hook.get("command")
         .and_then(Value::as_str)
-        .is_some_and(|c| c.contains(CLAUDE_MARK))
+        .is_some_and(|c| c.contains(mark))
 }
 
-/// Add or update our hooks in a Claude settings file. Returns a summary.
-pub fn claude_add(path: &Path, exe: &str) -> Result<String> {
+pub(crate) fn json_hooks_check(
+    path: &Path,
+    exe: &str,
+    name: &str,
+    events: &[(&str, Option<&str>)],
+) -> HookStatus {
+    let Ok(Some(text)) = read_opt(path) else {
+        if path.parent().is_some_and(|p| p.is_dir()) || crate::tools::on_path(name) {
+            return HookStatus::Available(path.to_path_buf());
+        }
+        return HookStatus::NotInstalled;
+    };
+    let Ok(root) = parse_settings(path, Some(&text)) else {
+        return HookStatus::Conflict(path.to_path_buf(), "invalid JSON".into());
+    };
+    let Some(hooks_val) = root.get("hooks") else {
+        return HookStatus::Available(path.to_path_buf());
+    };
+    let Some(hooks) = hooks_val.as_object() else {
+        return HookStatus::Conflict(path.to_path_buf(), "'hooks' is not an object".into());
+    };
+    let mark = format!("session hook {name}");
+    let want = format!("{} {mark}", platform::quote_cmd(exe));
+    let mut has_ours = false;
+    let mut matches_all = true;
+    for (event, _) in events {
+        let Some(ev_val) = hooks.get(*event) else {
+            matches_all = false;
+            continue;
+        };
+        let Some(groups) = ev_val.as_array() else {
+            return HookStatus::Conflict(
+                path.to_path_buf(),
+                format!("hooks.{event} is not an array"),
+            );
+        };
+        let found = groups
+            .iter()
+            .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .find(|h| is_ours_hook(h, &mark));
+        match found {
+            Some(h) => {
+                has_ours = true;
+                if h.get("command").and_then(Value::as_str) != Some(want.as_str()) {
+                    matches_all = false;
+                }
+            }
+            None => matches_all = false,
+        }
+    }
+    if has_ours && matches_all {
+        HookStatus::Connected(path.to_path_buf())
+    } else if has_ours {
+        HookStatus::OutdatedPath(path.to_path_buf())
+    } else {
+        HookStatus::Available(path.to_path_buf())
+    }
+}
+
+/// Add or update our command hooks in a Claude-style JSON settings file. Returns a summary.
+pub(crate) fn json_hooks_add(
+    path: &Path,
+    exe: &str,
+    name: &str,
+    events: &[(&str, Option<&str>)],
+    label: &str,
+) -> Result<String> {
+    let mark = format!("session hook {name}");
+    let cmd = format!("{} {mark}", platform::quote_cmd(exe));
     let text = read_opt(path)?;
     let mut root = parse_settings(path, text.as_deref())?;
-    let cmd = claude_command(exe);
-    let obj = root.as_object_mut().unwrap();
-    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    let hooks = hooks.as_object_mut().ok_or_else(|| {
-        anyhow!(
-            "'hooks' in {} is not an object. Nothing changed",
-            path.display()
-        )
-    })?;
-    let (mut added, mut updated) = (vec![], vec![]);
-    for (event, matcher) in CLAUDE_EVENTS {
-        let groups = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
-        let groups = groups.as_array_mut().ok_or_else(|| {
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
             anyhow!(
-                "hooks.{event} in {} is not an array. Nothing changed",
+                "'hooks' in {} is not an object. Nothing changed",
                 path.display()
             )
         })?;
+    let (mut added, mut updated) = (vec![], vec![]);
+    for (event, matcher) in events {
+        let groups = hooks
+            .entry((*event).to_string())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| {
+                anyhow!(
+                    "hooks.{event} in {} is not an array. Nothing changed",
+                    path.display()
+                )
+            })?;
         let mut found = false;
         let mut changed = false;
         for g in groups.iter_mut() {
             let Some(list) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
                 continue;
             };
-            for h in list.iter_mut().filter(|h| is_ours(h)) {
+            for h in list.iter_mut().filter(|h| is_ours_hook(h, &mark)) {
                 found = true;
                 if h["command"].as_str() != Some(&cmd) {
                     h["command"] = Value::String(cmd.clone());
@@ -507,14 +532,14 @@ pub fn claude_add(path: &Path, exe: &str) -> Result<String> {
             updated.push(*event);
         }
     }
-    let mut out = serde_json::to_string_pretty(&root)?;
-    out.push('\n');
     if added.is_empty() && updated.is_empty() {
         return Ok(format!(
             "{}: grace hooks already set up. Nothing to do.",
             path.display()
         ));
     }
+    let mut out = serde_json::to_string_pretty(&root)?;
+    out.push('\n');
     write_atomic(path, &out)?;
     let mut msg = format!("Updated {}", path.display());
     if !added.is_empty() {
@@ -523,12 +548,15 @@ pub fn claude_add(path: &Path, exe: &str) -> Result<String> {
     if !updated.is_empty() {
         msg.push_str(&format!("\n  updated path: {}", updated.join(", ")));
     }
-    msg.push_str("\nRestart running Claude Code sessions to pick this up.");
+    msg.push_str(&format!(
+        "\nRestart running {label} sessions to pick this up."
+    ));
     Ok(msg)
 }
 
-/// Remove our hooks from a Claude settings file. Returns a summary.
-pub fn claude_remove(path: &Path) -> Result<String> {
+/// Remove our command hooks. Drops emptied groups, events and the `hooks` key.
+pub(crate) fn json_hooks_remove(path: &Path, name: &str, label: &str) -> Result<String> {
+    let mark = format!("session hook {name}");
     let text = read_opt(path)?;
     if text.is_none() {
         return Ok(format!("{} does not exist. Nothing to do.", path.display()));
@@ -545,9 +573,8 @@ pub fn claude_remove(path: &Path) -> Result<String> {
             for g in groups.iter_mut() {
                 if let Some(list) = g.get_mut("hooks").and_then(Value::as_array_mut) {
                     let before = list.len();
-                    list.retain(|h| !is_ours(h));
-                    let d = before - list.len();
-                    n += d;
+                    list.retain(|h| !is_ours_hook(h, &mark));
+                    n += before - list.len();
                 }
             }
             if n > 0 {
@@ -576,10 +603,20 @@ pub fn claude_remove(path: &Path) -> Result<String> {
     out.push('\n');
     write_atomic(path, &out)?;
     Ok(format!(
-        "Updated {}\n  removed: {}\nRestart running Claude Code sessions to pick this up.",
+        "Updated {}\n  removed: {}\nRestart running {label} sessions to pick this up.",
         path.display(),
         removed.join(", ")
     ))
+}
+
+/// Add or update our hooks in a Claude settings file. Returns a summary.
+pub fn claude_add(path: &Path, exe: &str) -> Result<String> {
+    json_hooks_add(path, exe, "claude", CLAUDE_EVENTS, "Claude Code")
+}
+
+/// Remove our hooks from a Claude settings file. Returns a summary.
+pub fn claude_remove(path: &Path) -> Result<String> {
+    json_hooks_remove(path, "claude", "Claude Code")
 }
 
 fn parse_toml(path: &Path, text: Option<&str>) -> Result<DocumentMut> {
@@ -636,7 +673,7 @@ pub fn codex_add(path: &Path, exe: &str) -> Result<String> {
                      from your program) or remove your notify line first. Nothing changed.",
                     path.display(),
                     item.to_string().trim(),
-                    shell_quote(exe)
+                    platform::quote_posix(exe)
                 );
                 };
                 if strs_are_ours(&old) {
@@ -655,7 +692,7 @@ pub fn codex_add(path: &Path, exe: &str) -> Result<String> {
                     note =
                         format!(
                     "\ngrace now forwards each Codex event to your old notify program:\n  {}",
-                    old.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
+                    old.iter().map(|s| platform::quote_posix(s)).collect::<Vec<_>>().join(" ")
                 );
                     "chained"
                 }
@@ -818,6 +855,20 @@ mod tests {
         let link = d.path().join("link.json");
         std::os::unix::fs::symlink(&p, &link).unwrap();
         assert!(write_atomic(&link, "{}").is_err());
+
+        // Read-only source file (0o444) must still produce an owner-only 0o600 backup.
+        let ro = d.path().join("ro.json");
+        fs::write(&ro, "{}").unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o444)).unwrap();
+        write_atomic(&ro, "{\"a\":1}").unwrap();
+        assert_eq!(
+            fs::metadata(ro.with_file_name("ro.json.grace-backup"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -942,9 +993,20 @@ mod tests {
     }
 
     #[test]
-    fn quoting() {
-        assert_eq!(shell_quote("/a/b"), "/a/b");
-        assert_eq!(shell_quote("/a b/c"), "'/a b/c'");
-        assert_eq!(shell_quote(r"C:\a b\grace.exe"), r"'C:\a b\grace.exe'");
+    fn json_hooks_conflict_and_setup_cli_guards() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.json");
+        fs::write(&p, r#"{"hooks": []}"#).unwrap();
+        assert!(matches!(
+            json_hooks_check(&p, EXE, "claude", CLAUDE_EVENTS),
+            HookStatus::Conflict(_, _)
+        ));
+        fs::write(&p, r#"{"hooks": {"Stop": {}}}"#).unwrap();
+        assert!(matches!(
+            json_hooks_check(&p, EXE, "claude", CLAUDE_EVENTS),
+            HookStatus::Conflict(_, _)
+        ));
+        assert!(run(Some("claude"), true, false).is_err());
+        assert!(run(None, false, true).is_err());
     }
 }

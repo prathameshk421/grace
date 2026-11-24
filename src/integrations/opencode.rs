@@ -1,8 +1,11 @@
 //! opencode: a plugin file we own, `<config>/plugins/grace.js`.
-use super::{HookResult, HookStatus, Integration};
+use super::{
+    managed_file_check, remove_owned_backup, simple_arg_hook, HookResult, HookStatus, Integration,
+};
 use crate::model::Status;
+use crate::platform;
 use crate::setup::{read_opt, write_atomic};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 pub static INTEGRATION: Integration = Integration {
@@ -19,21 +22,16 @@ pub static INTEGRATION: Integration = Integration {
 const MARK: &str = "Managed by grace";
 
 fn base_dir() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var("GRACE_OPENCODE_DIR") {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v));
-        }
-    }
-    if let Ok(v) = std::env::var("XDG_CONFIG_HOME") {
-        if !v.is_empty() && Path::new(&v).is_absolute() {
-            return Ok(PathBuf::from(v).join("opencode"));
-        }
-    }
-    crate::setup::env_dir("GRACE_OPENCODE_DIR", ".config/opencode")
+    platform::xdg_config_dir(Some("GRACE_OPENCODE_DIR"), "opencode")
+        .ok_or_else(|| anyhow!("cannot find the home folder"))
 }
 
 fn setup(exe: &str, remove: bool) -> Result<String> {
     setup_in(&base_dir()?, exe, remove)
+}
+
+fn is_ours_text(t: &str) -> bool {
+    t.contains(MARK)
 }
 
 fn check(exe: &str) -> HookStatus {
@@ -41,20 +39,14 @@ fn check(exe: &str) -> HookStatus {
         return HookStatus::NotInstalled;
     };
     let path = base.join("plugins").join("grace.js");
-    let Ok(Some(cur)) = read_opt(&path) else {
-        if base.is_dir() || crate::tools::on_path("opencode") {
-            return HookStatus::Available(path);
-        }
-        return HookStatus::NotInstalled;
-    };
-    if !cur.contains(MARK) {
-        return HookStatus::Conflict(path, "custom grace.js".into());
-    }
-    if cur == plugin_source(exe) {
-        HookStatus::Connected(path)
-    } else {
-        HookStatus::OutdatedPath(path)
-    }
+    managed_file_check(
+        path,
+        Some(&base),
+        "opencode",
+        "custom grace.js",
+        is_ours_text,
+        |cur| cur == plugin_source(exe),
+    )
 }
 
 fn plugin_source(exe: &str) -> String {
@@ -139,9 +131,10 @@ fn setup_in(base: &Path, exe: &str, remove: bool) -> Result<String> {
     let current = read_opt(&path)?;
     if remove {
         return match current {
-            Some(t) if t.contains(MARK) => {
+            Some(t) if is_ours_text(&t) => {
                 std::fs::remove_file(&path)
                     .with_context(|| format!("cannot remove {}", path.display()))?;
+                remove_owned_backup(&path, MARK);
                 Ok(format!("opencode: removed {}", path.display()))
             }
             Some(_) => Ok(format!(
@@ -152,7 +145,7 @@ fn setup_in(base: &Path, exe: &str, remove: bool) -> Result<String> {
         };
     }
     if let Some(t) = &current {
-        if !t.contains(MARK) {
+        if !is_ours_text(t) {
             bail!(
                 "{} exists and is not managed by grace. Nothing changed",
                 path.display()
@@ -168,20 +161,13 @@ fn setup_in(base: &Path, exe: &str, remove: bool) -> Result<String> {
 }
 
 fn hook(args: &[String], _stdin: &str) -> HookResult {
-    let status = match args.first().map(String::as_str) {
-        Some("working") => Status::Working,
-        Some("waiting") => Status::Waiting,
-        Some("ready") => Status::Ready,
-        Some("done") => Status::Done,
-        _ => return HookResult::default(),
-    };
-    let cwd = args.get(1).filter(|d| !d.is_empty()).cloned();
-    HookResult {
-        status: Some(status),
-        cwd,
-        session_id: None,
-        detail: None,
-    }
+    simple_arg_hook(args, |s| match s {
+        "working" => Some(Status::Working),
+        "waiting" => Some(Status::Waiting),
+        "ready" => Some(Status::Ready),
+        "done" => Some(Status::Done),
+        _ => None,
+    })
 }
 
 #[cfg(test)]

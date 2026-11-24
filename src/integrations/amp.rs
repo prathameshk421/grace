@@ -1,6 +1,9 @@
 //! amp: a plugin file we own, `<config>/plugins/grace.ts`.
-use super::{HookResult, HookStatus, Integration};
+use super::{
+    managed_file_check, remove_owned_backup, simple_arg_hook, HookResult, HookStatus, Integration,
+};
 use crate::model::Status;
+use crate::platform;
 use crate::setup::{read_opt, write_atomic};
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -19,18 +22,7 @@ pub static INTEGRATION: Integration = Integration {
 const MARK: &str = "Managed by grace";
 
 fn base_dir() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var("GRACE_AMP_DIR") {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v));
-        }
-    }
-    if let Ok(v) = std::env::var("XDG_CONFIG_HOME") {
-        if !v.is_empty() && Path::new(&v).is_absolute() {
-            return Ok(PathBuf::from(v).join("amp"));
-        }
-    }
-    crate::platform::home_dir()
-        .map(|h| h.join(".config").join("amp"))
+    platform::xdg_config_dir(Some("GRACE_AMP_DIR"), "amp")
         .ok_or_else(|| anyhow!("cannot find the home folder"))
 }
 
@@ -38,25 +30,23 @@ fn setup(exe: &str, remove: bool) -> Result<String> {
     setup_in(&base_dir()?, exe, remove)
 }
 
+fn is_ours_text(t: &str) -> bool {
+    t.starts_with(&format!("// {MARK}"))
+}
+
 fn check(exe: &str) -> HookStatus {
     let Ok(base) = base_dir() else {
         return HookStatus::NotInstalled;
     };
     let path = base.join("plugins").join("grace.ts");
-    let Ok(Some(cur)) = read_opt(&path) else {
-        if base.is_dir() || crate::tools::on_path("amp") {
-            return HookStatus::Available(path);
-        }
-        return HookStatus::NotInstalled;
-    };
-    if !cur.starts_with(&format!("// {MARK}")) {
-        return HookStatus::Conflict(path, "custom grace.ts".into());
-    }
-    if cur == plugin_source(exe) {
-        HookStatus::Connected(path)
-    } else {
-        HookStatus::OutdatedPath(path)
-    }
+    managed_file_check(
+        path,
+        Some(&base),
+        "amp",
+        "custom grace.ts",
+        is_ours_text,
+        |cur| cur == plugin_source(exe),
+    )
 }
 
 fn plugin_source(exe: &str) -> String {
@@ -98,9 +88,10 @@ fn setup_in(base: &Path, exe: &str, remove: bool) -> Result<String> {
     let current = read_opt(&path)?;
     if remove {
         return match current {
-            Some(t) if t.starts_with(&format!("// {MARK}")) => {
+            Some(t) if is_ours_text(&t) => {
                 std::fs::remove_file(&path)
                     .with_context(|| format!("cannot remove {}", path.display()))?;
+                remove_owned_backup(&path, MARK);
                 Ok(format!(
                     "Removed {}\nRestart running amp sessions to pick this up.",
                     path.display()
@@ -114,7 +105,7 @@ fn setup_in(base: &Path, exe: &str, remove: bool) -> Result<String> {
         };
     }
     if let Some(t) = &current {
-        if !t.starts_with(&format!("// {MARK}")) {
+        if !is_ours_text(t) {
             anyhow::bail!(
                 "{} exists and is not managed by grace. Nothing changed",
                 path.display()
@@ -136,18 +127,11 @@ fn setup_in(base: &Path, exe: &str, remove: bool) -> Result<String> {
 }
 
 fn hook(args: &[String], _stdin: &str) -> HookResult {
-    let status = match args.first().map(String::as_str) {
-        Some("working") => Status::Working,
-        Some("ready") => Status::Ready,
-        _ => return HookResult::default(),
-    };
-    let cwd = args.get(1).filter(|d| !d.is_empty()).cloned();
-    HookResult {
-        status: Some(status),
-        cwd,
-        session_id: None,
-        detail: None,
-    }
+    simple_arg_hook(args, |s| match s {
+        "working" => Some(Status::Working),
+        "ready" => Some(Status::Ready),
+        _ => None,
+    })
 }
 
 #[cfg(test)]

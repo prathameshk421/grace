@@ -2,8 +2,9 @@
 use super::{HookResult, HookStatus, Integration};
 use crate::model::Status;
 use crate::platform;
+use crate::session::non_empty_str;
 use crate::setup::{read_opt, write_atomic};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -31,35 +32,20 @@ const EVENTS: [&str; 8] = [
 ];
 
 fn rc_path() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var("GRACE_CRUSH_DIR") {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v).join("crushrc"));
-        }
+    if let Some(v) = platform::env_non_empty("GRACE_CRUSH_DIR") {
+        return Ok(PathBuf::from(v).join("crushrc"));
     }
     if cfg!(windows) {
-        if let Ok(v) = std::env::var("LOCALAPPDATA") {
-            if !v.is_empty() {
-                let p = PathBuf::from(v).join("crush").join("crushrc");
-                if p.exists() {
-                    return Ok(p);
-                }
-            }
-        }
-    }
-    if let Ok(v) = std::env::var("XDG_CONFIG_HOME") {
-        if !v.is_empty() && Path::new(&v).is_absolute() {
+        if let Some(v) = platform::env_non_empty("LOCALAPPDATA") {
             return Ok(PathBuf::from(v).join("crush").join("crushrc"));
         }
     }
-    platform::home_dir()
-        .map(|h| h.join(".config").join("crush").join("crushrc"))
+    platform::xdg_config_dir(None, "crush")
+        .map(|d| d.join("crushrc"))
         .ok_or_else(|| anyhow!("cannot find the home folder"))
 }
 
 fn setup(exe: &str, remove: bool) -> Result<String> {
-    if !remove && platform::has_line_break_or_nul(exe) {
-        bail!("executable path contains unsafe newline or NUL characters");
-    }
     let p = rc_path()?;
     if remove {
         remove_at(&p)
@@ -97,10 +83,7 @@ fn is_ours(line: &str) -> bool {
 }
 
 fn block(exe: &str) -> String {
-    let cmd = platform::quote_posix(&format!(
-        "{} session hook crush",
-        platform::quote_posix(exe)
-    ));
+    let cmd = platform::quote_posix(&format!("{} session hook crush", platform::quote_cmd(exe)));
     let mut s = format!("{HEADER}\n");
     for e in EVENTS {
         s.push_str(&format!("hook add {e} --name grace --command {cmd}\n"));
@@ -121,9 +104,6 @@ fn strip_ours(text: &str) -> String {
 }
 
 fn add_at(path: &Path, exe: &str) -> Result<String> {
-    if platform::has_line_break_or_nul(exe) {
-        bail!("executable path contains unsafe newline or NUL characters");
-    }
     let text = read_opt(path)?.unwrap_or_default();
     let mut new = strip_ours(&text);
     if !new.is_empty() {
@@ -177,25 +157,12 @@ fn hook(_args: &[String], stdin: &str) -> HookResult {
         "sessionend" => Status::Done,
         _ => return HookResult::default(),
     };
-    let cwd = v
-        .get("cwd")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-        .map(String::from);
-    let session_id = v
-        .get("session_id")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-        .map(String::from);
-    let detail = v
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-        .map(platform::sanitize_display);
+    let detail =
+        non_empty_str(&v, "tool_name").map(|s| platform::sanitize_display(&s).into_owned());
     HookResult {
         status: Some(status),
-        cwd,
-        session_id,
+        cwd: non_empty_str(&v, "cwd"),
+        session_id: non_empty_str(&v, "session_id"),
         detail,
     }
 }

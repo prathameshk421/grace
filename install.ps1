@@ -178,7 +178,7 @@ try {
   Write-Host "  * grace $version installed to $dst ($chosenTarget)" -ForegroundColor Green
   Write-Host ""
   Write-Host "  1. Enable shell integration in PowerShell (`$PROFILE):"
-  Write-Host "       New-Item -ItemType File -Force -Path `$PROFILE"
+  Write-Host "       if (-not (Test-Path -LiteralPath `$PROFILE)) { New-Item -ItemType File -Force -Path `$PROFILE | Out-Null }"
   Write-Host "       Add-Content `$PROFILE 'Invoke-Expression (& grace init powershell | Out-String)'"
   Write-Host ""
   Write-Host "  2. Connect CLI agents and verify health:"

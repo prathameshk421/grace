@@ -1,8 +1,8 @@
 //! qwen: Qwen Code. Hooks go in `~/.qwen/settings.json` (Claude-style `hooks` map).
-use super::gemini::{json_hooks_add, json_hooks_check, json_hooks_remove, parse_event_json};
+use super::gemini::parse_event_json;
 use super::{HookResult, HookStatus, Integration};
 use crate::model::Status;
-use crate::setup::env_dir;
+use crate::setup::{env_dir, json_hooks_add, json_hooks_check, json_hooks_remove};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -17,15 +17,15 @@ pub static INTEGRATION: Integration = Integration {
     stdout: "{}",
 };
 
-const EVENTS: &[&str] = &[
-    "SessionStart",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "PermissionRequest",
-    "Notification",
-    "Stop",
-    "SessionEnd",
+const EVENTS: &[(&str, Option<&str>)] = &[
+    ("SessionStart", None),
+    ("UserPromptSubmit", None),
+    ("PreToolUse", None),
+    ("PostToolUse", None),
+    ("PermissionRequest", None),
+    ("Notification", None),
+    ("Stop", None),
+    ("SessionEnd", None),
 ];
 
 fn settings_path() -> Result<PathBuf> {

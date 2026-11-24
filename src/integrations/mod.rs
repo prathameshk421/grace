@@ -3,7 +3,7 @@
 //! Claude and Codex live in setup.rs / session.rs; everything newer lives here.
 use crate::model::Status;
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod agy;
 pub mod aider;
@@ -75,4 +75,93 @@ pub fn all() -> [&'static Integration; 9] {
 
 pub fn find(name: &str) -> Option<&'static Integration> {
     all().into_iter().find(|i| i.name == name)
+}
+
+pub(super) fn is_symlink(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+pub(super) fn ensure_not_symlink(p: &Path) -> Result<()> {
+    if is_symlink(p) {
+        anyhow::bail!("refusing to touch symlink {}", p.display());
+    }
+    Ok(())
+}
+
+pub(super) fn plugin_dir_check(
+    dir: &Path,
+    hp: PathBuf,
+    avail_dir: Option<&Path>,
+    tool: &str,
+    is_ours: fn(&Path) -> bool,
+    desired_hooks: &str,
+) -> HookStatus {
+    if is_symlink(dir) {
+        return HookStatus::Conflict(hp, "symlink plugin folder".into());
+    }
+    if !dir.exists() {
+        if avail_dir.is_some_and(|p| p.is_dir()) || crate::tools::on_path(tool) {
+            return HookStatus::Available(hp);
+        }
+        return HookStatus::NotInstalled;
+    }
+    if !is_ours(dir) {
+        return HookStatus::Conflict(hp, "foreign plugin folder".into());
+    }
+    if crate::setup::read_opt(&hp).ok().flatten().as_deref() == Some(desired_hooks) {
+        HookStatus::Connected(hp)
+    } else {
+        HookStatus::OutdatedPath(hp)
+    }
+}
+
+pub(super) fn managed_file_check(
+    path: PathBuf,
+    avail_dir: Option<&Path>,
+    tool: &str,
+    conflict_label: &str,
+    is_ours: fn(&str) -> bool,
+    matches: impl FnOnce(&str) -> bool,
+) -> HookStatus {
+    let Ok(Some(cur)) = crate::setup::read_opt(&path) else {
+        if avail_dir.is_some_and(|p| p.is_dir()) || crate::tools::on_path(tool) {
+            return HookStatus::Available(path);
+        }
+        return HookStatus::NotInstalled;
+    };
+    if !is_ours(&cur) {
+        return HookStatus::Conflict(path, conflict_label.into());
+    }
+    if matches(&cur) {
+        HookStatus::Connected(path)
+    } else {
+        HookStatus::OutdatedPath(path)
+    }
+}
+
+pub(super) fn simple_arg_hook(args: &[String], map: fn(&str) -> Option<Status>) -> HookResult {
+    let Some(status) = args.first().and_then(|s| map(s.as_str())) else {
+        return HookResult::default();
+    };
+    let cwd = args.get(1).filter(|d| !d.is_empty()).cloned();
+    HookResult {
+        status: Some(status),
+        cwd,
+        session_id: None,
+        detail: None,
+    }
+}
+
+pub(super) fn remove_owned_backup(path: &Path, mark: &str) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let backup = path.with_file_name(format!("{name}.grace-backup"));
+    if !is_symlink(&backup) {
+        if let Ok(Some(text)) = crate::setup::read_opt(&backup) {
+            if text.contains(mark) {
+                let _ = std::fs::remove_file(&backup);
+            }
+        }
+    }
 }

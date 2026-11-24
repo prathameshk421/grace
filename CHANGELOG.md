@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.2.0
+
+### Performance & Binary Slimming
+
+- **37% smaller release binary**: trimmed unused `clap`/`ratatui` features and enabled LTO + `opt-level = "s"` + symbol stripping (`codegen-units = 1`, `panic = "abort"`), cutting the macOS arm64 binary from `4.1M` to `2.6M`.
+- **Faster CLI startup & hooks**: made `Config`, SQLite `Db`, tool `Registry`, and `IgnoreMatcher` loading lazy (`grace init` opens SQLite read-only when present, `add`/`tag`/`session end`/agent hooks skip building `Registry` via `db.normalize_tool_tag`, and Zsh/Fish AI hooks coalesce `tag` + `session start` into a single `grace session start --tag` call).
+- **Snappier Picker, Diff, Tree & Hub**:
+  - Moved live open-editor scanning (`editors_live::open_editors`) into `after_first_frame` so fast-travel queries skip editor scanning completely and background reloads skip re-querying entries when nothing new was imported.
+  - Added dirty-flag TUI render loops ignoring mouse move noise, cached `Sidebar` data across hub-window-only updates, async startup + debounced diff loading in `grace diff`, and non-numstat git status + early directory skipping in `grace tree`.
+  - Replaced DOM parsing of `~/.claude.json` with a zero-DOM iterative streaming JSON scanner and precompiled `IgnoreMatcher` + O(N) ranking in `rank::sort_entries`.
+
+### Reliability, Security & Shell Polish
+
+- **`grace doctor` upgrades**: added `config.toml` key/type/enum validation (`theme`, `editor`, `ascii`, `hub_layout`, `[hub].layout`, `ignore`), `$ZDOTDIR`/`~/.profile`/`$XDG_CONFIG_HOME` shell detection, read-only DB inspection (`inspect_sessions`, `list_dir_flags`), `0600` permission checks on `grace.db`, `-wal`, `-shm`, and `hub.lock`, fixable-only `--fix` footer hints, and `socket_exists` fast-path for tmux checks.
+- **Shell wrappers & completions**:
+  - Fixed argument scanning before `--` across Zsh, Bash, Fish, and PowerShell wrappers (`-h`/`--help`/`-V`/`--version`, bundled `sessions -lo`, and `--` stop).
+  - Fixed `~` / `~/*` expansion in Zsh & Fish (no longer corrupts `~user`), improved command/argument tokenization in Bash, Fish, and PowerShell, added `__GraceResolveExe` dynamic fallback in PowerShell, and aligned all four completion scripts (`-t`/`--tag`, `-o`/`--open`, `pick`, `tool add`, directory completions, and Fish parity).
+- **CLI & installer fixes**: preserved terminal editor flags and POSIX/PowerShell quoting on launch, wired `config.toml` `editor` into `grace diff` and `grace tree`, guarded `grace pin` against missing/ignored folders and `grace setup --all <target>` conflicts, cleaned up staged binaries on trap failure in `install.sh`, and guarded `$PROFILE` creation in `install.ps1` so existing profiles are not overwritten.
+
 ## 2.1.0
 
 ### Highlights & UI/UX ("Site of Grace")

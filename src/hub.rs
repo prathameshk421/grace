@@ -6,13 +6,16 @@
 //!
 //! grace runs tmux on its own socket (`tmux -L grace`) with its own config file, so the
 //! user's tmux server and `~/.tmux.conf` are never touched.
+use crate::config::Config;
 use crate::db::Db;
 use crate::platform;
-use crate::theme::Theme;
+use crate::theme::{Ansi, Theme};
 use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The tmux session that holds all workspaces.
 pub const SESSION: &str = "grace";
@@ -337,8 +340,9 @@ pub fn load_layout(db: &Db) -> (Layout, Sizes) {
 }
 
 pub fn save_layout(db: &Db, layout: Layout, sizes: &Sizes) -> Result<()> {
-    db.set_meta(LAYOUT_KEY, &layout.to_meta())?;
-    db.set_meta(SIZES_KEY, &sizes.to_meta())
+    let layout_s = layout.to_meta();
+    let sizes_s = sizes.to_meta();
+    db.save_meta_batch(&[(LAYOUT_KEY, &layout_s), (SIZES_KEY, &sizes_s)])
 }
 
 // ---------------------------------------------------------------------------
@@ -717,8 +721,13 @@ pub struct ConfCtx<'a> {
     pub socket: &'a str,
     pub home: Option<&'a str>,
     pub data_dir: Option<&'a str>,
+    pub config_path: Option<&'a str>,
+    pub theme: Option<&'a str>,
+    pub ascii_env: Option<&'a str>,
+    pub no_color: Option<&'a str>,
     pub truecolor: bool,
     pub light: bool,
+    pub color: bool,
     pub ascii: bool,
     pub allow_passthrough: bool,
     pub default_terminal: &'a str,
@@ -739,7 +748,7 @@ pub fn conf_text(c: &ConfCtx) -> String {
         "set -g default-terminal {}",
         tmux_quote(c.default_terminal)
     ));
-    if c.truecolor {
+    if c.truecolor && c.color {
         if at_least(3, 2) {
             line("set -as terminal-features \",*:RGB\"");
         } else {
@@ -768,41 +777,52 @@ pub fn conf_text(c: &ConfCtx) -> String {
         "set-environment -g GRACE_TMUX_SOCKET {}",
         tmux_quote(c.socket)
     ));
-    if let Some(d) = c.data_dir {
-        line(&format!(
-            "set-environment -g GRACE_DATA_DIR {}",
-            tmux_quote(d)
-        ));
+    for (var, val) in [
+        ("GRACE_DATA_DIR", c.data_dir),
+        ("GRACE_CONFIG", c.config_path),
+        ("GRACE_THEME", c.theme),
+        ("GRACE_ASCII", c.ascii_env),
+        ("NO_COLOR", c.no_color),
+    ] {
+        if let Some(v) = val {
+            line(&format!("set-environment -g {var} {}", tmux_quote(v)));
+        }
     }
     line("");
-    let (accent, muted, dim_c, border_c, sel_fg, msg_bg) = match (c.truecolor, c.light) {
-        (true, true) => (
-            "#b07908", "#5c6370", "#9ca3af", "#c8cdd8", "#ffffff", "#ece7da",
-        ),
-        (true, false) => (
-            "#e8b94a", "#8b91a0", "#5c6370", "#3f4452", "#16171b", "#282c38",
-        ),
-        (false, true) => (
-            "colour130",
-            "colour242",
-            "colour248",
-            "colour250",
-            "colour255",
-            "colour254",
-        ),
-        (false, false) => (
-            "yellow",
-            "colour247",
-            "colour241",
-            "colour240",
-            "black",
-            "colour237",
-        ),
+    let (accent, muted, dim_c, border_c, sel_fg, msg_bg) = if !c.color {
+        (
+            "default", "default", "default", "default", "default", "default",
+        )
+    } else {
+        match (c.truecolor, c.light) {
+            (true, true) => (
+                "#b07908", "#5c6370", "#9ca3af", "#c8cdd8", "#ffffff", "#ece7da",
+            ),
+            (true, false) => (
+                "#e8b94a", "#8b91a0", "#5c6370", "#3f4452", "#16171b", "#282c38",
+            ),
+            (false, true) => (
+                "colour130",
+                "colour242",
+                "colour248",
+                "colour250",
+                "colour255",
+                "colour254",
+            ),
+            (false, false) => (
+                "yellow",
+                "colour247",
+                "colour241",
+                "colour240",
+                "black",
+                "colour237",
+            ),
+        }
     };
     let star = if c.ascii { "*" } else { "✦" };
     let sep_bar = if c.ascii { "|" } else { "│" };
     let dot = if c.ascii { "|" } else { "·" };
-    let lines_style = if c.ascii { "ascii" } else { "single" };
+    let lines_style = if c.ascii { "simple" } else { "single" };
     line("# Panes");
     line("set -g pane-border-status top");
     if at_least(3, 2) {
@@ -839,8 +859,13 @@ pub fn conf_text(c: &ConfCtx) -> String {
     line(&format!(
         "set -g window-status-current-style \"bg=default,fg={accent},bold,none\""
     ));
+    let badge_style = if c.color {
+        format!("bg={accent}#,fg={sel_fg}#,bold")
+    } else {
+        "reverse#,bold".into()
+    };
     line(&format!(
-        "set -g status-left '#{{?#{{==:#{{client_key_table}},grace}},#[bg={accent}#,fg={sel_fg}#,bold] {star} CTRL-G #[bg=default] ,#[fg={accent}#,bold] {star} grace #[fg={border_c}]{sep_bar} }}'"
+        "set -g status-left '#{{?#{{==:#{{client_key_table}},grace}},#[{badge_style}] {star} CTRL-G #[bg=default] ,#[fg={accent}#,bold] {star} grace #[fg={border_c}]{sep_bar} }}'"
     ));
     line("set -g status-left-length 22");
     line(&format!(
@@ -850,9 +875,12 @@ pub fn conf_text(c: &ConfCtx) -> String {
     line("set -g window-status-separator \"\"");
     line("set -g window-status-format \" #I #W#{?#{@grace_glyph}, #{@grace_glyph},} \"");
     line("set -g window-status-current-format \" #I #W#{?#{@grace_glyph}, #{@grace_glyph},} \"");
-    line(&format!(
-        "set -g message-style \"fg={accent},bg={msg_bg},bold\""
-    ));
+    let msg_style = if c.color {
+        format!("fg={accent},bg={msg_bg},bold")
+    } else {
+        "reverse,bold".into()
+    };
+    line(&format!("set -g message-style \"{msg_style}\""));
     line("");
     line("# Keys: ctrl-g, then one key. No prefix needed.");
     line("bind -n C-g switch-client -T grace");
@@ -990,20 +1018,36 @@ impl Tmux {
         ])?))
     }
 
-    /// Workspaces as (window id, folder).
-    pub fn windows(&self) -> Result<Vec<(String, String)>> {
+    /// Workspaces as `(window_id, folder, glyph)`.
+    pub fn windows_and_glyphs(&self) -> Result<Vec<(String, String, String)>> {
         let out = self.run(&[
             "list-windows",
             "-t",
             &format!("={SESSION}"),
             "-F",
-            "#{window_id}|g|#{@grace_path}",
+            "#{window_id}|g|#{@grace_path}|g|#{@grace_glyph}",
         ])?;
         Ok(out
             .lines()
-            .filter_map(|l| l.split_once(SEP))
-            .filter(|(_, p)| !p.is_empty())
-            .map(|(w, p)| (w.to_string(), p.to_string()))
+            .filter_map(|l| {
+                let mut parts = l.split(SEP);
+                let w = parts.next()?.to_string();
+                let p = parts.next()?.to_string();
+                if p.is_empty() {
+                    return None;
+                }
+                let g = parts.next().unwrap_or("").to_string();
+                Some((w, p, g))
+            })
+            .collect())
+    }
+
+    /// Workspaces as (window id, folder).
+    pub fn windows(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .windows_and_glyphs()?
+            .into_iter()
+            .map(|(w, p, _)| (w, p))
             .collect())
     }
 
@@ -1018,9 +1062,27 @@ impl Tmux {
     }
 }
 
+pub fn socket_exists(socket: &str) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid()` has no preconditions and always succeeds.
+        let uid = unsafe { libc::geteuid() };
+        let base = platform::env_non_empty("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".to_string());
+        Path::new(&base)
+            .join(format!("tmux-{uid}"))
+            .join(socket)
+            .exists()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
 /// Update `@grace_meta` on the current hub pane only when it changed.
 pub fn set_pane_meta(cache: &mut String, meta: &str) {
-    let clean = platform::sanitize_display(meta);
+    let clean = platform::sanitize_display(meta).into_owned();
     if *cache == clean {
         return;
     }
@@ -1092,6 +1154,9 @@ pub fn tmux_version() -> Result<(u32, u32)> {
         Ok(o) => o,
         Err(_) => bail!(INSTALL_MSG),
     };
+    if !out.status.success() {
+        bail!(INSTALL_MSG);
+    }
     let v = String::from_utf8_lossy(&out.stdout);
     let ver = parse_version(&v).unwrap_or((99, 0));
     if ver < (3, 2) {
@@ -1122,15 +1187,33 @@ fn exe() -> Result<String> {
     Ok(p.to_string_lossy().into_owned())
 }
 
-pub fn apply(t: &Tmux, window: &str, path: &str, want: Layout, sizes: &Sizes) -> Result<()> {
+pub fn apply(
+    t: &Tmux,
+    window: &str,
+    path: &str,
+    exe: &str,
+    want: Layout,
+    sizes: &Sizes,
+) -> Result<()> {
     let panes = t.panes(window)?;
-    let exe = exe()?;
+    let ops = plan(&panes, want, sizes);
     let mut made: Vec<(Role, String)> = Vec::new();
-    for op in plan(&panes, want, sizes) {
-        match &op {
-            Op::Kill(id) => {
-                let _ = t.run(&["kill-pane", "-t", id]);
+    let mut kill_batch: Vec<String> = Vec::new();
+    for op in &ops {
+        if let Op::Kill(id) = op {
+            if !kill_batch.is_empty() {
+                kill_batch.push(";".into());
             }
+            kill_batch.extend(["kill-pane".into(), "-t".into(), id.clone()]);
+        }
+    }
+    if !kill_batch.is_empty() {
+        let _ = t.run(&kill_batch);
+    }
+    let mut resize_batch: Vec<String> = Vec::new();
+    for op in &ops {
+        match op {
+            Op::Kill(_) => {}
             Op::Width { target, size } | Op::Height { target, size } => {
                 let flag = if matches!(op, Op::Width { .. }) {
                     "-x"
@@ -1142,7 +1225,16 @@ pub fn apply(t: &Tmux, window: &str, path: &str, want: Layout, sizes: &Sizes) ->
                     Target::New(r) => made.iter().find(|(m, _)| m == r).map(|(_, id)| id.clone()),
                 };
                 if let Some(id) = id {
-                    let _ = t.run(&["resize-pane", "-t", &id, flag, size]);
+                    if !resize_batch.is_empty() {
+                        resize_batch.push(";".into());
+                    }
+                    resize_batch.extend([
+                        "resize-pane".into(),
+                        "-t".into(),
+                        id,
+                        flag.into(),
+                        size.clone(),
+                    ]);
                 }
             }
             Op::Split { target, role, .. } => {
@@ -1153,13 +1245,16 @@ pub fn apply(t: &Tmux, window: &str, path: &str, want: Layout, sizes: &Sizes) ->
                         None => continue,
                     },
                 };
-                let Ok(id) = t.run(&split_args(&op, &target, &exe, path)) else {
+                let Ok(id) = t.run(&split_args(op, &target, exe, path)) else {
                     continue;
                 };
                 let _ = t.run(&tag_args(&id, *role));
                 made.push((*role, id));
             }
         }
+    }
+    if !resize_batch.is_empty() {
+        let _ = t.run(&resize_batch);
     }
     if let Ok(panes) = t.panes(window) {
         fit(t, window, &panes, sizes);
@@ -1172,29 +1267,44 @@ fn window_name(path: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
-    platform::sanitize_display(&raw)
+    platform::sanitize_display(&raw).into_owned()
 }
 
-fn setup_window(t: &Tmux, ids: &str, path: &str, layout: Layout, sizes: &Sizes) -> Result<String> {
+fn setup_window(
+    t: &Tmux,
+    ids: &str,
+    path: &str,
+    exe: &str,
+    layout: Layout,
+    sizes: &Sizes,
+) -> Result<(String, String)> {
     let (win, pane) = ids.split_once(SEP).context("unexpected tmux output")?;
-    t.run(&["set-option", "-w", "-t", win, "@grace_path", path])?;
-    t.run(&tag_args(pane, Role::Main))?;
-    apply(t, win, path, layout, sizes)?;
-    fit(t, win, &t.panes(win)?, sizes);
-    Ok(win.to_string())
+    let mut opt_args: Vec<String> = ["set-option", "-w", "-t", win, "@grace_path", path]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    opt_args.push(";".into());
+    opt_args.extend(tag_args(pane, Role::Main));
+    t.run(&opt_args)?;
+    apply(t, win, path, exe, layout, sizes)?;
+    Ok((win.to_string(), pane.to_string()))
 }
 
 pub fn switch(t: &Tmux, db: &Db, path: &str, resume: Option<&str>) -> Result<String> {
+    if !Path::new(path).is_dir() {
+        bail!("folder does not exist: {path}");
+    }
     let existing = t
         .windows()?
         .into_iter()
         .find(|(_, p)| platform::same_path(p, path))
         .map(|(w, _)| w);
     let fresh = existing.is_none();
-    let win = match existing {
-        Some(w) => w,
+    let (win, known_main) = match existing {
+        Some(w) => (w, None),
         None => {
             let (layout, sizes) = load_layout(db);
+            let exe = exe()?;
             let mut args: Vec<String> = [
                 "new-window",
                 "-d",
@@ -1214,18 +1324,21 @@ pub fn switch(t: &Tmux, db: &Db, path: &str, resume: Option<&str>) -> Result<Str
                 path.into(),
                 "--".into(),
             ]);
-            let mut cmd_vec = pane_command(&exe()?, Role::Main, path);
+            let mut cmd_vec = pane_command(&exe, Role::Main, path);
             if let Some(run_cmd) = resume {
-                cmd_vec.push("--run".into());
-                cmd_vec.push(run_cmd.to_string());
+                cmd_vec.push(format!("--run={run_cmd}"));
             }
             args.extend(cmd_vec);
             let ids = t.run(&args)?;
-            setup_window(t, &ids, path, layout, &sizes)?
+            let (w, m) = setup_window(t, &ids, path, &exe, layout, &sizes)?;
+            (w, Some(m))
         }
     };
     t.run(&["select-window", "-t", &win])?;
-    let main = main_pane(&t.panes(&win)?).map(|p| p.id.clone());
+    let main = match known_main {
+        Some(m) => Some(m),
+        None => main_pane(&t.panes(&win)?).map(|p| p.id.clone()),
+    };
     if let Some(main) = &main {
         t.run(&["select-pane", "-t", main])?;
         if let Some(cmd) = resume.filter(|_| !fresh) {
@@ -1266,6 +1379,9 @@ pub fn is_shell(cmd: &str) -> bool {
 /// `grace hub [path]`: open the hub, or switch the workspace when already inside.
 pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
     let version = tmux_version()?;
+    if !Path::new(path).is_dir() {
+        bail!("folder does not exist: {path}");
+    }
     let t = Tmux::new();
     if inside_hub(std::env::var("TMUX").ok().as_deref(), &t.socket) {
         switch(&t, db, path, None)?;
@@ -1278,11 +1394,14 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
     platform::create_dir_private(&dir)?;
     let conf = dir.join("tmux.conf");
     let home = platform::home_dir().map(|h| platform::clean_path_str(&h.to_string_lossy()));
-    let data_dir = std::env::var("GRACE_DATA_DIR")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let data_dir = platform::env_non_empty("GRACE_DATA_DIR");
+    let config_path = platform::env_non_empty("GRACE_CONFIG");
+    let theme_env = platform::env_non_empty("GRACE_THEME");
+    let ascii_env = platform::env_non_empty("GRACE_ASCII");
+    let no_color = platform::env_non_empty("NO_COLOR");
     let exe = exe()?;
-    let theme = Theme::from_env_and_config(&crate::config::load());
+    let cfg = crate::config::load();
+    let theme = Theme::from_env_and_config(&cfg);
     let allow_pt = std::env::var("GRACE_TMUX_PASSTHROUGH").is_ok_and(|v| v == "1");
     let text = conf_text(&ConfCtx {
         version,
@@ -1290,8 +1409,13 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
         socket: &t.socket,
         home: home.as_deref(),
         data_dir: data_dir.as_deref(),
+        config_path: config_path.as_deref(),
+        theme: theme_env.as_deref(),
+        ascii_env: ascii_env.as_deref(),
+        no_color: no_color.as_deref(),
         truecolor: theme.truecolor,
         light: theme.light,
+        color: theme.color,
         ascii: theme.ascii,
         allow_passthrough: allow_pt,
         default_terminal: default_tmux_terminal(),
@@ -1329,11 +1453,8 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
         ]);
         args.extend(pane_command(&exe, Role::Main, path));
         let ids = t.run(&args)?;
-        t.run(&["source-file", &conf_s])?;
-        let win = setup_window(&t, &ids, path, layout, &sizes)?;
-        if let Some(main) = main_pane(&t.panes(&win)?) {
-            t.run(&["select-pane", "-t", &main.id])?;
-        }
+        let (_win, main_pane_id) = setup_window(&t, &ids, path, &exe, layout, &sizes)?;
+        let _ = t.run(&["select-pane", "-t", &main_pane_id]);
     }
     if !attach {
         return Ok(());
@@ -1359,7 +1480,11 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
 fn write_conf_atomic(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
     let dir = path.parent().context("bad tmux.conf path")?;
-    let tmp = dir.join(format!("tmux.conf.tmp-{}", std::process::id()));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!("tmux.conf.tmp-{}-{nanos}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -1471,9 +1596,10 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
         Toggle::Zoom => {
             let main = main_pane(&panes).context("no main pane here")?;
             t.run(&["resize-pane", "-Z", "-t", &main.id])?;
-            if !zoomed(t, &win) {
+            let (is_zoomed, total) = window_metrics(t, &win);
+            if !is_zoomed && total > 0 {
                 let (_, sizes) = load_layout(db);
-                fit(t, &win, &t.panes(&win)?, &sizes);
+                fit_with_total(t, &t.panes(&win)?, &sizes, total);
             }
         }
         Toggle::Fit => {
@@ -1488,13 +1614,14 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
                     .unwrap();
                 t.run(&["select-pane", "-t", &sb.id])?;
             } else {
+                let exe = exe()?;
                 let (_, sizes) = load_layout(db);
                 let want = Layout::of(&panes).toggled(Toggle::Focus);
-                apply(t, &win, &path, want, &sizes)?;
+                apply(t, &win, &path, &exe, want, &sizes)?;
                 save_layout(db, want, &sizes)?;
                 for (w, p) in t.windows()? {
                     if w != win {
-                        let _ = apply(t, &w, &p, want, &sizes);
+                        let _ = apply(t, &w, &p, &exe, want, &sizes);
                     }
                 }
                 if let Some(sb) = t
@@ -1507,15 +1634,16 @@ fn toggle_inner(t: &Tmux, db: &Db, what: &str, window: Option<&str>) -> Result<(
             }
         }
         _ => {
+            let exe = exe()?;
             let (_, sizes) = load_layout(db);
             let want = Layout::of(&panes).toggled(what);
-            let total = window_width(t, &win);
+            let (_, total) = window_metrics(t, &win);
             let sizes = sizes.remember(&panes, want, total);
             save_layout(db, want, &sizes)?;
-            apply(t, &win, &path, want, &sizes)?;
+            apply(t, &win, &path, &exe, want, &sizes)?;
             for (w, p) in t.windows()? {
                 if w != win {
-                    let _ = apply(t, &w, &p, want, &sizes);
+                    let _ = apply(t, &w, &p, &exe, want, &sizes);
                 }
             }
         }
@@ -1551,49 +1679,81 @@ pub fn fit_widths(sizes: &Sizes, total: u16, sidebar: bool, right: bool) -> (u16
     (sb, rt)
 }
 
-fn window_width(t: &Tmux, win: &str) -> u16 {
-    t.run(&["display-message", "-p", "-t", win, "#{window_width}"])
-        .ok()
-        .and_then(|w| w.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-fn zoomed(t: &Tmux, win: &str) -> bool {
-    t.run(&["display-message", "-p", "-t", win, "#{window_zoomed_flag}"])
-        .is_ok_and(|z| z.trim() == "1")
+fn window_metrics(t: &Tmux, win: &str) -> (bool, u16) {
+    let Ok(out) = t.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        win,
+        "#{window_zoomed_flag}|g|#{window_width}",
+    ]) else {
+        return (false, 0);
+    };
+    let mut parts = out.trim().split(SEP);
+    let zoomed = parts.next().is_some_and(|v| v == "1");
+    let width = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (zoomed, width)
 }
 
 fn toggle_lock() -> Option<std::fs::File> {
     let dir = crate::db::data_dir().ok()?;
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("hub.lock"))
-        .ok()?;
+    platform::create_dir_private(&dir).ok()?;
+    let lock_path = dir.join("hub.lock");
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return None;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(&lock_path).ok()?;
+    platform::restrict_file_0600(&lock_path);
     f.lock().ok()?;
     Some(f)
 }
 
-fn fit(t: &Tmux, win: &str, panes: &[Pane], sizes: &Sizes) {
-    if zoomed(t, win) {
-        return;
-    }
-    let total = window_width(t, win);
-    if total == 0 {
-        return;
-    }
+fn fit_with_total(t: &Tmux, panes: &[Pane], sizes: &Sizes, total: u16) {
     let sb = panes.iter().find(|p| p.role == Some(Role::Sidebar));
     let rt = panes
         .iter()
         .find(|p| matches!(p.role, Some(Role::Diff) | Some(Role::Tree)));
     let (w_sb, w_rt) = fit_widths(sizes, total, sb.is_some(), rt.is_some());
+    let mut args: Vec<String> = Vec::new();
     if let Some(p) = sb {
-        let _ = t.run(&["resize-pane", "-t", &p.id, "-x", &w_sb.max(1).to_string()]);
+        args.extend([
+            "resize-pane".into(),
+            "-t".into(),
+            p.id.clone(),
+            "-x".into(),
+            w_sb.max(1).to_string(),
+        ]);
     }
     if let Some(p) = rt {
-        let _ = t.run(&["resize-pane", "-t", &p.id, "-x", &w_rt.max(1).to_string()]);
+        if !args.is_empty() {
+            args.push(";".into());
+        }
+        args.extend([
+            "resize-pane".into(),
+            "-t".into(),
+            p.id.clone(),
+            "-x".into(),
+            w_rt.max(1).to_string(),
+        ]);
     }
+    if !args.is_empty() {
+        let _ = t.run(&args);
+    }
+}
+
+fn fit(t: &Tmux, win: &str, panes: &[Pane], sizes: &Sizes) {
+    let (zoomed, total) = window_metrics(t, win);
+    if zoomed || total == 0 {
+        return;
+    }
+    fit_with_total(t, panes, sizes, total);
 }
 
 /// `grace hub shell [--run CMD]`: the main pane. Runs an optional initial command inside the
@@ -1602,24 +1762,26 @@ pub fn shell(run_cmd: Option<&str>) -> Result<()> {
     if cfg!(windows) {
         bail!(WINDOWS_MSG);
     }
-    let raw_sh = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty() && Path::new(s).exists())
+    let raw_sh = platform::env_non_empty("SHELL")
+        .filter(|s| Path::new(s).exists())
         .unwrap_or_else(|| "/bin/sh".into());
+    let sh_name = Path::new(&raw_sh)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sh".into());
     if let Some(cmd) = run_cmd.filter(|c| !c.trim().is_empty()) {
-        // Run the launch command synchronously, then drop into the login shell cleanly.
-        let _ = Command::new(&raw_sh).args(["-lc", cmd]).status();
+        let flag = match sh_name.as_str() {
+            "zsh" | "bash" | "fish" => "-lic",
+            _ => "-lc",
+        };
+        let _ = Command::new(&raw_sh).args([flag, cmd]).status();
     }
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut c = Command::new(&raw_sh);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let name = Path::new(&raw_sh)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "sh".into());
-        c.arg0(format!("-{name}"));
+        c.arg0(format!("-{sh_name}"));
     }
     let _ = c.status();
     if let Ok(pane) = std::env::var("TMUX_PANE") {
@@ -1629,13 +1791,17 @@ pub fn shell(run_cmd: Option<&str>) -> Result<()> {
 }
 
 /// The status glyph for the status bar, with tmux styles.
-pub fn glyph(s: crate::model::Status, frame: usize, ascii: bool) -> String {
+pub fn glyph(s: crate::model::Status, frame: usize, ascii: bool, color: bool) -> String {
     use crate::model::Status;
-    match s {
-        Status::Waiting => {
-            let sym = if ascii { "!" } else { "●" };
-            format!("#[fg=yellow,bold]{sym}#[default]")
+    let wrap = |fg: &str, ch: &str| -> String {
+        if color {
+            format!("#[fg={fg}]{ch}#[default]")
+        } else {
+            ch.into()
         }
+    };
+    match s {
+        Status::Waiting => wrap("yellow,bold", if ascii { "!" } else { "●" }),
         Status::Ready => (if ascii { "o" } else { "○" }).into(),
         Status::Working => {
             let f = if ascii {
@@ -1643,47 +1809,61 @@ pub fn glyph(s: crate::model::Status, frame: usize, ascii: bool) -> String {
             } else {
                 crate::theme::SPINNER[frame % crate::theme::SPINNER.len()]
             };
-            format!("#[fg=cyan]{f}#[default]")
+            let mut s_buf = [0u8; 4];
+            wrap("cyan", f.encode_utf8(&mut s_buf))
         }
-        Status::Done => {
-            let sym = if ascii { "+" } else { "✓" };
-            format!("#[fg=green]{sym}#[default]")
-        }
+        Status::Done => wrap("green", if ascii { "+" } else { "✓" }),
     }
 }
 
 /// Sync `@grace_glyph` on hub windows if a hub tmux session exists.
-pub fn sync_glyphs_if_running(db: &Db) {
+pub fn sync_glyphs_if_running(db: &Db, cfg: Option<&Config>) {
     if cfg!(windows) {
         return;
     }
     let t = Tmux::new();
-    if !t.ok(&["has-session", "-t", &format!("={SESSION}")]) {
+    if cfg!(unix) && !socket_exists(&t.socket) {
         return;
     }
-    let now = crate::model::now();
-    let sessions = db.sessions(now).unwrap_or_default();
-    let theme = Theme::from_env_and_config(&crate::config::load());
-    sync_glyphs(&t, &crate::picker::best_by_path(&sessions), 0, theme.ascii);
-}
-
-fn sync_glyphs(t: &Tmux, best: &crate::picker::Best, frame: usize, ascii: bool) {
-    let f = "#{window_id}|g|#{@grace_path}|g|#{@grace_glyph}";
-    let Ok(out) = t.run(&["list-windows", "-t", &format!("={SESSION}"), "-F", f]) else {
+    let Ok(rows) = t.windows_and_glyphs() else {
         return;
     };
+    let now = crate::model::now();
+    let sessions = db.sessions(now).unwrap_or_default();
+    let loaded;
+    let cfg = match cfg {
+        Some(c) => c,
+        None => {
+            loaded = crate::config::load();
+            &loaded
+        }
+    };
+    let theme = Theme::from_env_and_config(cfg);
+    sync_glyphs_rows(
+        &t,
+        &rows,
+        &crate::picker::best_by_path(&sessions),
+        0,
+        theme.ascii,
+        theme.color,
+    );
+}
+
+fn sync_glyphs_rows(
+    t: &Tmux,
+    rows: &[(String, String, String)],
+    best: &crate::picker::Best,
+    frame: usize,
+    ascii: bool,
+    color: bool,
+) {
     let mut args: Vec<String> = Vec::new();
-    for l in out.lines() {
-        let mut parts = l.split(SEP);
-        let (Some(w), Some(p)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let have = parts.next().unwrap_or("");
+    for (w, p, have) in rows {
         let want = best
             .get(p)
-            .map(|s| glyph(s.status, frame, ascii))
+            .map(|s| glyph(s.status, frame, ascii, color))
             .unwrap_or_default();
-        if p.is_empty() || want == have {
+        if p.is_empty() || want == *have {
             continue;
         }
         if !args.is_empty() {
@@ -1710,39 +1890,80 @@ fn sync_glyphs(t: &Tmux, best: &crate::picker::Best, frame: usize, ascii: bool) 
 }
 
 /// `grace hub sidebar <path>`: the sidebar pane of the workspace for `path`.
-pub fn run_sidebar(db: &Db, reg: &crate::tools::Registry, path: &str) -> Result<()> {
-    use crate::picker::{best_by_path, Data};
+pub fn run_sidebar(
+    db: &Db,
+    reg: &crate::tools::Registry,
+    ignore: &platform::IgnoreMatcher,
+    path: &str,
+) -> Result<()> {
+    use crate::picker::{best_by_path, Best, Data};
     let t = Tmux::new();
-    let load_with = |tm: &Tmux| -> Option<Data> {
-        let now = crate::model::now();
-        let entries = crate::load(db, reg, None).ok()?;
-        let sessions = db.sessions(now).unwrap_or_default();
-        let hub_paths: Vec<String> = tm
-            .windows()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect();
-        Some(Data {
-            entries,
-            sessions,
-            editors: Vec::new(),
-            branches: HashMap::new(),
-            hub_paths,
-        })
-    };
-    let theme = Theme::from_env_and_config(&crate::config::load());
+    let cfg = crate::config::load();
+    let theme = Theme::from_env_and_config(&cfg);
     let ascii = theme.ascii;
-    let data = load_with(&t).unwrap_or_default();
+    let color = theme.color;
+
+    let initial_rows = t.windows_and_glyphs().unwrap_or_default();
+    let initial_hub_paths: Vec<String> = initial_rows.iter().map(|(_, p, _)| p.clone()).collect();
+    let now = crate::model::now();
+    let initial_entries = crate::load(db, reg, ignore, None).unwrap_or_default();
+    let initial_sessions = db.sessions(now).unwrap_or_default();
+    let initial_data = Data {
+        entries: initial_entries,
+        sessions: initial_sessions,
+        editors: Vec::new(),
+        branches: HashMap::new(),
+    };
+
+    let mut cached_data = initial_data.clone();
+    let mut last_ver = db.data_version();
+    let mut last_hub_paths = initial_hub_paths.clone();
+    let mut last_best: Best = best_by_path(&initial_data.sessions);
+    let mut last_idle_bg = Instant::now();
     let mut frame = 0usize;
-    let reload = Box::new(move || -> Option<Data> {
+
+    let reload = Box::new(move || -> Option<(Data, Vec<String>)> {
         let (win_active, attached) = pane_activity();
-        let d = load_with(&t)?;
-        frame = frame.wrapping_add(1);
-        if win_active && attached {
-            sync_glyphs(&t, &best_by_path(&d.sessions), frame, ascii);
+        if (!win_active || !attached) && last_idle_bg.elapsed() < Duration::from_secs(15) {
+            return None;
         }
-        Some(d)
+        last_idle_bg = Instant::now();
+
+        let ver = db.data_version();
+        let rows = t.windows_and_glyphs().unwrap_or_default();
+        let hub_paths: Vec<String> = rows.iter().map(|(_, p, _)| p.clone()).collect();
+        let db_changed = ver != last_ver;
+        let hubs_changed = hub_paths != last_hub_paths;
+
+        frame = frame.wrapping_add(1);
+        let has_working = last_best
+            .values()
+            .any(|s| s.status == crate::model::Status::Working);
+        if !db_changed && !hubs_changed {
+            if win_active && attached && has_working {
+                sync_glyphs_rows(&t, &rows, &last_best, frame, ascii, color);
+            }
+            return None;
+        }
+
+        if db_changed {
+            let now = crate::model::now();
+            let entries = crate::load(db, reg, ignore, None).ok()?;
+            let sessions = db.sessions(now).unwrap_or_default();
+            last_ver = ver;
+            last_best = best_by_path(&sessions);
+            cached_data = Data {
+                entries,
+                sessions,
+                editors: Vec::new(),
+                branches: HashMap::new(),
+            };
+        }
+        last_hub_paths = hub_paths.clone();
+        if win_active && attached {
+            sync_glyphs_rows(&t, &rows, &last_best, frame, ascii, color);
+        }
+        Some((cached_data.clone(), hub_paths))
     });
     let t_go = Tmux::new();
     let go = Box::new(
@@ -1764,49 +1985,60 @@ pub fn run_sidebar(db: &Db, reg: &crate::tools::Registry, path: &str) -> Result<
                 .map_err(|e| e.to_string())
         },
     );
-    let home = platform::home_dir().map(|h| h.to_string_lossy().into_owned());
-    let mut sb = crate::sidebar::Sidebar::new(data, path, theme, home, reload, go);
+    let home = platform::home_dir().map(|h| platform::clean_path_str(&h.to_string_lossy()));
+    let mut sb = crate::sidebar::Sidebar::new(
+        initial_data,
+        initial_hub_paths,
+        path,
+        theme,
+        home,
+        reload,
+        go,
+    );
     crate::tui::run(&mut sb)
 }
 
-use std::collections::HashMap;
+struct RawGuard;
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
 
 /// `grace hub keys`: the help popup.
 pub fn keys(wait: bool) -> Result<()> {
     if cfg!(windows) {
         bail!(WINDOWS_MSG);
     }
-    let theme = Theme::from_env_and_config(&crate::config::load());
-    let (gold, dim_s, reset) = if !theme.color {
-        ("", "", "")
-    } else if theme.truecolor {
-        ("\x1b[1;38;2;232;185;74m", "\x1b[2m", "\x1b[0m")
-    } else {
-        ("\x1b[1;33m", "\x1b[2m", "\x1b[0m")
-    };
+    let cfg = crate::config::load();
+    let theme = Theme::from_env_and_config(&cfg);
+    let a = Ansi::stdout(&cfg);
     println!();
-    println!("  {gold}{} grace hub keys{reset}", theme.star());
-    println!("  {dim_s}ctrl-g, then one key{reset}");
+    println!("  {}{} grace hub keys{}", a.gold, theme.star(), a.reset);
+    println!("  {}ctrl-g, then one key{}", a.dim, a.reset);
     println!();
     for (k, l, _) in KEYS {
-        println!("  {gold}{k:<5}{reset} {l}");
+        println!("  {}{k:<5}{} {l}", a.gold, a.reset);
     }
     if !wait {
         return Ok(());
     }
     println!();
-    print!("  {dim_s}press any key{reset}");
+    print!("  {}press any key{}", a.dim, a.reset);
     use std::io::Write;
     std::io::stdout().flush()?;
     crossterm::terminal::enable_raw_mode()?;
+    let _guard = RawGuard;
     loop {
-        if let Ok(Event::Key(k)) = event::read() {
-            if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        match event::read() {
+            Ok(Event::Key(k)) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 break;
             }
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
-    crossterm::terminal::disable_raw_mode()?;
     Ok(())
 }
 
@@ -2005,8 +2237,13 @@ mod tests {
             socket: "grace",
             home: Some("/Users/me"),
             data_dir: None,
+            config_path: None,
+            theme: None,
+            ascii_env: None,
+            no_color: None,
             truecolor,
             light: false,
+            color: true,
             ascii: false,
             allow_passthrough,
             default_terminal: "tmux-256color",
@@ -2054,6 +2291,31 @@ mod tests {
         assert!(c.contains("bind -T grace ? display-message"));
         let c = conf((3, 3), true, true);
         assert!(c.contains("allow-passthrough on"));
+
+        let ascii_no_color = conf_text(&ConfCtx {
+            version: (3, 4),
+            exe: "/bin/grace",
+            socket: "grace",
+            home: None,
+            data_dir: None,
+            config_path: Some("/tmp/cfg.toml"),
+            theme: Some("light"),
+            ascii_env: Some("1"),
+            no_color: None,
+            truecolor: true,
+            light: false,
+            color: false,
+            ascii: true,
+            allow_passthrough: false,
+            default_terminal: "tmux-256color",
+        });
+        assert!(ascii_no_color.contains("pane-border-lines simple"));
+        assert!(!ascii_no_color.contains("pane-border-lines ascii"));
+        assert!(!ascii_no_color.contains("fg=#") && !ascii_no_color.contains("colour"));
+        assert!(ascii_no_color.contains("set-environment -g GRACE_CONFIG"));
+        assert!(ascii_no_color.contains("set-environment -g GRACE_THEME"));
+        assert!(ascii_no_color.contains("set-environment -g GRACE_ASCII"));
+        assert_eq!(glyph(crate::model::Status::Done, 0, true, false), "+");
     }
 
     #[test]

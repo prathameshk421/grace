@@ -20,10 +20,8 @@ pub static INTEGRATION: Integration = Integration {
 const MARK: &str = "# added by grace";
 
 fn conf_path() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var("GRACE_AIDER_CONF") {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v));
-        }
+    if let Some(v) = platform::env_non_empty("GRACE_AIDER_CONF") {
+        return Ok(PathBuf::from(v));
     }
     platform::home_dir()
         .map(|h| h.join(".aider.conf.yml"))
@@ -31,9 +29,6 @@ fn conf_path() -> Result<PathBuf> {
 }
 
 fn setup(exe: &str, remove: bool) -> Result<String> {
-    if !remove && platform::has_line_break_or_nul(exe) {
-        bail!("executable path contains unsafe newline or NUL characters");
-    }
     let p = conf_path()?;
     if remove {
         remove_at(&p)
@@ -52,28 +47,45 @@ fn check(exe: &str) -> HookStatus {
         }
         return HookStatus::NotInstalled;
     };
+    check_text(&p, &text, exe)
+}
+
+fn check_text(p: &Path, text: &str, exe: &str) -> HookStatus {
     let want_cmd = cmd_line_for(exe);
     let mut has_ours = false;
     let mut cmd_matches = false;
+    let mut notif_enabled = false;
     for l in text.lines() {
         match top_key(l) {
             Some("notifications_command" | "notifications-command") => {
                 if !is_ours(l) {
-                    return HookStatus::Conflict(p, "custom notifications_command".into());
+                    return HookStatus::Conflict(
+                        p.to_path_buf(),
+                        "custom notifications_command".into(),
+                    );
                 }
                 has_ours = true;
                 cmd_matches = l == want_cmd;
             }
-            Some("notifications") if is_ours(l) => has_ours = true,
+            Some("notifications") => {
+                if is_ours(l) {
+                    has_ours = true;
+                    notif_enabled = is_true(value_of(l));
+                } else if is_true(value_of(l)) {
+                    notif_enabled = true;
+                } else {
+                    return HookStatus::Conflict(p.to_path_buf(), "notifications: false".into());
+                }
+            }
             _ => {}
         }
     }
-    if has_ours && cmd_matches {
-        HookStatus::Connected(p)
+    if has_ours && cmd_matches && notif_enabled {
+        HookStatus::Connected(p.to_path_buf())
     } else if has_ours {
-        HookStatus::OutdatedPath(p)
+        HookStatus::OutdatedPath(p.to_path_buf())
     } else {
-        HookStatus::Available(p)
+        HookStatus::Available(p.to_path_buf())
     }
 }
 
@@ -85,10 +97,7 @@ fn yaml_quote(s: &str) -> String {
 fn cmd_line_for(exe: &str) -> String {
     format!(
         "notifications_command: {}  {MARK}",
-        yaml_quote(&format!(
-            "{} session hook aider",
-            platform::quote_posix(exe)
-        ))
+        yaml_quote(&format!("{} session hook aider", platform::quote_cmd(exe)))
     )
 }
 
@@ -120,9 +129,6 @@ fn is_true(v: &str) -> bool {
 }
 
 fn add_at(path: &Path, exe: &str) -> Result<String> {
-    if platform::has_line_break_or_nul(exe) {
-        bail!("executable path contains unsafe newline or NUL characters");
-    }
     let text = read_opt(path)?.unwrap_or_default();
     let cmd_line = cmd_line_for(exe);
     let on_line = format!("notifications: true  {MARK}");
@@ -294,6 +300,20 @@ mod tests {
             Some("notifications_command")
         );
         assert_eq!(top_key("http://x"), None);
+    }
+
+    #[test]
+    fn check_detects_foreign_false_and_missing_notifications_flag() {
+        let p = Path::new("/tmp/.aider.conf.yml");
+        assert!(matches!(
+            check_text(p, "notifications: false\n", "/bin/grace"),
+            HookStatus::Conflict(_, _)
+        ));
+        let cmd_only = format!("{}\n", cmd_line_for("/bin/grace"));
+        assert!(matches!(
+            check_text(p, &cmd_only, "/bin/grace"),
+            HookStatus::OutdatedPath(_)
+        ));
     }
 
     #[test]

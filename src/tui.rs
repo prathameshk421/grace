@@ -28,8 +28,8 @@ pub trait App {
         Flow::Continue
     }
     fn focus(&mut self, _focused: bool) {}
-    /// Read the data again (called every `self.every()`).
-    fn refresh(&mut self);
+    /// Read the data again (called every `self.every()`). Return true if redraw is needed.
+    fn refresh(&mut self) -> bool;
     /// Check background worker channels without blocking. Return true if state changed.
     fn poll_bg(&mut self) -> bool {
         false
@@ -43,6 +43,14 @@ pub trait App {
     /// A spinner is on screen: redraw often.
     fn animating(&self) -> bool {
         false
+    }
+}
+
+struct TermGuard;
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        restore();
     }
 }
 
@@ -68,6 +76,7 @@ pub fn run(app: &mut dyn App) -> Result<()> {
         default_hook(info);
     }));
     enable_raw_mode()?;
+    let _guard = TermGuard;
     execute!(
         io::stdout(),
         EnterAlternateScreen,
@@ -75,19 +84,24 @@ pub fn run(app: &mut dyn App) -> Result<()> {
         EnableFocusChange,
         Hide
     )?;
-    let result = run_loop(app);
-    restore();
-    result
+    run_loop(app)
 }
 
 fn run_loop(app: &mut dyn App) -> Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut next = Instant::now() + app.every();
+    let mut dirty = true;
     loop {
-        app.poll_bg();
-        term.draw(|f| app.draw(f))?;
+        if app.poll_bg() {
+            dirty = true;
+        }
+        if dirty {
+            term.draw(|f| app.draw(f))?;
+            dirty = false;
+        }
         let mut wait = next.saturating_duration_since(Instant::now());
-        if app.animating() {
+        let animating = app.animating();
+        if animating {
             wait = wait.min(Duration::from_millis(100));
         }
         if app.loading() {
@@ -99,20 +113,36 @@ fn run_loop(app: &mut dyn App) -> Result<()> {
                     if app.key(k) == Flow::Quit {
                         return Ok(());
                     }
+                    dirty = true;
                 }
                 Event::Mouse(m) => {
                     if app.mouse(m) == Flow::Quit {
                         return Ok(());
                     }
+                    if !matches!(m.kind, event::MouseEventKind::Moved) {
+                        dirty = true;
+                    }
                 }
-                Event::FocusGained => app.focus(true),
-                Event::FocusLost => app.focus(false),
+                Event::Resize(_, _) => dirty = true,
+                Event::FocusGained => {
+                    app.focus(true);
+                    dirty = true;
+                }
+                Event::FocusLost => {
+                    app.focus(false);
+                    dirty = true;
+                }
                 _ => {}
             }
         }
-        if Instant::now() >= next {
-            app.refresh();
-            next = Instant::now() + app.every();
+        let now = Instant::now();
+        if now >= next {
+            if app.refresh() {
+                dirty = true;
+            }
+            next = now + app.every();
+        } else if animating {
+            dirty = true;
         }
     }
 }

@@ -4,20 +4,21 @@ use crate::platform;
 use crate::theme::{Theme, ToastKind};
 use crate::tui::{self, Flow};
 use crate::widgets::{
-    center_msg, cut, cut_mid, cut_tail, hint_line, render_modal, render_scrollbar, sw, toast_line,
-    Toast,
+    center_msg, cut, cut_mid, cut_tail, hint_line, is_help_dismiss, is_plain_char, pane_frame,
+    render_help_modal, render_scrollbar, slice_scrollbar, spaces, sw, toast_line, Toast,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 const HINTS: [(&str, &str); 6] = [
     ("j/k", "move"),
@@ -27,7 +28,20 @@ const HINTS: [(&str, &str); 6] = [
     ("s/u", "stage"),
     ("?", "keys"),
 ];
+const HELP_ROWS: [(&str, &str); 10] = [
+    ("j/k", "Move selection / scroll diff"),
+    ("Tab", "Switch focus Files ↔ Diff"),
+    ("[ / ]", "Previous / next hunk"),
+    ("g / G", "Jump top / bottom of focused pane"),
+    ("h / l", "Scroll diff left / right"),
+    ("s / u", "Stage / unstage selected file"),
+    ("S", "Cycle scope: all / unstaged / staged"),
+    ("v", "Toggle raw git diff headers"),
+    ("/", "Search in diff (n/N next/prev)"),
+    ("e / o", "Open file"),
+];
 const SIDE_BY_SIDE: u16 = 70;
+const DIFF_DEBOUNCE: Duration = Duration::from_millis(35);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -35,15 +49,18 @@ enum Focus {
     Diff,
 }
 
-type DiffBgResult = (Option<Repo>, Vec<DiffLine>, Option<String>);
+type DiffBgResult = (Option<Repo>, DiffScope, Vec<DiffLine>, Option<String>);
+type FileDiffResult = (u64, DiffScope, Option<String>, Vec<DiffLine>);
 
 pub struct DiffView {
     dir: PathBuf,
+    editor: Option<String>,
     repo: Option<Repo>,
     selected: usize,
     list_off: usize,
     raw_diff: Vec<DiffLine>,
-    diff: Vec<DiffLine>,
+    diff: Vec<usize>,
+    max_ln: u32,
     diff_path: Option<String>,
     scope: DiffScope,
     show_headers: bool,
@@ -63,10 +80,13 @@ pub struct DiffView {
     list_area: Rect,
     diff_area: Rect,
     bg_rx: Option<Receiver<DiffBgResult>>,
+    diff_rx: Option<Receiver<FileDiffResult>>,
+    diff_seq: u64,
+    pending_diff_at: Option<Instant>,
     last_bg: Instant,
 }
 
-pub fn mark_color(m: Mark, theme: &Theme) -> Color {
+pub fn mark_color(m: Mark, theme: Theme) -> Color {
     match m {
         Mark::Modified => theme.accent(),
         Mark::Added => theme.diff_add_fg(),
@@ -76,7 +96,7 @@ pub fn mark_color(m: Mark, theme: &Theme) -> Color {
     }
 }
 
-fn line_style(t: &Theme, k: LineKind) -> Style {
+fn line_style(t: Theme, k: LineKind) -> Style {
     let s = Style::default();
     match k {
         LineKind::Add => {
@@ -106,6 +126,68 @@ fn line_style(t: &Theme, k: LineKind) -> Style {
     }
 }
 
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.is_ascii() {
+        let nb = needle.as_bytes();
+        return haystack
+            .as_bytes()
+            .windows(nb.len())
+            .any(|w| w.eq_ignore_ascii_case(nb));
+    }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn slice_cols(s: &str, skip: usize) -> &str {
+    if skip == 0 || s.is_empty() {
+        return s;
+    }
+    if s.is_ascii() {
+        return s.get(skip..).unwrap_or("");
+    }
+    let mut col = 0usize;
+    for (i, ch) in s.char_indices() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col >= skip && w > 0 {
+            return &s[i..];
+        }
+        col += w;
+    }
+    ""
+}
+
+pub fn open_in_editor_or_default(
+    full: &std::path::Path,
+    editor: Option<&str>,
+) -> Result<bool, &'static str> {
+    if let Some(ed) = editor.map(str::trim).filter(|s| !s.is_empty()) {
+        let mut parts = ed.split_whitespace();
+        if let Some(prog) = parts.next() {
+            if !crate::tools::is_terminal_editor(prog) {
+                let mut cmd = std::process::Command::new(prog);
+                cmd.args(parts).arg(full);
+                platform::apply_no_window(&mut cmd);
+                if cmd
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    if platform::open_path(full) {
+        Ok(true)
+    } else {
+        Err("no opener found")
+    }
+}
+
 impl DiffView {
     pub fn in_hub(mut self, yes: bool) -> DiffView {
         self.in_hub = yes;
@@ -115,14 +197,21 @@ impl DiffView {
         self
     }
 
+    pub fn with_editor(mut self, editor: Option<String>) -> DiffView {
+        self.editor = editor;
+        self
+    }
+
     pub fn new(dir: PathBuf, theme: Theme) -> DiffView {
         let mut v = DiffView {
             dir,
+            editor: None,
             repo: None,
             selected: 0,
             list_off: 0,
             raw_diff: Vec::new(),
             diff: Vec::new(),
+            max_ln: 0,
             diff_path: None,
             scope: DiffScope::All,
             show_headers: false,
@@ -142,34 +231,30 @@ impl DiffView {
             list_area: Rect::default(),
             diff_area: Rect::default(),
             bg_rx: None,
-            last_bg: Instant::now(),
+            diff_rx: None,
+            diff_seq: 0,
+            pending_diff_at: None,
+            last_bg: Instant::now() - Duration::from_secs(30),
         };
-        v.reload_sync();
+        v.reload_async();
         v
     }
 
     #[cfg(test)]
-    fn with_repo(repo: Option<Repo>, diff: Vec<(LineKind, String)>) -> DiffView {
+    fn with_repo(repo: Option<Repo>, raw_diff: Vec<DiffLine>) -> DiffView {
         let path = repo
             .as_ref()
             .and_then(|r| r.changes.first())
             .map(|c| c.path.clone());
-        let raw_diff: Vec<DiffLine> = diff
-            .into_iter()
-            .map(|(kind, text)| DiffLine {
-                kind,
-                old_no: None,
-                new_no: None,
-                text,
-            })
-            .collect();
         let mut v = DiffView {
             dir: PathBuf::from("."),
+            editor: None,
             repo,
             selected: 0,
             list_off: 0,
             raw_diff,
             diff: Vec::new(),
+            max_ln: 0,
             diff_path: path,
             scope: DiffScope::All,
             show_headers: false,
@@ -189,6 +274,9 @@ impl DiffView {
             list_area: Rect::default(),
             diff_area: Rect::default(),
             bg_rx: None,
+            diff_rx: None,
+            diff_seq: 0,
+            pending_diff_at: None,
             last_bg: Instant::now(),
         };
         v.rebuild_visible_diff();
@@ -200,21 +288,28 @@ impl DiffView {
     }
 
     fn rebuild_visible_diff(&mut self) {
+        self.diff.clear();
         if self.show_headers {
-            self.diff = self.raw_diff.clone();
+            self.diff.extend(0..self.raw_diff.len());
         } else {
-            let filtered: Vec<DiffLine> = self
-                .raw_diff
-                .iter()
-                .filter(|l| l.kind != LineKind::Header)
-                .cloned()
-                .collect();
-            self.diff = if filtered.is_empty() {
-                self.raw_diff.clone()
-            } else {
-                filtered
-            };
+            for (i, l) in self.raw_diff.iter().enumerate() {
+                if l.kind != LineKind::Header {
+                    self.diff.push(i);
+                }
+            }
+            if self.diff.is_empty() {
+                self.diff.extend(0..self.raw_diff.len());
+            }
         }
+        self.max_ln = self
+            .diff
+            .iter()
+            .filter_map(|&idx| {
+                let dl = &self.raw_diff[idx];
+                dl.old_no.max(dl.new_no)
+            })
+            .max()
+            .unwrap_or(0);
         self.scroll = self.scroll.min(self.diff.len().saturating_sub(1));
     }
 
@@ -234,7 +329,9 @@ impl DiffView {
         }
         if self.in_hub {
             let (win_active, attached) = crate::hub::pane_activity();
-            if (!win_active || !attached) && self.last_bg.elapsed() < Duration::from_secs(15) {
+            if (!self.focused || !win_active || !attached)
+                && self.last_bg.elapsed() < Duration::from_secs(15)
+            {
                 return;
             }
         }
@@ -261,20 +358,24 @@ impl DiffView {
                 }
                 None => (Vec::new(), None),
             };
-            let _ = tx.send((repo, lines, path));
+            let _ = tx.send((repo, scope, lines, path));
         });
     }
 
     fn load_diff(&mut self) {
+        self.pending_diff_at = None;
+        self.diff_rx = None;
         let Some(repo) = self.repo.as_ref() else {
             self.raw_diff.clear();
             self.diff.clear();
+            self.max_ln = 0;
             self.diff_path = None;
             return;
         };
         let Some(c) = repo.changes.get(self.selected) else {
             self.raw_diff.clear();
             self.diff.clear();
+            self.max_ln = 0;
             self.diff_path = None;
             return;
         };
@@ -289,6 +390,60 @@ impl DiffView {
         self.rebuild_visible_diff();
     }
 
+    fn schedule_diff_load(&mut self) {
+        let Some(next_path) = self.changes().get(self.selected).map(|c| c.path.clone()) else {
+            self.raw_diff.clear();
+            self.diff.clear();
+            self.max_ln = 0;
+            self.diff_path = None;
+            self.pending_diff_at = None;
+            return;
+        };
+        if self.diff_path.as_deref() != Some(next_path.as_str()) {
+            self.scroll = 0;
+            self.h_scroll = 0;
+            self.diff_path = Some(next_path);
+        }
+        self.diff_seq = self.diff_seq.wrapping_add(1);
+        self.pending_diff_at = Some(Instant::now() + DIFF_DEBOUNCE);
+    }
+
+    fn spawn_diff_load(&mut self) {
+        self.pending_diff_at = None;
+        let Some(repo) = self.repo.as_ref() else {
+            self.load_diff();
+            return;
+        };
+        let Some(c) = repo.changes.get(self.selected) else {
+            self.load_diff();
+            return;
+        };
+        if self.diff_path.as_deref() != Some(c.path.as_str()) {
+            self.scroll = 0;
+            self.h_scroll = 0;
+            self.diff_path = Some(c.path.clone());
+        }
+        self.diff_seq = self.diff_seq.wrapping_add(1);
+        let seq = self.diff_seq;
+        let scope = self.scope;
+        let change = c.clone();
+        let min_repo = Repo {
+            root: repo.root.clone(),
+            branch: git::Branch {
+                has_commits: repo.branch.has_commits,
+                ..git::Branch::default()
+            },
+            ..Repo::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        self.diff_rx = Some(rx);
+        std::thread::spawn(move || {
+            let path = Some(change.path.clone());
+            let lines = git::file_diff(&min_repo, &change, scope);
+            let _ = tx.send((seq, scope, path, lines));
+        });
+    }
+
     fn select(&mut self, delta: isize) {
         let n = self.changes().len();
         if n == 0 {
@@ -297,7 +452,7 @@ impl DiffView {
         let s = (self.selected as isize + delta).clamp(0, n as isize - 1) as usize;
         if s != self.selected {
             self.selected = s;
-            self.load_diff();
+            self.schedule_diff_load();
         }
     }
 
@@ -316,14 +471,14 @@ impl DiffView {
                 .iter()
                 .enumerate()
                 .skip(self.scroll + 1)
-                .find(|(_, l)| l.kind == LineKind::Hunk)
+                .find(|&(_, &idx)| self.raw_diff[idx].kind == LineKind::Hunk)
                 .map(|(i, _)| i)
             {
                 self.scroll = pos;
             }
         } else if let Some(pos) = self.diff[..self.scroll]
             .iter()
-            .rposition(|l| l.kind == LineKind::Hunk)
+            .rposition(|&idx| self.raw_diff[idx].kind == LineKind::Hunk)
         {
             self.scroll = pos;
         }
@@ -333,16 +488,17 @@ impl DiffView {
         if self.search.is_empty() || self.diff.is_empty() {
             return;
         }
-        let q = self.search.to_ascii_lowercase();
-        let matches = |l: &DiffLine| l.text.to_ascii_lowercase().contains(&q);
+        let q = &self.search;
+        let raw = &self.raw_diff;
+        let matches = |&idx: &usize| contains_ci(&raw[idx].text, q);
         if forward {
             let pos = self
                 .diff
                 .iter()
                 .enumerate()
                 .skip(self.scroll + 1)
-                .find(|(_, l)| matches(l))
-                .or_else(|| self.diff.iter().enumerate().find(|(_, l)| matches(l)))
+                .find(|(_, idx)| matches(idx))
+                .or_else(|| self.diff.iter().enumerate().find(|(_, idx)| matches(idx)))
                 .map(|(i, _)| i);
             if let Some(p) = pos {
                 self.scroll = p;
@@ -394,10 +550,9 @@ impl DiffView {
             return;
         }
         let full = PathBuf::from(&repo.root).join(&c.path);
-        if platform::open_path(&full) {
-            self.flash(format!("opened {}", c.path), ToastKind::Success);
-        } else {
-            self.flash("no opener found", ToastKind::Warn);
+        match open_in_editor_or_default(&full, self.editor.as_deref()) {
+            Ok(_) => self.flash(format!("opened {}", c.path), ToastKind::Success),
+            Err(msg) => self.flash(msg, ToastKind::Warn),
         }
     }
 }
@@ -408,39 +563,70 @@ impl tui::App for DiffView {
     }
 
     fn focus(&mut self, focused: bool) {
+        let gained = focused && !self.focused;
         self.focused = focused;
+        if gained && self.last_bg.elapsed() >= Duration::from_secs(2) {
+            self.reload_async();
+        }
     }
 
     fn loading(&self) -> bool {
-        self.bg_rx.is_some()
+        self.bg_rx.is_some() || self.diff_rx.is_some() || self.pending_diff_at.is_some()
     }
 
     fn poll_bg(&mut self) -> bool {
-        let Some(rx) = &self.bg_rx else { return false };
-        let Ok((repo, lines, path)) = rx.try_recv() else {
-            return false;
-        };
-        self.bg_rx = None;
-        let keep = self.changes().get(self.selected).map(|c| c.path.clone());
-        self.repo = repo;
-        let n = self.changes().len();
-        self.selected = keep
-            .and_then(|p| self.changes().iter().position(|c| c.path == p))
-            .unwrap_or(self.selected.min(n.saturating_sub(1)));
-        let current_path = self.changes().get(self.selected).map(|c| c.path.as_str());
-        if current_path == path.as_deref() {
-            let same = self.diff_path.as_deref() == path.as_deref();
-            self.raw_diff = lines;
-            if !same {
-                self.scroll = 0;
-                self.h_scroll = 0;
+        let mut changed = false;
+        if let Some(rx) = &self.bg_rx {
+            if let Ok((repo, res_scope, lines, path)) = rx.try_recv() {
+                self.bg_rx = None;
+                let keep = self.changes().get(self.selected).map(|c| c.path.clone());
+                self.repo = repo;
+                let n = self.changes().len();
+                self.selected = keep
+                    .and_then(|p| self.changes().iter().position(|c| c.path == p))
+                    .unwrap_or(self.selected.min(n.saturating_sub(1)));
+                let current_path = self.changes().get(self.selected).map(|c| c.path.as_str());
+                if current_path == path.as_deref() && res_scope == self.scope {
+                    let same = self.diff_path.as_deref() == path.as_deref();
+                    self.raw_diff = lines;
+                    if !same {
+                        self.scroll = 0;
+                        self.h_scroll = 0;
+                    }
+                    self.diff_path = path;
+                    self.rebuild_visible_diff();
+                } else {
+                    self.spawn_diff_load();
+                }
+                changed = true;
             }
-            self.diff_path = path;
-            self.rebuild_visible_diff();
-        } else {
-            self.load_diff();
         }
-        true
+        if let Some(rx) = &self.diff_rx {
+            if let Ok((seq, res_scope, path, lines)) = rx.try_recv() {
+                self.diff_rx = None;
+                let current_path = self.changes().get(self.selected).map(|c| c.path.as_str());
+                if seq == self.diff_seq
+                    && res_scope == self.scope
+                    && current_path == path.as_deref()
+                {
+                    let same = self.diff_path.as_deref() == path.as_deref();
+                    self.raw_diff = lines;
+                    if !same {
+                        self.scroll = 0;
+                        self.h_scroll = 0;
+                    }
+                    self.diff_path = path;
+                    self.rebuild_visible_diff();
+                    changed = true;
+                }
+            }
+        }
+        if let Some(at) = self.pending_diff_at {
+            if Instant::now() >= at {
+                self.spawn_diff_load();
+            }
+        }
+        changed
     }
 
     fn mouse(&mut self, m: MouseEvent) -> Flow {
@@ -473,7 +659,7 @@ impl tui::App for DiffView {
                     let idx = self.list_off + (m.row - self.list_area.y) as usize;
                     if idx < self.changes().len() {
                         self.selected = idx;
-                        self.load_diff();
+                        self.spawn_diff_load();
                     }
                 } else if self.diff_area.contains(pos) {
                     self.focus = Focus::Diff;
@@ -487,11 +673,7 @@ impl tui::App for DiffView {
     fn key(&mut self, k: KeyEvent) -> Flow {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.show_help {
-            if matches!(
-                k.code,
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter
-            ) || (ctrl && k.code == KeyCode::Char('c'))
-            {
+            if is_help_dismiss(&k) {
                 self.show_help = false;
             }
             return Flow::Continue;
@@ -502,6 +684,10 @@ impl tui::App for DiffView {
                     self.searching = false;
                     self.search.clear();
                 }
+                KeyCode::Char('c') if ctrl => {
+                    self.searching = false;
+                    self.search.clear();
+                }
                 KeyCode::Enter => {
                     self.searching = false;
                     self.jump_search(true);
@@ -509,10 +695,7 @@ impl tui::App for DiffView {
                 KeyCode::Backspace => {
                     self.search.pop();
                 }
-                KeyCode::Char(c)
-                    if (!ctrl && !k.modifiers.contains(KeyModifiers::ALT))
-                        || (cfg!(windows) && ctrl && k.modifiers.contains(KeyModifiers::ALT)) =>
-                {
+                KeyCode::Char(c) if is_plain_char(&k) => {
                     self.search.push(c);
                 }
                 _ => {}
@@ -552,7 +735,7 @@ impl tui::App for DiffView {
             KeyCode::Home | KeyCode::Char('g') => match self.focus {
                 Focus::List => {
                     self.selected = 0;
-                    self.load_diff();
+                    self.spawn_diff_load();
                 }
                 Focus::Diff => self.scroll = 0,
             },
@@ -561,7 +744,7 @@ impl tui::App for DiffView {
                     let n = self.changes().len();
                     if n > 0 {
                         self.selected = n - 1;
-                        self.load_diff();
+                        self.spawn_diff_load();
                     }
                 }
                 Focus::Diff => self.scroll_by(isize::MAX / 2),
@@ -576,7 +759,7 @@ impl tui::App for DiffView {
             }
             KeyCode::Char('S') => {
                 self.scope = self.scope.next();
-                self.load_diff();
+                self.spawn_diff_load();
             }
             KeyCode::Char('s') => self.stage_selected(true),
             KeyCode::Char('u') => self.stage_selected(false),
@@ -594,8 +777,16 @@ impl tui::App for DiffView {
         Flow::Continue
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self) -> bool {
+        let expired = self
+            .toast
+            .as_ref()
+            .is_some_and(|x| Instant::now() >= x.until);
+        if expired {
+            self.toast = None;
+        }
         self.reload_async();
+        expired
     }
 
     fn every(&self) -> Duration {
@@ -604,7 +795,7 @@ impl tui::App for DiffView {
 }
 
 fn branch_text(r: &Repo) -> String {
-    let mut s = platform::sanitize_display(&r.branch.name);
+    let mut s = platform::sanitize_display(&r.branch.name).into_owned();
     if r.branch.ahead > 0 {
         s += &format!(" ↑{}", r.branch.ahead);
     }
@@ -612,6 +803,15 @@ fn branch_text(r: &Repo) -> String {
         s += &format!(" ↓{}", r.branch.behind);
     }
     s
+}
+
+fn search_line(q: &str, max_w: usize, t: Theme) -> Line<'static> {
+    let shown = cut_tail(q, max_w.saturating_sub(4));
+    Line::from(vec![
+        Span::styled(" /", t.title_accent()),
+        Span::raw(shown),
+        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+    ])
 }
 
 fn draw(f: &mut Frame, v: &mut DiffView) {
@@ -630,102 +830,110 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
         .as_ref()
         .filter(|x| Instant::now() < x.until)
         .cloned();
-    let (inner, footer) = if v.in_hub {
-        if area.height <= 1 {
-            (area, None)
-        } else {
-            (
-                Rect {
-                    height: area.height - 1,
-                    ..area
-                },
-                Some(Rect {
-                    y: area.y + area.height - 1,
-                    height: 1,
-                    ..area
-                }),
-            )
-        }
-    } else {
-        let w = area.width as usize;
-        let right = match &v.repo {
-            Some(r) => {
-                let total_a: u32 = r.changes.iter().filter_map(|c| c.added).sum();
-                let total_d: u32 = r.changes.iter().filter_map(|c| c.deleted).sum();
-                let room = w.saturating_sub(12);
-                let summary = if room >= 28 {
-                    format!(
-                        "{} files · +{total_a} -{total_d} · {}",
-                        r.changes.len(),
-                        branch_text(r)
-                    )
-                } else {
+    let w = area.width as usize;
+    let right = match &v.repo {
+        Some(r) => {
+            let total_a: u32 = r.changes.iter().filter_map(|c| c.added).sum();
+            let total_d: u32 = r.changes.iter().filter_map(|c| c.deleted).sum();
+            let room = w.saturating_sub(12);
+            let summary = if room >= 28 {
+                format!(
+                    "{} files · +{total_a} -{total_d} · {}",
+                    r.changes.len(),
                     branch_text(r)
-                };
-                if room >= 6 {
-                    Line::from(Span::styled(
-                        format!(" {} ", cut(&summary, room - 2)),
-                        t.title_muted(),
-                    ))
-                    .right_aligned()
-                } else {
-                    Line::default()
-                }
-            }
-            None => Line::default(),
-        };
-        let bottom = match &active_toast {
-            Some(toast) => toast_line(toast, w.saturating_sub(4), &t),
-            None => hint_line(&v.hints, w.saturating_sub(4), &t),
-        };
-        let block = Block::bordered()
-            .border_type(t.border_type())
-            .border_style(t.border_style(v.focused))
-            .title_top(
+                )
+            } else {
+                branch_text(r)
+            };
+            if room >= 6 {
                 Line::from(Span::styled(
-                    format!(" {} diff ", t.star()),
-                    t.title_accent(),
+                    format!(" {} ", cut(&summary, room - 2)),
+                    t.title_muted(),
                 ))
-                .left_aligned(),
-            )
-            .title_top(right)
-            .title_bottom(bottom);
-        let inn = block.inner(area);
-        f.render_widget(block, area);
-        (inn, None)
-    };
-
-    if let Some(foot) = footer {
-        let fw = foot.width as usize;
-        let line = if v.searching {
-            let q = cut_tail(&v.search, fw.saturating_sub(4));
-            Line::from(vec![
-                Span::styled(" /", t.title_accent()),
-                Span::raw(q),
-                Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
-            ])
-        } else {
-            match &active_toast {
-                Some(toast) => toast_line(toast, fw, &t),
-                None => hint_line(&v.hints, fw, &t),
+                .right_aligned()
+            } else {
+                Line::default()
             }
-        };
-        f.render_widget(Paragraph::new(line), foot);
-    }
+        }
+        None => Line::default(),
+    };
+    let bw = if v.in_hub { w } else { w.saturating_sub(4) };
+    let has_diff_hdr = !v.in_hub && {
+        let inn_w = area.width.saturating_sub(2);
+        let inn_h = area.height.saturating_sub(2);
+        let n = v.repo.as_ref().map_or(0, |r| r.changes.len());
+        inn_w > 0
+            && inn_h > 0
+            && n > 0
+            && if inn_w >= SIDE_BY_SIDE {
+                inn_h >= 3
+            } else {
+                let lh = (n as u16 + 1).min((inn_h / 3).max(4)).min(inn_h);
+                let sep_h = 1.min(inn_h - lh);
+                inn_h - lh - sep_h >= 3
+            }
+    };
+    let bottom = if !v.in_hub && v.searching && !has_diff_hdr {
+        search_line(&v.search, bw, t)
+    } else {
+        match &active_toast {
+            Some(toast) => toast_line(toast, bw, t),
+            None => hint_line(&v.hints, bw, t),
+        }
+    };
+    let foot_line = |fw: usize| -> Line<'static> {
+        if v.searching {
+            search_line(&v.search, fw, t)
+        } else {
+            bottom.clone()
+        }
+    };
+    let title_left = Line::from(Span::styled(
+        format!(" {} diff ", t.star()),
+        t.title_accent(),
+    ))
+    .left_aligned();
+    let (inner, footer) = pane_frame(
+        f,
+        area,
+        v.in_hub,
+        v.focused,
+        title_left,
+        right,
+        bottom.clone(),
+        t,
+    );
 
     v.list_area = Rect::default();
     v.diff_area = Rect::default();
     if inner.width == 0 || inner.height == 0 {
+        if let Some(foot) = footer {
+            f.render_widget(Paragraph::new(foot_line(foot.width as usize)), foot);
+        }
         return;
     }
     let Some(repo) = &v.repo else {
-        center_msg(f, inner, "not a git repository", &t);
+        if let Some(foot) = footer {
+            f.render_widget(Paragraph::new(foot_line(foot.width as usize)), foot);
+        }
+        let msg = if v.bg_rx.is_some() {
+            "loading diff…"
+        } else {
+            "not a git repository"
+        };
+        center_msg(f, inner, msg, t);
         return;
     };
     if repo.changes.is_empty() {
-        let check = if t.ascii { "+" } else { "✓" };
-        let msg = format!("{check} working tree clean · {}", branch_text(repo));
-        center_msg(f, inner, &msg, &t);
+        if let Some(foot) = footer {
+            f.render_widget(Paragraph::new(foot_line(foot.width as usize)), foot);
+        }
+        let msg = format!(
+            "{} working tree clean · {}",
+            t.sym("✓", "+"),
+            branch_text(repo)
+        );
+        center_msg(f, inner, &msg, t);
         return;
     }
 
@@ -768,12 +976,13 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
     // Sub-pane divider.
     let div_style = t.fg(Style::default(), t.border_color());
     let sep_lines: Vec<Line> = if sep.width == 1 {
+        let vr = t.v_rule();
         (0..sep.height)
-            .map(|_| Line::from(Span::styled("│", div_style)))
+            .map(|_| Line::from(Span::styled(vr, div_style)))
             .collect()
     } else {
         vec![Line::from(Span::styled(
-            "─".repeat(sep.width as usize),
+            t.h_rule().repeat(sep.width as usize),
             div_style,
         ))]
     };
@@ -811,6 +1020,16 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
         (None, diff_pane)
     };
 
+    if let Some(foot) = footer {
+        let fw = foot.width as usize;
+        let line = if v.searching && diff_hdr.is_none() {
+            search_line(&v.search, fw, t)
+        } else {
+            bottom
+        };
+        f.render_widget(Paragraph::new(line), foot);
+    }
+
     if let Some(lh_rect) = list_hdr {
         let st = if v.focused && v.focus == Focus::List {
             t.title_accent()
@@ -832,15 +1051,7 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
     } else if lh > 0 && v.selected >= v.list_off + lh {
         v.list_off = v.selected + 1 - lh;
     }
-    let need_list_sb = n > lh && list_body.width > 12;
-    let list_draw = if need_list_sb {
-        Rect {
-            width: list_body.width - 1,
-            ..list_body
-        }
-    } else {
-        list_body
-    };
+    let (list_draw, list_sb) = slice_scrollbar(list_body, n, lh);
     let lw = list_draw.width as usize;
     let mut lines = Vec::new();
     for (i, c) in repo.changes.iter().enumerate().skip(v.list_off).take(lh) {
@@ -857,7 +1068,7 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
             }
         }
         let bar = if sel && v.focus == Focus::List {
-            "▌"
+            t.bar_glyph()
         } else {
             " "
         };
@@ -877,7 +1088,7 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
         };
         let stat_w = sw(&stat_str);
         let name_budget = lw.saturating_sub(1 + sw(&code) + 1 + stat_w + 1);
-        let name = cut_mid(&git::printable(&c.path), name_budget);
+        let name = cut_mid(&platform::sanitize_display(&c.path), name_budget);
         let name_style = if sel {
             t.fg(base, t.accent()).add_modifier(Modifier::BOLD)
         } else {
@@ -889,12 +1100,12 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
             Span::styled(bar, bar_style),
             Span::styled(
                 code,
-                t.fg(base, mark_color(c.mark(), &t))
+                t.fg(base, mark_color(c.mark(), t))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" ", base),
             Span::styled(name, name_style),
-            Span::styled(" ".repeat(pad), base),
+            Span::styled(spaces(pad), base),
         ];
         if !stat_str.is_empty() {
             if let (Some(a), Some(d)) = (c.added, c.deleted) {
@@ -905,31 +1116,20 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), list_draw);
-    if need_list_sb {
-        let sb_area = Rect {
-            x: list_body.x + list_body.width - 1,
-            width: 1,
-            ..list_body
-        };
-        render_scrollbar(f, sb_area, n, v.list_off, lh, &t);
+    if let Some(sb_area) = list_sb {
+        render_scrollbar(f, sb_area, n, v.list_off, lh, t);
     }
 
     // Diff pane header.
     if let Some(dh_rect) = diff_hdr {
         let dw_h = dh_rect.width as usize;
         if v.searching {
-            let q = cut_tail(&v.search, dw_h.saturating_sub(4));
-            let line = Line::from(vec![
-                Span::styled(" /", t.title_accent()),
-                Span::raw(q),
-                Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
-            ]);
-            f.render_widget(Paragraph::new(line), dh_rect);
+            f.render_widget(Paragraph::new(search_line(&v.search, dw_h, t)), dh_rect);
         } else {
             let cur_file = v
                 .diff_path
                 .as_deref()
-                .map(git::printable)
+                .map(|p| platform::sanitize_display(p).into_owned())
                 .unwrap_or_default();
             let scope_tag = if v.scope != DiffScope::All {
                 format!(" [{}]", v.scope.label())
@@ -953,7 +1153,7 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
             let gap = dw_h.saturating_sub(sw(&left) + sw(&pos) + 1);
             let line = Line::from(vec![
                 Span::styled(left, hdr_style),
-                Span::raw(" ".repeat(gap)),
+                Span::raw(spaces(gap)),
                 Span::styled(pos, t.muted()),
             ]);
             f.render_widget(Paragraph::new(line), dh_rect);
@@ -964,115 +1164,65 @@ fn draw(f: &mut Frame, v: &mut DiffView) {
     v.diff_area = diff_body;
     let dh = diff_body.height as usize;
     v.page = dh;
-    let need_diff_sb = v.diff.len() > dh && diff_body.width > 12;
-    let diff_draw = if need_diff_sb {
-        Rect {
-            width: diff_body.width - 1,
-            ..diff_body
-        }
-    } else {
-        diff_body
-    };
+    let (diff_draw, diff_sb) = slice_scrollbar(diff_body, v.diff.len(), dh);
     let dw = diff_draw.width as usize;
     let show_gutter = dw >= 48;
-    let max_ln = v
-        .diff
-        .iter()
-        .filter_map(|dl| dl.old_no.max(dl.new_no))
-        .max()
-        .unwrap_or(0);
-    let col_w = if max_ln >= 10_000 {
-        max_ln.to_string().len()
+    let col_w = if v.max_ln >= 10_000 {
+        v.max_ln.to_string().len()
     } else {
         4
     };
     let gutter_w = if show_gutter { col_w * 2 + 2 } else { 1 };
     let code_w = dw.saturating_sub(gutter_w);
-    let q_lower = if !v.search.is_empty() {
-        Some(v.search.to_ascii_lowercase())
-    } else {
-        None
-    };
+    let empty_col = spaces(col_w);
 
     let lines: Vec<Line> = v
         .diff
         .iter()
         .skip(v.scroll)
         .take(dh)
-        .map(|dl| {
-            let mut st = line_style(&t, dl.kind);
-            if let Some(q) = &q_lower {
-                if dl.text.to_ascii_lowercase().contains(q) {
-                    st = st.add_modifier(Modifier::BOLD);
-                }
+        .map(|&idx| {
+            let dl = &v.raw_diff[idx];
+            let mut st = line_style(t, dl.kind);
+            if !v.search.is_empty() && contains_ci(&dl.text, &v.search) {
+                st = st.add_modifier(Modifier::BOLD);
             }
-            let slice = if v.h_scroll > 0 {
-                dl.text.chars().skip(v.h_scroll).collect::<String>()
-            } else {
-                dl.text.clone()
-            };
-            let text_shown = cut(&slice, code_w);
+            let slice = slice_cols(&dl.text, v.h_scroll);
+            let text_shown = cut(slice, code_w);
             let fill = code_w.saturating_sub(sw(&text_shown));
             let mut spans = Vec::new();
             if show_gutter {
-                let old_s = dl
-                    .old_no
-                    .map_or_else(|| " ".repeat(col_w), |n| format!("{n:>col_w$}"));
-                let new_s = dl
-                    .new_no
-                    .map_or_else(|| " ".repeat(col_w), |n| format!("{n:>col_w$}"));
                 let g_style = t.muted();
-                spans.push(Span::styled(
-                    format!("{old_s} {new_s}{}", t.scroll_track()),
-                    g_style,
-                ));
+                let gutter = match (dl.old_no, dl.new_no) {
+                    (Some(o), Some(n)) => format!("{o:>col_w$} {n:>col_w$}{}", t.scroll_track()),
+                    (Some(o), None) => {
+                        format!("{o:>col_w$} {empty_col}{}", t.scroll_track())
+                    }
+                    (None, Some(n)) => {
+                        format!("{empty_col} {n:>col_w$}{}", t.scroll_track())
+                    }
+                    (None, None) => {
+                        format!("{empty_col} {empty_col}{}", t.scroll_track())
+                    }
+                };
+                spans.push(Span::styled(gutter, g_style));
             } else {
                 spans.push(Span::raw(" "));
             }
             spans.push(Span::styled(text_shown, st));
             if st.bg.is_some() && fill > 0 {
-                spans.push(Span::styled(" ".repeat(fill), st));
+                spans.push(Span::styled(spaces(fill), st));
             }
             Line::from(spans)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), diff_draw);
-    if need_diff_sb {
-        let sb_area = Rect {
-            x: diff_body.x + diff_body.width - 1,
-            width: 1,
-            ..diff_body
-        };
-        render_scrollbar(f, sb_area, v.diff.len(), v.scroll, dh, &t);
+    if let Some(sb_area) = diff_sb {
+        render_scrollbar(f, sb_area, v.diff.len(), v.scroll, dh, t);
     }
 
     if v.show_help {
-        let row = |k: &str, d: &str| {
-            Line::from(vec![
-                Span::styled(format!("{k:<10}"), t.title_accent()),
-                Span::raw(d.to_string()),
-            ])
-        };
-        let body = vec![
-            row("j/k", "Move selection / scroll diff"),
-            row("Tab", "Switch focus Files ↔ Diff"),
-            row("[ / ]", "Previous / next hunk"),
-            row("g / G", "Jump top / bottom of focused pane"),
-            row("h / l", "Scroll diff left / right"),
-            row("s / u", "Stage / unstage selected file"),
-            row("S", "Cycle scope: all / unstaged / staged"),
-            row("v", "Toggle raw git diff headers"),
-            row("/", "Search in diff (n/N next/prev)"),
-            row("e / o", "Open file"),
-        ];
-        render_modal(
-            f,
-            area,
-            "diff keys",
-            body,
-            &[("esc", "close"), ("?", "close")],
-            &t,
-        );
+        render_help_modal(f, area, "diff keys", &HELP_ROWS, t);
     }
 }
 
@@ -1096,7 +1246,6 @@ mod tests {
             prefix: String::new(),
             branch: Branch {
                 name: "main".into(),
-                upstream: None,
                 ahead: 2,
                 behind: 1,
                 has_commits: true,
@@ -1109,8 +1258,8 @@ mod tests {
         }
     }
 
-    fn diff() -> Vec<(LineKind, String)> {
-        git::classify_all("diff --git a/src/main.rs b/src/main.rs\n@@ -1,2 +1,2 @@\n fn main() {\n-    old();\n+    new_function_with_a_long_name();\n }\n")
+    fn diff() -> Vec<DiffLine> {
+        git::classify_lines("diff --git a/src/main.rs b/src/main.rs\n@@ -1,2 +1,2 @@\n fn main() {\n-    old();\n+    new_function_with_a_long_name();\n }\n")
     }
 
     #[test]

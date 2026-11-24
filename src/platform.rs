@@ -1,7 +1,34 @@
 //! Small helpers that differ between operating systems.
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// Read a non-empty environment variable.
+pub fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Resolve a directory from `override_env` (if non-empty) else `~/<default_sub>`.
+pub fn env_dir(override_env: &str, default_sub: &str) -> Option<PathBuf> {
+    if let Some(v) = env_non_empty(override_env) {
+        return Some(PathBuf::from(v));
+    }
+    home_dir().map(|h| h.join(default_sub))
+}
+
+/// Resolve a config directory: `override_env` -> `$XDG_CONFIG_HOME/<subdir>` -> `~/.config/<subdir>`.
+pub fn xdg_config_dir(override_env: Option<&str>, subdir: &str) -> Option<PathBuf> {
+    if let Some(key) = override_env {
+        if let Some(v) = env_non_empty(key) {
+            return Some(PathBuf::from(v));
+        }
+    }
+    if let Some(v) = env_non_empty("XDG_CONFIG_HOME").filter(|v| Path::new(v).is_absolute()) {
+        return Some(PathBuf::from(v).join(subdir));
+    }
+    home_dir().map(|h| h.join(".config").join(subdir))
+}
 
 /// The home folder: `USERPROFILE` first on Windows (avoids Git Bash POSIX `HOME`),
 /// `HOME` first on Unix. Never empty.
@@ -12,9 +39,9 @@ pub fn home_dir() -> Option<PathBuf> {
         &["HOME", "USERPROFILE"]
     };
     vars.iter()
-        .filter_map(|k| std::env::var(k).ok())
-        .find(|v| !v.is_empty())
+        .filter_map(|k| env_non_empty(k))
         .map(PathBuf::from)
+        .next()
 }
 
 /// Remove the Windows verbatim prefix: `\\?\C:\x` becomes `C:\x`,
@@ -116,7 +143,20 @@ pub fn is_unsafe_char(c: char) -> bool {
 /// Sanitize arbitrary strings for safe terminal / UI display:
 /// replaces tabs with 4 spaces, and replaces ASCII/Unicode control characters and
 /// Unicode BiDi override/isolate controls with '?'.
-pub fn sanitize_display(s: &str) -> String {
+pub fn sanitize_display(s: &str) -> Cow<'_, str> {
+    if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return Cow::Borrowed(s);
+    }
+    let mut dirty = false;
+    for c in s.chars() {
+        if c == '\t' || is_unsafe_char(c) {
+            dirty = true;
+            break;
+        }
+    }
+    if !dirty {
+        return Cow::Borrowed(s);
+    }
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -125,32 +165,32 @@ pub fn sanitize_display(s: &str) -> String {
             c => o.push(c),
         }
     }
-    o
+    Cow::Owned(o)
 }
 
 /// Shorten a displayed path with `~` only at an actual path separator boundary.
-pub fn strip_home_prefix(shown: &str, home: Option<&str>) -> String {
-    let Some(h) = home.filter(|h| !h.is_empty()) else {
-        return shown.to_string();
-    };
-    let rest_opt = if cfg!(windows) {
-        let low_s = shown.to_ascii_lowercase();
-        let low_h = h.to_ascii_lowercase();
-        if low_s.starts_with(&low_h) {
-            Some(&shown[h.len()..])
-        } else {
-            None
+/// Handles `/` vs `\` and ASCII case-insensitivity on Windows.
+pub fn display_path(path: &str, home: Option<&str>) -> String {
+    if let Some(h) = home.filter(|h| !h.is_empty()) {
+        let h = trim_separators(h);
+        if same_path(path, &h) {
+            return "~".into();
         }
-    } else {
-        shown.strip_prefix(h)
-    };
-    match rest_opt {
-        Some("") => "~".into(),
-        Some(rest) if rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\')) => {
-            format!("~{rest}")
+        if let (Some(pre), Some(rest)) = (path.get(..h.len()), path.get(h.len()..)) {
+            let sep = rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\'));
+            if sep && same_path(pre, &h) {
+                return format!("~{rest}");
+            }
         }
-        _ => shown.to_string(),
     }
+    path.to_string()
+}
+
+/// Clean, sanitize, and shorten `p` for terminal diagnostics/logging.
+pub fn short_path(p: &Path, home: Option<&str>) -> String {
+    let raw = clean_path_str(&p.to_string_lossy());
+    let sanitized = sanitize_display(&raw);
+    display_path(&sanitized, home)
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -177,17 +217,19 @@ pub fn quote_posix(s: &str) -> String {
     }
 }
 
-/// Quote a string for Fish shell (`\'` and `\\` are escape sequences inside Fish single quotes).
-#[cfg(test)]
-pub fn quote_fish(s: &str) -> String {
-    let plain = !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/_.-:+@=".contains(c));
-    if plain {
-        s.to_string()
+/// Quote a program/argument for the host command runner (`cmd.exe`/Win32 on Windows, POSIX on Unix).
+pub fn quote_cmd(s: &str) -> String {
+    if cfg!(windows) {
+        let plain = !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || r"\/_.-:+@=".contains(c));
+        if plain {
+            s.to_string()
+        } else {
+            format!("\"{}\"", s.replace('"', "\\\""))
+        }
     } else {
-        let escaped = s.replace('\\', r"\\").replace('\'', r"\'");
-        format!("'{escaped}'")
+        quote_posix(s)
     }
 }
 
@@ -212,12 +254,17 @@ pub fn quote_powershell(s: &str) -> String {
 /// Read a UTF-8 text file up to `max_bytes`, failing cleanly if larger or unreadable.
 pub fn read_to_string_capped(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     let f = std::fs::File::open(path)?;
-    let mut buf = Vec::new();
+    let cap = f
+        .metadata()
+        .ok()
+        .map_or(0, |m| (m.len() as usize).min(max_bytes));
+    let mut buf = Vec::with_capacity(cap.saturating_add(1));
     f.take((max_bytes + 1) as u64).read_to_end(&mut buf)?;
     if buf.len() > max_bytes {
         buf.truncate(max_bytes);
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// Path of the running grace program, for configs that call it later
@@ -246,31 +293,100 @@ fn stable_exe_in(exe: &Path, path: Option<&std::ffi::OsStr>) -> PathBuf {
         .unwrap_or(real)
 }
 
-/// Folders we never track: paths with control newlines/NUL, filesystem roots (`/`, `C:\`),
-/// the home folder (canonical or raw), and user-configured ignore globs.
-pub fn ignored(path: &str) -> bool {
-    ignored_with_patterns(path, &crate::config::load().ignore)
+/// Pre-resolved ignore matcher (`home` and canonicalized prefixes resolved once).
+#[derive(Debug, Clone, Default)]
+pub struct IgnoreMatcher {
+    home_raw: Option<String>,
+    home_canon: Option<String>,
+    patterns: Vec<String>,
 }
 
-pub fn ignored_with_patterns(path: &str, patterns: &[String]) -> bool {
-    if path.is_empty() || has_line_break_or_nul(path) || is_root(path) {
-        return true;
+impl IgnoreMatcher {
+    pub fn new(patterns: &[String]) -> Self {
+        let home_raw = home_dir().map(|h| clean_path_str(&h.to_string_lossy()));
+        let home_canon = home_raw
+            .as_ref()
+            .and_then(|h| std::fs::canonicalize(h).ok())
+            .map(|c| clean_path_str(&c.to_string_lossy()))
+            .filter(|ch| home_raw.as_deref() != Some(ch.as_str()));
+
+        let mut expanded = Vec::with_capacity(patterns.len() * 2);
+        for pat in patterns {
+            let is_tilde = pat == "~" || pat.starts_with("~/") || pat.starts_with("~\\");
+            if is_tilde {
+                if let Some(hr) = home_raw.as_deref() {
+                    let p = crate::config::expand_tilde(pat, Some(hr));
+                    Self::push_with_canon_prefix(&mut expanded, p);
+                } else {
+                    Self::push_with_canon_prefix(&mut expanded, pat.clone());
+                }
+                if let Some(hc) = home_canon.as_deref() {
+                    let p = crate::config::expand_tilde(pat, Some(hc));
+                    Self::push_with_canon_prefix(&mut expanded, p);
+                }
+            } else {
+                Self::push_with_canon_prefix(&mut expanded, pat.clone());
+            }
+        }
+        Self {
+            home_raw,
+            home_canon,
+            patterns: expanded,
+        }
     }
-    let home = home_dir().map(|h| clean_path_str(&h.to_string_lossy()));
-    if let Some(h) = &home {
-        if same_path(path, h) {
+
+    fn push_with_canon_prefix(out: &mut Vec<String>, pat: String) {
+        let first_wild = pat.find(['*', '?']).unwrap_or(pat.len());
+        let static_part = &pat[..first_wild];
+        let prefix = if first_wild == pat.len() {
+            static_part.trim_end_matches(['/', '\\'])
+        } else {
+            static_part
+                .rfind(['/', '\\'])
+                .map_or("", |idx| &static_part[..idx])
+        };
+        if !prefix.is_empty() {
+            if let Ok(canon) = std::fs::canonicalize(prefix) {
+                let canon_s = clean_path_str(&canon.to_string_lossy());
+                if !same_path(&canon_s, prefix) {
+                    let rest = &pat[prefix.len()..];
+                    let alt = format!("{canon_s}{rest}");
+                    if !out.contains(&alt) {
+                        out.push(alt);
+                    }
+                }
+            }
+        }
+        if !out.contains(&pat) {
+            out.push(pat);
+        }
+    }
+
+    pub fn is_ignored(&self, path: &str) -> bool {
+        if path.is_empty() || has_line_break_or_nul(path) || is_root(path) {
             return true;
         }
-        if let Ok(canon_h) = std::fs::canonicalize(h) {
-            let ch = clean_path_str(&canon_h.to_string_lossy());
-            if same_path(path, &ch) {
+        if let Some(hr) = &self.home_raw {
+            if same_path(path, hr) {
                 return true;
             }
         }
+        if let Some(hc) = &self.home_canon {
+            if same_path(path, hc) {
+                return true;
+            }
+        }
+        self.patterns
+            .iter()
+            .any(|pat| crate::config::glob_match(pat, path, None))
     }
-    patterns
-        .iter()
-        .any(|pat| crate::config::glob_match(pat, path, home.as_deref()))
+}
+
+/// Folders we never track: paths with control newlines/NUL, filesystem roots (`/`, `C:\`),
+/// the home folder (canonical or raw), and user-configured ignore globs.
+#[cfg(test)]
+pub fn ignored_with_patterns(path: &str, patterns: &[String]) -> bool {
+    IgnoreMatcher::new(patterns).is_ignored(path)
 }
 
 /// Pick the folder to tag. `cwd` is where the command ran. `target` is the first
@@ -524,23 +640,35 @@ pub fn restrict_file_0600(path: &Path) {
     }
 }
 
-/// True if a process with this PID exists.
+/// True if a process with this PID exists and belongs to us (non-zombie on Linux).
 #[cfg(unix)]
 pub fn pid_alive(pid: i64) -> bool {
     if pid <= 0 || pid > i32::MAX as i64 {
         return false;
     }
-    // SAFETY: signal 0 only checks that the process exists.
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // SAFETY: signal 0 only checks that the process exists and is signalable by our UID.
+    // EPERM means another user recycled this PID (not our shell), so treat as dead.
+    let exists = unsafe { libc::kill(pid as i32, 0) == 0 };
+    if !exists {
+        return false;
     }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if let Some(after) = stat.rsplit(')').next() {
+            if let Some(state) = after.trim_start().chars().next() {
+                if matches!(state, 'Z' | 'X') {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
-/// True if a process with this PID exists.
+/// True if a process with this PID exists and is accessible.
 #[cfg(windows)]
 pub fn pid_alive(pid: i64) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -552,7 +680,7 @@ pub fn pid_alive(pid: i64) -> bool {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
         if h.is_null() {
-            return GetLastError() == ERROR_ACCESS_DENIED;
+            return false;
         }
         let mut code: u32 = 0;
         let ok = GetExitCodeProcess(h, &mut code) != 0;
@@ -598,7 +726,7 @@ mod tests {
         .unwrap();
         assert_eq!(stable_exe_in(&real, Some(&path)), bin.join("grace"));
         // Not on PATH: the real path, as before.
-        let only_other = std::env::join_paths([other.clone()]).unwrap();
+        let only_other = std::env::join_paths([other]).unwrap();
         assert_eq!(stable_exe_in(&real, Some(&only_other)), real);
         assert_eq!(stable_exe_in(&real, None), real);
         // Started through the link: still the link, not the Cellar path.
@@ -659,7 +787,6 @@ mod tests {
         assert_eq!(quote_posix("/a/b"), "/a/b");
         assert_eq!(quote_posix(r"C:\a\b"), r"'C:\a\b'");
         assert_eq!(quote_posix("/a b'c"), r"'/a b'\''c'");
-        assert_eq!(quote_fish(r"/tmp/x\'y"), r"'/tmp/x\\\'y'");
         assert_eq!(quote_powershell("a'b\u{2019}c"), "'a''b\u{2019}\u{2019}c'");
     }
 
@@ -670,5 +797,19 @@ mod tests {
         assert!(has_line_break_or_nul("/tmp/a\nb"));
         assert!(ignored_with_patterns("/tmp/a\nb", &[]));
         assert!(ignored_with_patterns("/tmp/foo", &["/tmp/*".into()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignore_matcher_handles_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        let link = d.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let pat = format!("{}/*", link.to_string_lossy());
+        let matcher = IgnoreMatcher::new(&[pat]);
+        let target_canon = format!("{}/proj", normalize(&real));
+        assert!(matcher.is_ignored(&target_canon));
     }
 }

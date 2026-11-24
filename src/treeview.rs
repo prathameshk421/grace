@@ -1,11 +1,13 @@
 //! `grace tree`: a file tree that marks git changes.
-use crate::diffview::mark_color;
+use crate::diffview::{mark_color, open_in_editor_or_default};
 use crate::git::{self, Mark};
 use crate::platform;
 use crate::theme::{Theme, ToastKind};
 use crate::tui::{self, Flow};
 use crate::widgets::{
-    center_msg, cut, cut_tail, hint_line, render_modal, render_scrollbar, sw, toast_line, Toast,
+    center_msg, cut, cut_tail, hint_line, is_help_dismiss, is_plain_char, pane_frame,
+    render_help_modal, render_scrollbar, slice_scrollbar, spaces, sw, toast_line, DoubleClick,
+    Toast,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::{
@@ -16,9 +18,10 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -30,6 +33,27 @@ const HINTS: [(&str, &str); 5] = [
     ("c", "changed"),
     ("r", "refresh"),
     ("?", "keys"),
+];
+const HELP_ROWS: [(&str, &str); 8] = [
+    ("j / k", "Move selection"),
+    ("h / l", "Collapse / expand or parent"),
+    ("Enter", "Toggle folder or open file"),
+    ("o", "Open file or folder"),
+    ("/", "Fuzzy filter files"),
+    ("c", "Toggle changed files only"),
+    ("E / C", "Expand all / collapse all"),
+    ("y", "Copy relative path"),
+];
+const HELP_ROWS_HUB: [(&str, &str); 9] = [
+    ("j / k", "Move selection"),
+    ("h / l", "Collapse / expand or parent"),
+    ("Enter", "Toggle folder or open file"),
+    ("o", "Open file or folder"),
+    ("/", "Fuzzy filter files"),
+    ("c", "Toggle changed files only"),
+    ("E / C", "Expand all / collapse all"),
+    ("y", "Copy relative path"),
+    ("i", "Insert path into main pane"),
 ];
 const SKIP: [&str; 3] = [".git", "node_modules", "target"];
 const MAX_FILES: usize = 20_000;
@@ -44,49 +68,74 @@ pub struct Node {
 }
 
 #[derive(Default)]
-struct Building {
-    dirs: BTreeMap<String, Building>,
-    files: HashSet<String>,
+struct Building<'a> {
+    dirs: BTreeMap<&'a str, Building<'a>>,
+    files: HashSet<&'a str>,
+}
+
+fn cmp_ci(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        for (ab, bb) in a.bytes().zip(b.bytes()) {
+            let ord = ab.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        return a.len().cmp(&b.len()).then_with(|| a.cmp(b));
+    }
+    let mut ac = a.chars().flat_map(|c| c.to_lowercase());
+    let mut bc = b.chars().flat_map(|c| c.to_lowercase());
+    loop {
+        match (ac.next(), bc.next()) {
+            (Some(x), Some(y)) => {
+                let ord = x.cmp(&y);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return a.cmp(b),
+        }
+    }
 }
 
 /// Build a sorted tree iteratively (depth-safe against deeply nested paths).
 pub fn build_tree(paths: &[String]) -> Node {
     let mut root = Building::default();
     for p in paths {
-        let parts: Vec<&str> = p
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .take(MAX_DEPTH)
-            .collect();
-        let Some((file, dirs)) = parts.split_last() else {
+        let mut it = p.split('/').filter(|s| !s.is_empty()).take(MAX_DEPTH);
+        let Some(mut prev) = it.next() else {
             continue;
         };
         let mut cur = &mut root;
-        for d in dirs {
-            cur = cur.dirs.entry((*d).to_string()).or_default();
+        for seg in it {
+            // A folder segment supersedes a same-named file placeholder.
+            cur.files.remove(prev);
+            cur = cur.dirs.entry(prev).or_default();
+            prev = seg;
         }
-        if !cur.dirs.contains_key(*file) {
-            cur.files.insert((*file).to_string());
+        if !cur.dirs.contains_key(prev) {
+            cur.files.insert(prev);
         }
     }
     convert_iterative(root)
 }
 
-fn convert_iterative(root: Building) -> Node {
-    enum Frame {
+fn convert_iterative(root: Building<'_>) -> Node {
+    enum Frame<'a> {
         Enter {
             name: String,
             path: String,
-            b: Building,
+            b: Building<'a>,
         },
         Exit {
             name: String,
             path: String,
             dir_count: usize,
-            files: Vec<String>,
+            files: Vec<&'a str>,
         },
     }
-    let key = |s: &str| (s.to_lowercase(), s.to_string());
     let mut stack = vec![Frame::Enter {
         name: String::new(),
         path: String::new(),
@@ -96,10 +145,10 @@ fn convert_iterative(root: Building) -> Node {
     while let Some(frame) = stack.pop() {
         match frame {
             Frame::Enter { name, path, b } => {
-                let mut dirs: Vec<(String, Building)> = b.dirs.into_iter().collect();
-                dirs.sort_by_key(|(n, _)| key(n));
-                let mut files: Vec<String> = b.files.into_iter().collect();
-                files.sort_by_key(|n| key(n));
+                let mut dirs: Vec<(&str, Building)> = b.dirs.into_iter().collect();
+                dirs.sort_by(|(a, _), (b, _)| cmp_ci(a, b));
+                let mut files: Vec<&str> = b.files.into_iter().collect();
+                files.sort_by(|a, b| cmp_ci(a, b));
                 let dir_count = dirs.len();
                 stack.push(Frame::Exit {
                     name,
@@ -109,12 +158,12 @@ fn convert_iterative(root: Building) -> Node {
                 });
                 for (dn, db) in dirs.into_iter().rev() {
                     let child_path = if path.is_empty() {
-                        dn.clone()
+                        dn.to_string()
                     } else {
                         format!("{path}/{dn}")
                     };
                     stack.push(Frame::Enter {
-                        name: dn,
+                        name: dn.to_string(),
                         path: child_path,
                         b: db,
                     });
@@ -130,12 +179,12 @@ fn convert_iterative(root: Building) -> Node {
                 let mut children: Vec<Node> = done.drain(split..).collect();
                 for fnm in files {
                     let fp = if path.is_empty() {
-                        fnm.clone()
+                        fnm.to_string()
                     } else {
                         format!("{path}/{fnm}")
                     };
                     children.push(Node {
-                        name: fnm,
+                        name: fnm.to_string(),
                         path: fp,
                         dir: false,
                         children: Vec::new(),
@@ -170,9 +219,9 @@ pub struct Row {
     pub last_sibling: Vec<bool>,
 }
 
-pub fn dirty_dirs(marks: &HashMap<String, Mark>) -> HashSet<String> {
+fn ancestor_dirs<'a>(paths: impl Iterator<Item = &'a String>) -> HashSet<String> {
     let mut out = HashSet::new();
-    for p in marks.keys() {
+    for p in paths {
         let mut cur = p.as_str();
         while let Some(i) = cur.rfind('/') {
             cur = &cur[..i];
@@ -182,16 +231,34 @@ pub fn dirty_dirs(marks: &HashMap<String, Mark>) -> HashSet<String> {
     out
 }
 
+pub fn dirty_dirs(marks: &HashMap<String, Mark>) -> HashSet<String> {
+    ancestor_dirs(marks.keys())
+}
+
 /// Visible rows iteratively computed (no stack overflow on deep trees).
+#[cfg(test)]
 pub fn visible(root: &Node, open: &HashSet<String>, marks: &HashMap<String, Mark>) -> Vec<Row> {
     let dirty = dirty_dirs(marks);
+    visible_filtered(root, open, marks, &dirty, |_| true)
+}
+
+fn visible_filtered(
+    root: &Node,
+    open: &HashSet<String>,
+    marks: &HashMap<String, Mark>,
+    dirty: &HashSet<String>,
+    mut keep_row: impl FnMut(&Node) -> bool,
+) -> Vec<Row> {
     let mut out = Vec::new();
-    let mut stack: Vec<(&Node, usize, Vec<bool>)> = Vec::new();
-    for (idx, c) in root.children.iter().enumerate().rev() {
-        let is_last = idx + 1 == root.children.len();
-        stack.push((c, 0, vec![is_last]));
+    let mut stack: Vec<(&Node, usize, bool)> = Vec::new();
+    let mut trail: Vec<bool> = Vec::new();
+    let top: Vec<&Node> = root.children.iter().filter(|c| keep_row(c)).collect();
+    for (idx, c) in top.iter().enumerate().rev() {
+        stack.push((c, 0, idx + 1 == top.len()));
     }
-    while let Some((n, depth, trail)) = stack.pop() {
+    while let Some((n, depth, is_last)) = stack.pop() {
+        trail.truncate(depth);
+        trail.push(is_last);
         let is_open = n.dir && open.contains(&n.path);
         out.push(Row {
             depth,
@@ -204,10 +271,9 @@ pub fn visible(root: &Node, open: &HashSet<String>, marks: &HashMap<String, Mark
             last_sibling: trail.clone(),
         });
         if is_open {
-            for (idx, c) in n.children.iter().enumerate().rev() {
-                let mut child_trail = trail.clone();
-                child_trail.push(idx + 1 == n.children.len());
-                stack.push((c, depth + 1, child_trail));
+            let children: Vec<&Node> = n.children.iter().filter(|c| keep_row(c)).collect();
+            for (idx, c) in children.iter().enumerate().rev() {
+                stack.push((c, depth + 1, idx + 1 == children.len()));
             }
         }
     }
@@ -216,28 +282,35 @@ pub fn visible(root: &Node, open: &HashSet<String>, marks: &HashMap<String, Mark
 
 fn walk_dir(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let mut stack = vec![(dir.to_path_buf(), String::new())];
-    while let Some((d, rel)) = stack.pop() {
+    let mut stack = vec![(dir.to_path_buf(), String::new(), 0usize)];
+    while let Some((d, rel, depth)) = stack.pop() {
+        if depth >= MAX_DEPTH {
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
         };
         for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
+            let Ok(ft) = e.file_type() else { continue };
+            let os = e.file_name();
+            let name = os.to_string_lossy();
+            if ft.is_dir() && SKIP.contains(&name.as_ref()) {
+                continue;
+            }
             let path = if rel.is_empty() {
-                name.clone()
+                name.into_owned()
             } else {
                 format!("{rel}/{name}")
             };
-            let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
-                if !SKIP.contains(&name.as_str()) {
-                    stack.push((e.path(), path));
+                if depth + 1 < MAX_DEPTH {
+                    stack.push((e.path(), path, depth + 1));
                 }
             } else {
                 out.push(path);
-            }
-            if out.len() >= MAX_FILES {
-                return out;
+                if out.len() >= MAX_FILES {
+                    return out;
+                }
             }
         }
     }
@@ -258,6 +331,7 @@ type TreeLoad = (Node, HashMap<String, Mark>, Option<String>);
 
 pub struct TreeView {
     dir: PathBuf,
+    editor: Option<String>,
     title: String,
     branch: Option<String>,
     root: Node,
@@ -279,7 +353,7 @@ pub struct TreeView {
     initial_expand_done: bool,
     toast: Option<Toast>,
     list_area: Rect,
-    last_click: Option<(usize, Instant)>,
+    last_click: DoubleClick,
     bg_rx: Option<Receiver<TreeLoad>>,
     last_bg: Instant,
     hints: [(&'static str, &'static str); 5],
@@ -294,13 +368,19 @@ impl TreeView {
         self
     }
 
+    pub fn with_editor(mut self, editor: Option<String>) -> TreeView {
+        self.editor = editor;
+        self
+    }
+
     pub fn new(dir: PathBuf, theme: Theme) -> TreeView {
         let title = dir
             .file_name()
-            .map(|n| platform::sanitize_display(&n.to_string_lossy()))
-            .unwrap_or_else(|| platform::sanitize_display(&dir.to_string_lossy()));
+            .map(|n| platform::sanitize_display(&n.to_string_lossy()).into_owned())
+            .unwrap_or_else(|| platform::sanitize_display(&dir.to_string_lossy()).into_owned());
         let mut v = TreeView {
             dir,
+            editor: None,
             title,
             branch: None,
             root: build_tree(&[]),
@@ -322,12 +402,12 @@ impl TreeView {
             initial_expand_done: false,
             toast: None,
             list_area: Rect::default(),
-            last_click: None,
+            last_click: DoubleClick::default(),
             bg_rx: None,
-            last_bg: Instant::now(),
+            last_bg: Instant::now() - Duration::from_secs(30),
             hints: HINTS,
         };
-        v.reload_sync();
+        v.reload_async();
         v
     }
 
@@ -336,6 +416,7 @@ impl TreeView {
         let paths: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
         let mut v = TreeView {
             dir: PathBuf::from("."),
+            editor: None,
             title: title.into(),
             branch: Some("main".into()),
             root: build_tree(&paths),
@@ -357,7 +438,7 @@ impl TreeView {
             initial_expand_done: true,
             toast: None,
             list_area: Rect::default(),
-            last_click: None,
+            last_click: DoubleClick::default(),
             bg_rx: None,
             last_bg: Instant::now(),
             hints: HINTS,
@@ -367,12 +448,10 @@ impl TreeView {
     }
 
     fn compute_tree_data(dir: &Path) -> TreeLoad {
-        let (files_raw, repo) = match git::ls_files(dir) {
-            Some(f) => (f, git::status(dir)),
+        let (mut files, repo) = match git::ls_files(dir) {
+            Some(f) => (f, git::status_opts(dir, false)),
             None => (walk_dir(dir), None),
         };
-        let mut seen: HashSet<String> = files_raw.iter().cloned().collect();
-        let mut files = files_raw;
         let mut marks = HashMap::new();
         let branch = repo.as_ref().map(|r| r.branch.name.clone());
         if let Some(r) = &repo {
@@ -380,9 +459,7 @@ impl TreeView {
                 let Some(rel) = c.path.strip_prefix(&r.prefix) else {
                     continue;
                 };
-                if seen.insert(rel.to_string()) {
-                    files.push(rel.to_string());
-                }
+                files.push(rel.to_string());
                 marks.insert(rel.to_string(), c.mark());
             }
         }
@@ -416,7 +493,9 @@ impl TreeView {
         }
         if self.in_hub {
             let (win_active, attached) = crate::hub::pane_activity();
-            if (!win_active || !attached) && self.last_bg.elapsed() < Duration::from_secs(15) {
+            if (!self.focused || !win_active || !attached)
+                && self.last_bg.elapsed() < Duration::from_secs(15)
+            {
                 return;
             }
         }
@@ -430,56 +509,46 @@ impl TreeView {
     }
 
     fn rebuild_rows(&mut self, keep: Option<&str>) {
-        if !self.search.trim().is_empty() {
-            let pat = Pattern::parse(&self.search, CaseMatching::Smart, Normalization::Smart);
+        let dirty = dirty_dirs(&self.marks);
+        let query = self.search.trim();
+        if !query.is_empty() {
+            let pat = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
             let mut buf = Vec::new();
-            let mut matched_files: Vec<(u32, String)> = Vec::new();
+            let mut keep_set: HashSet<String> = HashSet::new();
             let mut stack = vec![&self.root];
             while let Some(n) = stack.pop() {
                 for c in &n.children {
                     if c.dir {
-                        stack.push(c);
-                    } else if let Some(sc) =
-                        pat.score(Utf32Str::new(&c.path, &mut buf), &mut self.matcher)
+                        if !self.changed_only || dirty.contains(&c.path) {
+                            stack.push(c);
+                        }
+                    } else if (!self.changed_only || self.marks.contains_key(&c.path))
+                        && pat
+                            .score(Utf32Str::new(&c.path, &mut buf), &mut self.matcher)
+                            .is_some()
                     {
-                        matched_files.push((sc, c.path.clone()));
+                        keep_set.insert(c.path.clone());
                     }
                 }
             }
-            matched_files.sort_by_key(|(sc, p)| (std::cmp::Reverse(*sc), p.clone()));
-            let keep_set: HashSet<String> = matched_files.iter().map(|(_, p)| p.clone()).collect();
-            let mut keep_dirs = HashSet::new();
-            for p in &keep_set {
-                let mut cur = p.as_str();
-                while let Some(i) = cur.rfind('/') {
-                    cur = &cur[..i];
-                    keep_dirs.insert(cur.to_string());
+            let keep_dirs = ancestor_dirs(keep_set.iter());
+            self.rows = visible_filtered(&self.root, &keep_dirs, &self.marks, &dirty, |n| {
+                if n.dir {
+                    keep_dirs.contains(&n.path)
+                } else {
+                    keep_set.contains(&n.path)
                 }
-            }
-            self.rows = visible(&self.root, &keep_dirs, &self.marks)
-                .into_iter()
-                .filter(|r| {
-                    if r.dir {
-                        keep_dirs.contains(&r.path)
-                    } else {
-                        keep_set.contains(&r.path)
-                    }
-                })
-                .collect();
+            });
         } else if self.changed_only {
-            let dirty = dirty_dirs(&self.marks);
-            self.rows = visible(&self.root, &dirty, &self.marks)
-                .into_iter()
-                .filter(|r| {
-                    if r.dir {
-                        dirty.contains(&r.path)
-                    } else {
-                        self.marks.contains_key(&r.path)
-                    }
-                })
-                .collect();
+            self.rows = visible_filtered(&self.root, &dirty, &self.marks, &dirty, |n| {
+                if n.dir {
+                    dirty.contains(&n.path)
+                } else {
+                    self.marks.contains_key(&n.path)
+                }
+            });
         } else {
-            self.rows = visible(&self.root, &self.open, &self.marks);
+            self.rows = visible_filtered(&self.root, &self.open, &self.marks, &dirty, |_| true);
         }
 
         if let Some(i) = keep.and_then(|p| self.rows.iter().position(|r| r.path == p)) {
@@ -586,10 +655,9 @@ impl TreeView {
             self.flash("unsafe path skipped", ToastKind::Error);
             return;
         };
-        if platform::open_path(&full) {
-            self.flash(format!("opened {}", r.name), ToastKind::Success);
-        } else {
-            self.flash("no opener found", ToastKind::Warn);
+        match open_in_editor_or_default(&full, self.editor.as_deref()) {
+            Ok(_) => self.flash(format!("opened {}", r.name), ToastKind::Success),
+            Err(msg) => self.flash(msg, ToastKind::Warn),
         }
     }
 }
@@ -600,7 +668,11 @@ impl tui::App for TreeView {
     }
 
     fn focus(&mut self, focused: bool) {
+        let gained = focused && !self.focused;
         self.focused = focused;
+        if gained && self.last_bg.elapsed() >= Duration::from_secs(2) {
+            self.reload_async();
+        }
     }
 
     fn loading(&self) -> bool {
@@ -633,11 +705,8 @@ impl tui::App for TreeView {
                 if self.list_area.contains(pos) {
                     let idx = self.offset + (m.row - self.list_area.y) as usize;
                     if idx < self.rows.len() {
-                        let dbl = self.last_click.is_some_and(|(p, at)| {
-                            p == idx && at.elapsed() < Duration::from_millis(400)
-                        });
+                        let dbl = self.last_click.click(idx);
                         self.selected = idx;
-                        self.last_click = Some((idx, Instant::now()));
                         let is_dir = self.rows[idx].dir;
                         let is_open = self.rows[idx].open;
                         if is_dir && dbl {
@@ -656,11 +725,7 @@ impl tui::App for TreeView {
     fn key(&mut self, k: KeyEvent) -> Flow {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.show_help {
-            if matches!(
-                k.code,
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter
-            ) || (ctrl && k.code == KeyCode::Char('c'))
-            {
+            if is_help_dismiss(&k) {
                 self.show_help = false;
             }
             return Flow::Continue;
@@ -672,6 +737,11 @@ impl tui::App for TreeView {
                     self.search.clear();
                     self.rebuild_rows(None);
                 }
+                KeyCode::Char('c') if ctrl => {
+                    self.searching = false;
+                    self.search.clear();
+                    self.rebuild_rows(None);
+                }
                 KeyCode::Enter => {
                     self.searching = false;
                 }
@@ -679,10 +749,7 @@ impl tui::App for TreeView {
                     self.search.pop();
                     self.rebuild_rows(None);
                 }
-                KeyCode::Char(c)
-                    if (!ctrl && !k.modifiers.contains(KeyModifiers::ALT))
-                        || (cfg!(windows) && ctrl && k.modifiers.contains(KeyModifiers::ALT)) =>
-                {
+                KeyCode::Char(c) if is_plain_char(&k) => {
                     self.search.push(c);
                     self.rebuild_rows(None);
                 }
@@ -753,8 +820,16 @@ impl tui::App for TreeView {
         Flow::Continue
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self) -> bool {
+        let expired = self
+            .toast
+            .as_ref()
+            .is_some_and(|x| Instant::now() >= x.until);
+        if expired {
+            self.toast = None;
+        }
         self.reload_async();
+        expired
     }
 
     fn every(&self) -> Duration {
@@ -781,71 +856,50 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
         .as_ref()
         .filter(|x| Instant::now() < x.until)
         .cloned();
-    let (inner, footer) = if v.in_hub {
-        if area.height <= 1 {
-            (area, None)
-        } else {
-            (
-                Rect {
-                    height: area.height - 1,
-                    ..area
-                },
-                Some(Rect {
-                    y: area.y + area.height - 1,
-                    height: 1,
-                    ..area
-                }),
-            )
-        }
+    let w = area.width as usize;
+    let mut right_text = v.title.clone();
+    if let Some(b) = &v.branch {
+        right_text = format!("{right_text} · {}", platform::sanitize_display(b));
+    }
+    if v.changed_only {
+        right_text.push_str(" [changed]");
+    }
+    let room = w.saturating_sub(12);
+    let right = if room >= 4 {
+        Line::from(Span::styled(
+            format!(" {} ", cut(&right_text, room - 2)),
+            t.title_muted(),
+        ))
+        .right_aligned()
     } else {
-        let w = area.width as usize;
-        let mut right = v.title.clone();
-        if let Some(b) = &v.branch {
-            right = format!("{right} · {}", platform::sanitize_display(b));
-        }
-        if v.changed_only {
-            right.push_str(" [changed]");
-        }
-        let room = w.saturating_sub(12);
-        let right = if room >= 4 {
-            Line::from(Span::styled(
-                format!(" {} ", cut(&right, room - 2)),
-                t.title_muted(),
-            ))
-            .right_aligned()
-        } else {
-            Line::default()
-        };
-        let bottom = match &active_toast {
-            Some(toast) => toast_line(toast, w.saturating_sub(4), &t),
-            None => hint_line(&v.hints, w.saturating_sub(4), &t),
-        };
-        let block = Block::bordered()
-            .border_type(t.border_type())
-            .border_style(t.border_style(v.focused))
-            .title_top(
-                Line::from(Span::styled(
-                    format!(" {} tree ", t.star()),
-                    t.title_accent(),
-                ))
-                .left_aligned(),
-            )
-            .title_top(right)
-            .title_bottom(bottom);
-        let inn = block.inner(area);
-        f.render_widget(block, area);
-        (inn, None)
+        Line::default()
     };
+    let bw = if v.in_hub { w } else { w.saturating_sub(4) };
+    let bottom = match &active_toast {
+        Some(toast) => toast_line(toast, bw, t),
+        None => hint_line(&v.hints, bw, t),
+    };
+    let title_left = Line::from(Span::styled(
+        format!(" {} tree ", t.star()),
+        t.title_accent(),
+    ))
+    .left_aligned();
+    let (inner, footer) = pane_frame(
+        f,
+        area,
+        v.in_hub,
+        v.focused,
+        title_left,
+        right,
+        bottom.clone(),
+        t,
+    );
 
     if let Some(foot) = footer {
-        let fw = foot.width as usize;
-        let line = match &active_toast {
-            Some(toast) => toast_line(toast, fw, &t),
-            None => hint_line(&v.hints, fw, &t),
-        };
-        f.render_widget(Paragraph::new(line), foot);
+        f.render_widget(Paragraph::new(bottom), foot);
     }
 
+    v.list_area = Rect::default();
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -874,17 +928,21 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
             ..inner
         };
     }
-    v.list_area = list_full;
     if list_full.height == 0 {
         return;
     }
+    v.list_area = list_full;
     if v.rows.is_empty() {
-        let msg = if v.changed_only {
+        let msg = if !v.initial_expand_done && v.bg_rx.is_some() {
+            "loading files…"
+        } else if !v.search.trim().is_empty() {
+            "no matching files"
+        } else if v.changed_only {
             "no changed files"
         } else {
             "no files"
         };
-        center_msg(f, list_full, msg, &t);
+        center_msg(f, list_full, msg, t);
         return;
     }
 
@@ -895,15 +953,7 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
     } else if v.selected >= v.offset + h {
         v.offset = v.selected + 1 - h;
     }
-    let need_sb = v.rows.len() > h && list_full.width > 12;
-    let draw_area = if need_sb {
-        Rect {
-            width: list_full.width - 1,
-            ..list_full
-        }
-    } else {
-        list_full
-    };
+    let (draw_area, sb_area) = slice_scrollbar(list_full, v.rows.len(), h);
     let iw = draw_area.width as usize;
     let guide_style = t.fg(Style::default(), t.border_color());
 
@@ -924,28 +974,16 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
         let max_indent_levels = (iw / 4).min(r.depth);
         let indent_w = max_indent_levels * 2;
         let icon = match (r.dir, r.open) {
-            (true, true) => {
-                if t.ascii {
-                    "- "
-                } else {
-                    "▾ "
-                }
-            }
-            (true, false) => {
-                if t.ascii {
-                    "+ "
-                } else {
-                    "▸ "
-                }
-            }
+            (true, true) => t.sym("▾ ", "- "),
+            (true, false) => t.sym("▸ ", "+ "),
             _ => "  ",
         };
         let (tail, tail_style) = match (r.mark, r.dirty) {
             (Some(m), _) => (
                 mark_letter(m),
-                t.fg(base, mark_color(m, &t)).add_modifier(Modifier::BOLD),
+                t.fg(base, mark_color(m, t)).add_modifier(Modifier::BOLD),
             ),
-            (None, true) => (if t.ascii { "*" } else { "•" }, t.fg(base, t.accent())),
+            (None, true) => (t.sym("•", "*"), t.fg(base, t.accent())),
             _ => ("", base),
         };
         let tail_space = if tail.is_empty() { 0 } else { sw(tail) + 1 };
@@ -957,19 +995,18 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
         };
         let prefix_w = 1 + indent_w + 2;
         let name_budget = iw.saturating_sub(prefix_w + tail_space + 1);
-        let raw_name = git::printable(&r.name);
-        let display = if r.dir {
-            format!("{raw_name}/")
+        let raw_name = platform::sanitize_display(&r.name);
+        let name = if r.dir {
+            cut(&format!("{raw_name}/"), name_budget)
         } else {
-            raw_name
+            cut(&raw_name, name_budget)
         };
-        let name = cut(&display, name_budget);
         let is_dot = r.name.starts_with('.');
         let name_style = match (sel, r.dir) {
             (true, _) => t.fg(base, t.accent()).add_modifier(Modifier::BOLD),
             (false, true) => base.add_modifier(Modifier::BOLD),
             (false, false) => match r.mark {
-                Some(m) => t.fg(base, mark_color(m, &t)),
+                Some(m) => t.fg(base, mark_color(m, t)),
                 None if is_dot => base.patch(t.muted()),
                 None => base,
             },
@@ -977,20 +1014,15 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
         let used = prefix_w + sw(&name) + tail_space;
         let pad = iw.saturating_sub(used + 1);
         let mut spans = vec![Span::styled(bar, bar_style)];
+        let guide_pipe = t.sym("│ ", "| ");
         for d in 0..max_indent_levels {
             let is_last = r.last_sibling.get(d).copied().unwrap_or(false);
-            let sym = if is_last {
-                "  "
-            } else if t.ascii {
-                "| "
-            } else {
-                "│ "
-            };
+            let sym = if is_last { "  " } else { guide_pipe };
             spans.push(Span::styled(sym, base.patch(guide_style)));
         }
         spans.push(Span::styled(icon, base.patch(t.muted())));
         spans.push(Span::styled(name.clone(), name_style));
-        spans.push(Span::styled(" ".repeat(pad), base));
+        spans.push(Span::styled(spaces(pad), base));
         if !tail.is_empty() {
             spans.push(Span::styled(" ", base));
             spans.push(Span::styled(tail, tail_style));
@@ -1001,43 +1033,13 @@ fn draw(f: &mut Frame, v: &mut TreeView) {
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), draw_area);
-    if need_sb {
-        let sb_area = Rect {
-            x: list_full.x + list_full.width - 1,
-            width: 1,
-            ..list_full
-        };
-        render_scrollbar(f, sb_area, v.rows.len(), v.offset, h, &t);
+    if let Some(sb_area) = sb_area {
+        render_scrollbar(f, sb_area, v.rows.len(), v.offset, h, t);
     }
 
     if v.show_help {
-        let row = |k: &str, d: &str| {
-            Line::from(vec![
-                Span::styled(format!("{k:<10}"), t.title_accent()),
-                Span::raw(d.to_string()),
-            ])
-        };
-        let mut body = vec![
-            row("j / k", "Move selection"),
-            row("h / l", "Collapse / expand or parent"),
-            row("Enter", "Toggle folder or open file"),
-            row("o", "Open file or folder"),
-            row("/", "Fuzzy filter files"),
-            row("c", "Toggle changed files only"),
-            row("E / C", "Expand all / collapse all"),
-            row("y", "Copy relative path"),
-        ];
-        if v.in_hub {
-            body.push(row("i", "Insert path into main pane"));
-        }
-        render_modal(
-            f,
-            area,
-            "tree keys",
-            body,
-            &[("esc", "close"), ("?", "close")],
-            &t,
-        );
+        let rows: &[(&str, &str)] = if v.in_hub { &HELP_ROWS_HUB } else { &HELP_ROWS };
+        render_help_modal(f, area, "tree keys", rows, t);
     }
 }
 

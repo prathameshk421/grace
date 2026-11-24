@@ -2,17 +2,20 @@
 //!
 //! The TUI draws on stderr, because the shell function captures stdout.
 //! By default it draws inline, below the prompt. `--full` uses the alternate screen.
+use crate::config::Config;
 use crate::editors_live::OpenEditor;
 use crate::git::{self, RepoSummary};
 use crate::model::{Entry, Session, Status};
 use crate::platform;
+pub use crate::platform::display_path;
 use crate::rank::time_ago;
 use crate::theme::{Theme, ToastKind};
 use crate::widgets::{
-    center_msg, cut, cut_tail, fit_end, fit_middle, hint_spans, push_fit_coalesced, render_modal,
-    render_scrollbar, sw, toast_line, Toast,
+    center_msg, cut, cut_tail, fit_end, fit_middle, hint_spans, is_help_dismiss, is_plain_char,
+    push_fit_coalesced, render_help_modal, render_modal, render_scrollbar, slice_scrollbar, spaces,
+    sw, toast_line, DoubleClick, Toast,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -24,7 +27,7 @@ use crossterm::{
 };
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
-    Config, Matcher, Utf32Str,
+    Config as MatcherConfig, Matcher, Utf32Str,
 };
 use ratatui::{
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
@@ -35,8 +38,9 @@ use ratatui::{
     widgets::{Block, Paragraph},
     Frame, Terminal, TerminalOptions, Viewport,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -79,12 +83,14 @@ pub(crate) fn status_words(s: Status) -> &'static str {
     }
 }
 
-pub(crate) fn haystack(
+fn push_haystack(
+    s: &mut String,
     e: &Entry,
     best: &Best,
     branches: &HashMap<String, (String, bool)>,
-) -> String {
-    let mut s = e.path.clone();
+) {
+    s.clear();
+    s.push_str(&e.path);
     for t in &e.tags {
         s.push(' ');
         s.push_str(&t.tool);
@@ -101,7 +107,6 @@ pub(crate) fn haystack(
             s.push_str(d);
         }
     }
-    s
 }
 
 /// Return indices into `entries` that match `query`, best first.
@@ -118,14 +123,15 @@ pub(crate) fn filter_with_branches(
     if query.trim().is_empty() {
         return (0..entries.len()).collect();
     }
-    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let mut matcher = Matcher::new(MatcherConfig::DEFAULT.match_paths());
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut buf = Vec::new();
+    let mut h = String::new();
     let mut scored: Vec<(u32, usize)> = entries
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
-            let h = haystack(e, best, branches);
+            push_haystack(&mut h, e, best, branches);
             pattern
                 .score(Utf32Str::new(&h, &mut buf), &mut matcher)
                 .map(|s| (s, i))
@@ -133,31 +139,6 @@ pub(crate) fn filter_with_branches(
         .collect();
     scored.sort_by_key(|s| std::cmp::Reverse(s.0));
     scored.into_iter().map(|(_, i)| i).collect()
-}
-
-/// Char positions in `text` that `pattern` matched.
-fn match_positions_pat(text: &str, pattern: &Pattern, matcher: &mut Matcher) -> Vec<usize> {
-    let mut buf = Vec::new();
-    let mut idx = Vec::new();
-    pattern.indices(Utf32Str::new(text, &mut buf), matcher, &mut idx);
-    idx.into_iter().map(|i| i as usize).collect()
-}
-
-pub fn display_path(path: &str, home: Option<&str>) -> String {
-    if let Some(h) = home.filter(|h| !h.is_empty()) {
-        let h = platform::trim_separators(h);
-        let h = h.as_str();
-        if platform::same_path(path, h) {
-            return "~".into();
-        }
-        if let (Some(pre), Some(rest)) = (path.get(..h.len()), path.get(h.len()..)) {
-            let sep = rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\'));
-            if sep && platform::same_path(pre, h) {
-                return format!("~{rest}");
-            }
-        }
-    }
-    path.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +182,6 @@ pub struct Data {
     pub sessions: Vec<Session>,
     pub editors: Vec<OpenEditor>,
     pub branches: HashMap<String, (String, bool)>,
-    pub hub_paths: Vec<String>,
 }
 
 pub type EditorCmd<'a> = Box<dyn Fn(&Entry, Option<&OpenEditor>) -> Option<EditorChoice> + 'a>;
@@ -227,7 +207,7 @@ pub struct Opts<'a> {
     pub after_first_frame: Option<Box<dyn FnOnce() -> Option<Data> + Send + 'static>>,
     /// Reads the data again for a view.
     pub reload: Option<Box<dyn FnMut(View) -> Option<Data> + 'a>>,
-    pub reload_every: Option<Duration>,
+    pub reload_every: Option<Box<dyn Fn(View) -> Option<Duration> + 'a>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,23 +219,35 @@ const NAME_MAX: usize = 28;
 const TAGS_MAX: usize = 32;
 const PARENT_MAX: usize = 30;
 const TICK: Duration = Duration::from_millis(100);
+const SUMMARY_DEBOUNCE: Duration = Duration::from_millis(120);
+const HELP_ROWS: [(&str, &str); 10] = [
+    ("Enter", "Travel to selected folder"),
+    ("Ctrl-O", "Travel and start last AI tool"),
+    ("Ctrl-E", "Open or focus editor"),
+    ("Ctrl-G", "Open folder in grace hub"),
+    ("Tab", "Switch Folders / Sessions view"),
+    ("Alt-P", "Pin or unpin folder"),
+    ("Alt-I", "Toggle Inspector drawer"),
+    ("Ctrl-Y", "Copy folder path"),
+    ("Ctrl-D", "Forget folder (asks first)"),
+    ("Ctrl-W/U", "Delete word / clear search"),
+];
 
-/// Split a shown path into (parent, name, char index where the name starts).
-pub fn split_path(shown: &str) -> (String, String, usize) {
-    let chars: Vec<char> = shown.chars().collect();
+/// Split a shown path into `(parent, name)` without allocating.
+pub fn split_path(shown: &str) -> (&str, &str) {
     let is_sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
-    match chars.iter().rposition(|&c| is_sep(c)) {
-        Some(p) if p + 1 < chars.len() => {
-            let parent: String = if p == 0 {
-                "/".into()
-            } else if cfg!(windows) && p == 2 && chars[1] == ':' {
-                chars[..=p].iter().collect()
+    match shown.rfind(is_sep) {
+        Some(p) if p + 1 < shown.len() => {
+            let parent = if p == 0 {
+                "/"
+            } else if cfg!(windows) && p == 2 && shown.as_bytes().get(1) == Some(&b':') {
+                &shown[..=p]
             } else {
-                chars[..p].iter().collect()
+                &shown[..p]
             };
-            (parent, chars[p + 1..].iter().collect(), p + 1)
+            (parent, &shown[p + 1..])
         }
-        _ => (String::new(), shown.to_string(), 0),
+        _ => ("", shown),
     }
 }
 
@@ -386,20 +378,36 @@ pub fn step_item(rows: &[Row], from: usize, delta: isize) -> usize {
     cur
 }
 
-pub fn scroll(rows: &[Row], selected: usize, offset: usize, height: usize) -> usize {
-    if height == 0 || rows.is_empty() {
+pub fn scroll_by(
+    len: usize,
+    is_header: impl Fn(usize) -> bool,
+    selected: usize,
+    offset: usize,
+    height: usize,
+) -> usize {
+    if height == 0 || len == 0 {
         return 0;
     }
-    let mut off = offset.min(rows.len() - 1);
+    let mut off = offset.min(len - 1);
     if selected < off {
         off = selected;
     } else if selected >= off + height {
         off = selected + 1 - height;
     }
-    if off == selected && off > 0 && height > 1 && matches!(rows[off - 1], Row::Header(_, _)) {
+    if off == selected && off > 0 && height > 1 && is_header(off - 1) {
         off -= 1;
     }
     off
+}
+
+pub fn scroll(rows: &[Row], selected: usize, offset: usize, height: usize) -> usize {
+    scroll_by(
+        rows.len(),
+        |idx| matches!(rows[idx], Row::Header(_, _)),
+        selected,
+        offset,
+        height,
+    )
 }
 
 /// Inline viewport height: the rows plus chrome, at most 48% of the terminal (min 10).
@@ -432,6 +440,7 @@ struct State {
     open: HashMap<String, Vec<OpenEditor>>,
     query: String,
     pattern: Option<Pattern>,
+    atom_patterns: Vec<Pattern>,
     matches: Vec<usize>,
     rows: Vec<Row>,
     selected: usize,
@@ -440,6 +449,9 @@ struct State {
     now: i64,
     home: Option<String>,
     matcher: Matcher,
+    utf32_buf: Vec<char>,
+    idx_buf: Vec<u32>,
+    haystack_buf: String,
     view: View,
     fullscreen: bool,
     tag_filter: Option<String>,
@@ -451,13 +463,14 @@ struct State {
     modal: Modal,
     inspector: bool,
     summaries: HashMap<String, Option<RepoSummary>>,
+    summary_wait: Option<(String, Instant)>,
     pending_summary: Option<String>,
     summary_rx: Option<Receiver<(String, Option<RepoSummary>)>>,
     widths: CachedWidths,
     list_area: Rect,
     tab_folders_area: Rect,
     tab_sessions_area: Rect,
-    last_click: Option<(usize, Instant)>,
+    last_click: DoubleClick,
     footer_hints: Vec<(&'static str, String)>,
 }
 
@@ -480,6 +493,7 @@ impl State {
             open: HashMap::new(),
             query: query.to_string(),
             pattern: None,
+            atom_patterns: Vec::new(),
             matches: Vec::new(),
             rows: Vec::new(),
             selected: 0,
@@ -487,7 +501,10 @@ impl State {
             page: 10,
             now,
             home,
-            matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            matcher: Matcher::new(MatcherConfig::DEFAULT.match_paths()),
+            utf32_buf: Vec::new(),
+            idx_buf: Vec::new(),
+            haystack_buf: String::new(),
             view,
             fullscreen,
             tag_filter,
@@ -499,6 +516,7 @@ impl State {
             modal: Modal::None,
             inspector: fullscreen,
             summaries: HashMap::new(),
+            summary_wait: None,
             pending_summary: None,
             summary_rx: None,
             widths: CachedWidths {
@@ -510,7 +528,7 @@ impl State {
             list_area: Rect::default(),
             tab_folders_area: Rect::default(),
             tab_sessions_area: Rect::default(),
-            last_click: None,
+            last_click: DoubleClick::default(),
             footer_hints: Vec::new(),
         };
         st.update_pattern();
@@ -519,8 +537,27 @@ impl State {
     }
 
     fn update_pattern(&mut self) {
-        self.pattern = (!self.query.trim().is_empty())
-            .then(|| Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart));
+        self.atom_patterns.clear();
+        if self.query.trim().is_empty() {
+            self.pattern = None;
+            return;
+        }
+        self.pattern = Some(Pattern::parse(
+            &self.query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+        ));
+        let mut words = self.query.split_whitespace();
+        let first = words.next();
+        if first.is_some() && words.next().is_some() {
+            for atom in self.query.split_whitespace() {
+                self.atom_patterns.push(Pattern::parse(
+                    atom,
+                    CaseMatching::Smart,
+                    Normalization::Smart,
+                ));
+            }
+        }
     }
 
     /// Replace the data. The query and the selected folder stay.
@@ -538,12 +575,37 @@ impl State {
 
     fn recompute_widths(&mut self) {
         let (mut name_max, mut parent_max, mut tags_max, mut time_max) = (0, 0, 0, 0);
-        for i in 0..self.data.entries.len() {
-            let rv = self.row_view(i, false);
-            name_max = name_max.max(sw(&rv.name));
-            parent_max = parent_max.max(sw(&rv.parent));
-            tags_max = tags_max.max(tags_width(&rv.tags));
-            time_max = time_max.max(sw(&rv.time));
+        for e in &self.data.entries {
+            let raw_shown = display_path(&e.path, self.home.as_deref());
+            let shown = platform::sanitize_display(&raw_shown);
+            let (parent, name) = split_path(&shown);
+            name_max = name_max.max(sw(name));
+            parent_max = parent_max.max(sw(parent));
+
+            let open_list = self.open.get(&e.path);
+            let mut tw = 0usize;
+            let mut n_tags = 0usize;
+            for t in &e.tags {
+                let w = sw(&platform::sanitize_display(&t.tool));
+                tw += w + if n_tags > 0 { 3 } else { 0 };
+                n_tags += 1;
+            }
+            if let Some(list) = open_list {
+                for o in list {
+                    if !e.tags.iter().any(|t| t.tool == o.tag) {
+                        let w = sw(&platform::sanitize_display(&o.tag));
+                        tw += w + if n_tags > 0 { 3 } else { 0 };
+                        n_tags += 1;
+                    }
+                }
+            }
+            tags_max = tags_max.max(tw);
+
+            let then = match (self.view, self.best.get(&e.path)) {
+                (View::Sessions, Some(b)) => b.updated_at,
+                _ => e.last_visit,
+            };
+            time_max = time_max.max(sw(&time_ago(then, self.now)));
         }
         self.widths = CachedWidths {
             name_max,
@@ -557,13 +619,27 @@ impl State {
         self.best.get(&self.data.entries[i].path).map(|s| s.status)
     }
 
-    fn visible_entries_indices(&self) -> Vec<usize> {
-        let filtered = filter_with_branches(
-            &self.data.entries,
-            &self.best,
-            &self.data.branches,
-            &self.query,
-        );
+    fn visible_entries_indices(&mut self) -> Vec<usize> {
+        let filtered: Vec<usize> = if let Some(pat) = &self.pattern {
+            let mut scored: Vec<(u32, usize)> = self
+                .data
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| {
+                    push_haystack(&mut self.haystack_buf, e, &self.best, &self.data.branches);
+                    pat.score(
+                        Utf32Str::new(&self.haystack_buf, &mut self.utf32_buf),
+                        &mut self.matcher,
+                    )
+                    .map(|s| (s, i))
+                })
+                .collect();
+            scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+            scored.into_iter().map(|(_, i)| i).collect()
+        } else {
+            (0..self.data.entries.len()).collect()
+        };
         if self.view == View::Sessions {
             let mut sess: Vec<usize> = filtered
                 .into_iter()
@@ -621,36 +697,58 @@ impl State {
     }
 
     fn delete_word(&mut self) {
-        let trimmed = self.query.trim_end();
-        let new_len = match trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '\\') {
-            Some(i) => i + 1,
-            None => 0,
-        };
+        let is_sep = |c: char| c.is_whitespace() || c == '/' || c == '\\';
+        let trimmed = self.query.trim_end_matches(is_sep);
+        let new_len = trimmed
+            .char_indices()
+            .rfind(|&(_, c)| is_sep(c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
         self.query.truncate(new_len);
         self.refilter();
     }
 
-    fn maybe_fetch_summary(&mut self) {
-        if !self.inspector {
-            return;
-        }
+    fn maybe_fetch_summary(&mut self) -> bool {
+        let mut received = false;
         if let Some(rx) = &self.summary_rx {
-            while let Ok((p, sum)) = rx.try_recv() {
+            if let Ok((p, sum)) = rx.try_recv() {
                 self.summaries.insert(p.clone(), sum);
                 if self.pending_summary.as_deref() == Some(p.as_str()) {
                     self.pending_summary = None;
                 }
+                self.summary_rx = None;
+                received = true;
             }
         }
+        if !self.inspector {
+            self.summary_wait = None;
+            return received;
+        }
         let Some(e) = self.selected_entry() else {
-            return;
+            self.summary_wait = None;
+            return received;
         };
         let path = e.path.clone();
         if self.summaries.contains_key(&path)
             || self.pending_summary.as_deref() == Some(path.as_str())
         {
-            return;
+            self.summary_wait = None;
+            return received;
         }
+        if self.summary_rx.is_some() {
+            return received;
+        }
+        match &self.summary_wait {
+            Some((p, since)) if p == &path => {
+                if since.elapsed() < SUMMARY_DEBOUNCE {
+                    return received;
+                }
+            }
+            _ => {
+                self.summary_wait = Some((path, Instant::now()));
+                return received;
+            }
+        }
+        self.summary_wait = None;
         let (tx, rx) = mpsc::channel();
         self.summary_rx = Some(rx);
         self.pending_summary = Some(path.clone());
@@ -658,6 +756,34 @@ impl State {
             let sum = git::summary(Path::new(&path));
             let _ = tx.send((path, sum));
         });
+        received
+    }
+
+    fn collect_hl(&mut self, target: &str) -> Vec<usize> {
+        let Some(pat) = self.pattern.as_ref() else {
+            return Vec::new();
+        };
+        self.idx_buf.clear();
+        pat.indices(
+            Utf32Str::new(target, &mut self.utf32_buf),
+            &mut self.matcher,
+            &mut self.idx_buf,
+        );
+        let mut all: Vec<usize> = self.idx_buf.iter().map(|&x| x as usize).collect();
+        if !self.atom_patterns.is_empty() {
+            for ap in &self.atom_patterns {
+                self.idx_buf.clear();
+                ap.indices(
+                    Utf32Str::new(target, &mut self.utf32_buf),
+                    &mut self.matcher,
+                    &mut self.idx_buf,
+                );
+                all.extend(self.idx_buf.iter().map(|&x| x as usize));
+            }
+            all.sort_unstable();
+            all.dedup();
+        }
+        all
     }
 
     /// Row content for entry `i`. With `hl`, computes match positions for name, parent, and tags.
@@ -665,67 +791,53 @@ impl State {
         let e = &self.data.entries[i];
         let raw_shown = display_path(&e.path, self.home.as_deref());
         let shown = platform::sanitize_display(&raw_shown);
-        let (parent, name, _) = split_path(&shown);
-        let mut name_hl = Vec::new();
-        let mut parent_hl = Vec::new();
-        let mut tag_hl = Vec::new();
-        let best = self.best.get(&e.path);
+        let (parent_s, name_s) = split_path(&shown);
+        let parent = parent_s.to_string();
+        let name = name_s.to_string();
+        let best_opt = self.best.get(&e.path).cloned();
         let open_list = self.open.get(&e.path);
+        let editor_open = open_list.is_some();
         let mut tags: Vec<(String, bool)> = e
             .tags
             .iter()
             .map(|t| {
                 let is_open = open_list.is_some_and(|list| list.iter().any(|o| o.tag == t.tool));
-                (platform::sanitize_display(&t.tool), is_open)
+                (platform::sanitize_display(&t.tool).into_owned(), is_open)
             })
             .collect();
         if let Some(list) = open_list {
             for o in list.iter().rev() {
                 if !tags.iter().any(|(t, _)| t == &o.tag) {
-                    tags.insert(0, (platform::sanitize_display(&o.tag), true));
+                    tags.insert(0, (platform::sanitize_display(&o.tag).into_owned(), true));
                 }
             }
         }
-        if hl {
-            if let Some(pat) = self.pattern.as_ref() {
-                let mut words = self.query.split_whitespace();
-                let first = words.next();
-                let multi = first.is_some() && words.next().is_some();
-                let collect_hl = |target: &str, m: &mut Matcher| -> Vec<usize> {
-                    if !multi {
-                        return match_positions_pat(target, pat, m);
-                    }
-                    let mut all = match_positions_pat(target, pat, m);
-                    for atom in self.query.split_whitespace() {
-                        let ap = Pattern::parse(atom, CaseMatching::Smart, Normalization::Smart);
-                        all.extend(match_positions_pat(target, &ap, m));
-                    }
-                    all.sort_unstable();
-                    all.dedup();
-                    all
-                };
-                name_hl = collect_hl(&name, &mut self.matcher);
-                if !parent.is_empty() {
-                    parent_hl = collect_hl(&parent, &mut self.matcher);
-                }
-                for (tag, _) in &tags {
-                    tag_hl.push(collect_hl(tag, &mut self.matcher));
-                }
-            }
-        }
-        let then = match (self.view, best) {
+        let then = match (self.view, best_opt.as_ref()) {
             (View::Sessions, Some(b)) => b.updated_at,
             _ => e.last_visit,
         };
+        let pinned = e.pinned;
+        let mut name_hl = Vec::new();
+        let mut parent_hl = Vec::new();
+        let mut tag_hl = Vec::new();
+        if hl && self.pattern.is_some() {
+            name_hl = self.collect_hl(&name);
+            if !parent.is_empty() {
+                parent_hl = self.collect_hl(&parent);
+            }
+            for (tag, _) in &tags {
+                tag_hl.push(self.collect_hl(tag));
+            }
+        }
         RowView {
             name,
             parent,
             name_hl,
             parent_hl,
             tag_hl,
-            pinned: e.pinned,
-            session: best.cloned(),
-            editor_open: open_list.is_some(),
+            pinned,
+            session: best_opt,
+            editor_open,
             tags,
             time: time_ago(then, self.now),
         }
@@ -748,14 +860,6 @@ struct RowView {
     time: String,
 }
 
-pub(crate) fn tags_width(tags: &[(String, bool)]) -> usize {
-    if tags.is_empty() {
-        0
-    } else {
-        tags.iter().map(|(t, _)| sw(t)).sum::<usize>() + 3 * (tags.len() - 1)
-    }
-}
-
 struct Ctx {
     theme: Theme,
     view: View,
@@ -769,14 +873,15 @@ struct RowBuf {
 }
 
 impl RowBuf {
-    fn push(&mut self, text: String, style: Style) {
-        self.used += sw(&text);
-        self.spans.push(Span::styled(text, style));
+    fn push(&mut self, text: impl Into<Cow<'static, str>>, style: Style) {
+        let cow = text.into();
+        self.used += sw(&cow);
+        self.spans.push(Span::styled(cow, style));
     }
     fn pad(&mut self, n: usize) {
         if n > 0 {
             self.used += n;
-            self.spans.push(Span::styled(" ".repeat(n), self.base));
+            self.spans.push(Span::styled(spaces(n), self.base));
         }
     }
     fn pad_to(&mut self, to: usize) {
@@ -794,7 +899,7 @@ fn compose_row(
     ctx: &Ctx,
     width: usize,
 ) -> Line<'static> {
-    let t = &ctx.theme;
+    let t = ctx.theme;
     let mut base = Style::default();
     if selected {
         if let Some(bg) = t.sel_bg() {
@@ -815,7 +920,7 @@ fn compose_row(
 
     // Accent bar.
     if selected {
-        b.push("▌".into(), t.fg(base, t.accent()));
+        b.push(t.bar_glyph(), t.fg(base, t.accent()));
     } else {
         b.pad(1);
     }
@@ -835,7 +940,7 @@ fn compose_row(
             b.push(cut(&label, room), style);
         }
     } else if rv.editor_open {
-        b.push(t.editor_glyph().into(), t.fg(base, t.open_blue()));
+        b.push(t.editor_glyph().to_string(), t.fg(base, t.open_blue()));
     }
     b.pad_to(end);
 
@@ -882,7 +987,7 @@ fn compose_row(
         let (kept, more) = fit_tags(&widths, cols.tags);
         for (k, (tag, open)) in rv.tags.iter().take(kept).enumerate() {
             if k > 0 {
-                b.push(" · ".into(), base.patch(t.muted()));
+                b.push(t.dot_sep(), base.patch(t.muted()));
             }
             let mut s = t.fg(base, t.tag_color(tag));
             if *open {
@@ -1008,7 +1113,7 @@ fn draw(f: &mut Frame, st: &mut State) {
         .cloned();
     let max_bw = (outer.width as usize).saturating_sub(4);
     let bottom = match &active_toast {
-        Some(toast) => toast_line(toast, max_bw, &t),
+        Some(toast) => toast_line(toast, max_bw, t),
         None => {
             let owned: Vec<(&str, &str)> = st
                 .footer_hints
@@ -1024,9 +1129,9 @@ fn draw(f: &mut Frame, st: &mut State) {
                 ("?", "keys"),
             ];
             if owned.is_empty() {
-                Line::from(hint_spans(&fallback, max_bw, &t))
+                Line::from(hint_spans(&fallback, max_bw, t))
             } else {
-                Line::from(hint_spans(&owned, max_bw, &t))
+                Line::from(hint_spans(&owned, max_bw, t))
             }
         }
     };
@@ -1040,6 +1145,7 @@ fn draw(f: &mut Frame, st: &mut State) {
     let inner = block.inner(outer);
     f.render_widget(block, outer);
     st.animating = false;
+    st.list_area = Rect::default();
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -1089,7 +1195,7 @@ fn draw(f: &mut Frame, st: &mut State) {
     if cur_y < inner.y + inner.height && inner.height >= 6 {
         f.render_widget(
             Paragraph::new(Span::styled(
-                "─".repeat(iw),
+                t.h_rule().repeat(iw),
                 t.fg(Style::default(), t.border_color()),
             )),
             Rect {
@@ -1108,13 +1214,15 @@ fn draw(f: &mut Frame, st: &mut State) {
         height: (inner.y + inner.height).saturating_sub(cur_y),
     };
     if body.height == 0 {
-        st.list_area = Rect::default();
         return;
     }
 
     if st.data.entries.is_empty() {
-        st.list_area = Rect::default();
-        draw_empty_welcome(f, body, &t);
+        if let Some(tag) = &st.tag_filter {
+            center_msg(f, body, &format!("No folders tagged \"{tag}\""), t);
+        } else {
+            draw_empty_welcome(f, body, t);
+        }
         draw_active_modal(f, outer, st);
         return;
     }
@@ -1130,8 +1238,9 @@ fn draw(f: &mut Frame, st: &mut State) {
             width: 1,
             height: body.height,
         };
+        let vr = t.v_rule();
         let sep_lines: Vec<Line> = (0..sep.height)
-            .map(|_| Line::from(Span::styled("│", t.fg(Style::default(), t.border_color()))))
+            .map(|_| Line::from(Span::styled(vr, t.fg(Style::default(), t.border_color()))))
             .collect();
         f.render_widget(Paragraph::new(sep_lines), sep);
         (
@@ -1147,13 +1256,12 @@ fn draw(f: &mut Frame, st: &mut State) {
     };
 
     if st.rows.is_empty() {
-        st.list_area = Rect::default();
         let msg = if st.view == View::Sessions {
             "No live agent sessions matching filter"
         } else {
             "No matching folders"
         };
-        center_msg(f, list_full, msg, &t);
+        center_msg(f, list_full, msg, t);
         if let Some(ia) = insp_area {
             draw_inspector(f, ia, st);
         }
@@ -1164,15 +1272,7 @@ fn draw(f: &mut Frame, st: &mut State) {
     let height = list_full.height as usize;
     st.page = height;
     st.offset = scroll(&st.rows, st.selected, st.offset, height);
-    let need_sb = st.rows.len() > height && list_full.width > 12;
-    let row_rect = if need_sb {
-        Rect {
-            width: list_full.width - 1,
-            ..list_full
-        }
-    } else {
-        list_full
-    };
+    let (row_rect, sb_area) = slice_scrollbar(list_full, st.rows.len(), height);
     st.list_area = row_rect;
     let width = row_rect.width as usize;
 
@@ -1233,13 +1333,8 @@ fn draw(f: &mut Frame, st: &mut State) {
     }
     f.render_widget(Paragraph::new(lines), row_rect);
 
-    if need_sb {
-        let sb_area = Rect {
-            x: list_full.x + list_full.width - 1,
-            width: 1,
-            ..list_full
-        };
-        render_scrollbar(f, sb_area, st.rows.len(), st.offset, height, &t);
+    if let Some(sb_area) = sb_area {
+        render_scrollbar(f, sb_area, st.rows.len(), st.offset, height, t);
     }
     if let Some(ia) = insp_area {
         draw_inspector(f, ia, st);
@@ -1247,7 +1342,7 @@ fn draw(f: &mut Frame, st: &mut State) {
     draw_active_modal(f, outer, st);
 }
 
-fn draw_empty_welcome(f: &mut Frame, area: Rect, t: &Theme) {
+fn draw_empty_welcome(f: &mut Frame, area: Rect, t: Theme) {
     if area.height < 4 {
         center_msg(
             f,
@@ -1287,7 +1382,7 @@ fn draw_inspector(f: &mut Frame, area: Rect, st: &State) {
     if area.width < 12 || area.height < 3 {
         return;
     }
-    let t = &st.theme;
+    let t = st.theme;
     let pad = Rect {
         x: area.x + 1,
         width: area.width.saturating_sub(2),
@@ -1298,13 +1393,14 @@ fn draw_inspector(f: &mut Frame, area: Rect, st: &State) {
         center_msg(f, pad, "Nothing selected", t);
         return;
     };
-    let shown = platform::sanitize_display(&display_path(&e.path, st.home.as_deref()));
-    let (_, name, _) = split_path(&shown);
+    let disp = display_path(&e.path, st.home.as_deref());
+    let shown = platform::sanitize_display(&disp);
+    let (_, name) = split_path(&shown);
     let mut lines = vec![
         Line::from(vec![
             Span::styled(format!("{} ", t.star()), t.title_accent()),
             Span::styled(
-                cut(&name, w.saturating_sub(2)),
+                cut(name, w.saturating_sub(2)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -1455,41 +1551,17 @@ fn draw_inspector(f: &mut Frame, area: Rect, st: &State) {
 }
 
 fn draw_active_modal(f: &mut Frame, outer: Rect, st: &State) {
-    let t = &st.theme;
+    let t = st.theme;
     match st.modal {
         Modal::None => {}
-        Modal::Help => {
-            let row = |k: &str, d: &str| {
-                Line::from(vec![
-                    Span::styled(format!("{k:<10}"), t.title_accent()),
-                    Span::raw(d.to_string()),
-                ])
-            };
-            let body = vec![
-                row("Enter", "Travel to selected folder"),
-                row("Ctrl-O", "Travel and start last AI tool"),
-                row("Ctrl-E", "Open or focus editor"),
-                row("Ctrl-G", "Open folder in grace hub"),
-                row("Tab", "Switch Folders / Sessions view"),
-                row("Alt-P", "Pin or unpin folder"),
-                row("Alt-I", "Toggle Inspector drawer"),
-                row("Ctrl-Y", "Copy folder path"),
-                row("Ctrl-D", "Forget folder (asks first)"),
-                row("Ctrl-W/U", "Delete word / clear search"),
-            ];
-            render_modal(
-                f,
-                outer,
-                "keys",
-                body,
-                &[("esc", "close"), ("?", "close")],
-                t,
-            );
-        }
+        Modal::Help => render_help_modal(f, outer, "keys", &HELP_ROWS, t),
         Modal::ConfirmForget => {
             let name = st
                 .selected_entry()
-                .map(|e| split_path(&platform::sanitize_display(&e.path)).1)
+                .map(|e| {
+                    let clean = platform::sanitize_display(&e.path);
+                    split_path(&clean).1.to_string()
+                })
                 .unwrap_or_default();
             let body = vec![
                 Line::from(format!("Remove \"{name}\" from grace history?")),
@@ -1648,10 +1720,18 @@ fn tty_cursor_position() -> io::Result<Position> {
 
 static FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
+struct PickerGuard;
+
+impl Drop for PickerGuard {
+    fn drop(&mut self) {
+        restore();
+    }
+}
+
 fn restore() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stderr(), DisableMouseCapture);
-    if FULLSCREEN.load(Ordering::SeqCst) {
+    if FULLSCREEN.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stderr(), LeaveAlternateScreen, Show);
     } else {
         let _ = execute!(io::stderr(), Show);
@@ -1683,16 +1763,9 @@ fn update_footer_hints(st: &mut State, opts: &Opts) {
     st.footer_hints = hints;
 }
 
-fn is_altgr_char(key: &KeyEvent) -> bool {
-    cfg!(windows)
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT)
-}
-
-fn is_plain_char(key: &KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    (!ctrl && !alt) || is_altgr_char(key)
+fn reload_interval(opts: &Opts, view: View) -> Option<Duration> {
+    opts.reload.as_ref()?;
+    opts.reload_every.as_ref().and_then(|f| f(view))
 }
 
 fn run<B: Backend>(
@@ -1701,47 +1774,64 @@ fn run<B: Backend>(
     opts: &mut Opts,
 ) -> Result<Option<Choice>> {
     let mut first = true;
-    let mut bg_rx: Option<Receiver<Option<Data>>> = None;
+    let mut bg_rx: Option<(View, Receiver<Option<Data>>)> = None;
     let mut next_reload: Option<Instant> = None;
+    let mut dirty = true;
+    let mut hints_dirty = true;
+    let mut last_frame = 0usize;
 
     loop {
-        if let Some(rx) = &bg_rx {
+        if let Some((bg_view, rx)) = &bg_rx {
             if let Ok(maybe) = rx.try_recv() {
-                if let Some(d) = maybe {
-                    st.now = crate::model::now();
-                    st.set_data(d);
+                if *bg_view == st.view {
+                    if let Some(d) = maybe {
+                        st.now = crate::model::now();
+                        st.set_data(d);
+                        dirty = true;
+                        hints_dirty = true;
+                    }
                 }
                 bg_rx = None;
             }
         }
-        st.maybe_fetch_summary();
-        update_footer_hints(st, opts);
-        terminal.draw(|f| draw(f, st))?;
+        if st.maybe_fetch_summary() {
+            dirty = true;
+        }
+        if dirty {
+            if hints_dirty {
+                update_footer_hints(st, opts);
+                hints_dirty = false;
+            }
+            terminal.draw(|f| draw(f, st))?;
+            dirty = false;
+        }
 
         if first {
             first = false;
             if let Some(job) = opts.after_first_frame.take() {
+                let launch_view = st.view;
                 let (tx, rx) = mpsc::channel();
-                bg_rx = Some(rx);
+                bg_rx = Some((launch_view, rx));
                 std::thread::spawn(move || {
                     let _ = tx.send(job());
                 });
             }
-            if opts.reload.is_some() {
-                next_reload = opts.reload_every.map(|d| Instant::now() + d);
-            }
+            next_reload = reload_interval(opts, st.view).map(|d| Instant::now() + d);
         }
 
         let now = Instant::now();
         if st.toast.as_ref().is_some_and(|t| now >= t.until) {
             st.toast = None;
+            dirty = true;
         }
         if next_reload.is_some_and(|at| now >= at) {
             if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
                 st.now = crate::model::now();
                 st.set_data(d);
+                dirty = true;
+                hints_dirty = true;
             }
-            next_reload = opts.reload_every.map(|d| Instant::now() + d);
+            next_reload = reload_interval(opts, st.view).map(|d| Instant::now() + d);
         }
 
         let mut wait = Duration::from_secs(60);
@@ -1749,7 +1839,7 @@ fn run<B: Backend>(
             let into = (now - st.start).as_millis() % TICK.as_millis();
             wait = wait.min(TICK - Duration::from_millis(into as u64));
         }
-        if bg_rx.is_some() || st.pending_summary.is_some() {
+        if bg_rx.is_some() || st.pending_summary.is_some() || st.summary_wait.is_some() {
             wait = wait.min(Duration::from_millis(40));
         }
         if let Some(toast) = &st.toast {
@@ -1759,26 +1849,49 @@ fn run<B: Backend>(
             wait = wait.min(at.saturating_duration_since(now));
         }
 
-        if !event::poll(wait)? {
-            continue;
+        if event::poll(wait)? {
+            match event::read()? {
+                Event::Mouse(m) => {
+                    if let Some(c) = handle_mouse(st, opts, m, &mut next_reload) {
+                        return Ok(Some(c));
+                    }
+                    if !matches!(m.kind, MouseEventKind::Moved) {
+                        dirty = true;
+                        hints_dirty = true;
+                    }
+                }
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if let Some(res) = handle_key(st, opts, key, &mut next_reload) {
+                        return Ok(res);
+                    }
+                    dirty = true;
+                    hints_dirty = true;
+                }
+                Event::Resize(_, _) => {
+                    dirty = true;
+                }
+                _ => {}
+            }
         }
-        match event::read()? {
-            Event::Mouse(m) => {
-                if let Some(c) = handle_mouse(st, opts, m) {
-                    return Ok(Some(c));
-                }
+        if st.animating {
+            let frame =
+                (Instant::now().saturating_duration_since(st.start)).as_millis() / TICK.as_millis();
+            if frame as usize != last_frame {
+                last_frame = frame as usize;
+                dirty = true;
             }
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if let Some(res) = handle_key(st, opts, key) {
-                    return Ok(res);
-                }
-            }
-            _ => {}
         }
     }
 }
 
-fn handle_mouse(st: &mut State, opts: &mut Opts, m: MouseEvent) -> Option<Choice> {
+fn handle_mouse(
+    st: &mut State,
+    opts: &mut Opts,
+    m: MouseEvent,
+    next_reload: &mut Option<Instant>,
+) -> Option<Choice> {
     if st.modal != Modal::None {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             st.modal = Modal::None;
@@ -1794,22 +1907,19 @@ fn handle_mouse(st: &mut State, opts: &mut Opts, m: MouseEvent) -> Option<Choice
                 y: m.row,
             };
             if st.tab_folders_area.contains(pos) && st.view != View::Folders {
-                switch_view(st, opts, View::Folders);
+                switch_view(st, opts, View::Folders, next_reload);
                 return None;
             }
             if st.tab_sessions_area.contains(pos) && st.view != View::Sessions {
-                switch_view(st, opts, View::Sessions);
+                switch_view(st, opts, View::Sessions, next_reload);
                 return None;
             }
             if st.list_area.contains(pos) {
                 let rel_y = (m.row - st.list_area.y) as usize;
                 let idx = st.offset + rel_y;
                 if matches!(st.rows.get(idx), Some(Row::Item(_))) {
-                    let is_dbl = st.last_click.is_some_and(|(prev, at)| {
-                        prev == idx && at.elapsed() < Duration::from_millis(400)
-                    });
+                    let is_dbl = st.last_click.click(idx);
                     st.selected = idx;
-                    st.last_click = Some((idx, Instant::now()));
                     if is_dbl {
                         return st.selected_entry().map(|e| Choice {
                             entry: e.clone(),
@@ -1824,8 +1934,9 @@ fn handle_mouse(st: &mut State, opts: &mut Opts, m: MouseEvent) -> Option<Choice
     None
 }
 
-fn switch_view(st: &mut State, opts: &mut Opts, next: View) {
+fn switch_view(st: &mut State, opts: &mut Opts, next: View, next_reload: &mut Option<Instant>) {
     st.view = next;
+    *next_reload = reload_interval(opts, next).map(|d| Instant::now() + d);
     if let Some(d) = opts.reload.as_mut().and_then(|r| r(next)) {
         st.now = crate::model::now();
         st.set_data(d);
@@ -1835,18 +1946,19 @@ fn switch_view(st: &mut State, opts: &mut Opts, next: View) {
 }
 
 /// Returns `Some(res)` to exit the picker with `res`, `None` to keep running.
-fn handle_key(st: &mut State, opts: &mut Opts, key: KeyEvent) -> Option<Option<Choice>> {
+fn handle_key(
+    st: &mut State,
+    opts: &mut Opts,
+    key: KeyEvent,
+    next_reload: &mut Option<Instant>,
+) -> Option<Option<Choice>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // Modal intercept.
     match st.modal {
         Modal::Help => {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q')
-            ) || (ctrl && key.code == KeyCode::Char('c'))
-            {
+            if is_help_dismiss(&key) {
                 st.modal = Modal::None;
             }
             return None;
@@ -1859,9 +1971,10 @@ fn handle_key(st: &mut State, opts: &mut Opts, key: KeyEvent) -> Option<Option<C
                         if let Some(cb) = opts.forget_dir.as_mut() {
                             match cb(&e) {
                                 Ok(()) => {
-                                    if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
-                                        st.set_data(d);
-                                    }
+                                    st.data.entries.retain(|x| x.path != e.path);
+                                    st.summaries.remove(&e.path);
+                                    st.recompute_widths();
+                                    st.refilter_keep(None);
                                     st.flash(
                                         format!("forgot {}", split_path(&e.path).1),
                                         ToastKind::Success,
@@ -1882,7 +1995,8 @@ fn handle_key(st: &mut State, opts: &mut Opts, key: KeyEvent) -> Option<Option<C
     }
 
     // Empty-DB quick welcome keys.
-    if st.data.entries.is_empty() && st.query.is_empty() && !ctrl && !alt {
+    if st.tag_filter.is_none() && st.data.entries.is_empty() && st.query.is_empty() && !ctrl && !alt
+    {
         match key.code {
             KeyCode::Char('i' | 'I') => {
                 if let Some(cb) = opts.import_all_now.as_mut() {
@@ -1976,9 +2090,13 @@ fn handle_key(st: &mut State, opts: &mut Opts, key: KeyEvent) -> Option<Option<C
                 if let Some(cb) = opts.toggle_pin.as_mut() {
                     match cb(&e) {
                         Ok(now_pinned) => {
-                            if let Some(d) = opts.reload.as_mut().and_then(|r| r(st.view)) {
-                                st.set_data(d);
+                            if let Some(item) =
+                                st.data.entries.iter_mut().find(|x| x.path == e.path)
+                            {
+                                item.pinned = now_pinned;
                             }
+                            crate::rank::sort_entries(&mut st.data.entries, st.now);
+                            st.refilter_keep(Some(&e.path));
                             let verb = if now_pinned { "pinned" } else { "unpinned" };
                             st.flash(
                                 format!("{verb} {}", split_path(&e.path).1),
@@ -2008,7 +2126,7 @@ fn handle_key(st: &mut State, opts: &mut Opts, key: KeyEvent) -> Option<Option<C
             } else {
                 View::Folders
             };
-            switch_view(st, opts, next);
+            switch_view(st, opts, next, next_reload);
         }
         KeyCode::F(1) => st.modal = Modal::Help,
         KeyCode::Char('?') if st.query.is_empty() && !ctrl && !alt => st.modal = Modal::Help,
@@ -2066,10 +2184,15 @@ fn run_inline(st: &mut State, opts: &mut Opts) -> Result<Option<Choice>> {
     result
 }
 
-pub fn pick(data: Data, query: &str, now: i64, mut opts: Opts) -> Result<Option<Choice>> {
+pub fn pick(
+    data: Data,
+    query: &str,
+    now: i64,
+    cfg: &Config,
+    mut opts: Opts,
+) -> Result<Option<Choice>> {
     let home = platform::home_dir().map(|h| h.to_string_lossy().into_owned());
-    let cfg = crate::config::load();
-    let theme = Theme::from_env_and_config(&cfg);
+    let theme = Theme::from_env_and_config(cfg);
     let mut st = State::new(
         data,
         query,
@@ -2092,6 +2215,9 @@ pub fn pick(data: Data, query: &str, now: i64, mut opts: Opts) -> Result<Option<
             action: Action::Travel,
         }));
     }
+    if !io::stderr().is_terminal() {
+        bail!("grace requires an interactive terminal for the picker");
+    }
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2100,21 +2226,22 @@ pub fn pick(data: Data, query: &str, now: i64, mut opts: Opts) -> Result<Option<
     }));
 
     enable_raw_mode()?;
-    let result = if opts.fullscreen {
+    let _guard = PickerGuard;
+    if opts.fullscreen {
         run_fullscreen(&mut st, &mut opts)
     } else {
         run_inline(&mut st, &mut opts)
-    };
-    restore();
-    result
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Tag;
-    use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
+
+    fn render_pick(st: &mut State, w: u16, h: u16) -> String {
+        crate::tui::render_text(w, h, |f| draw(f, st))
+    }
 
     fn entry(path: &str, tools: &[&str]) -> Entry {
         Entry {
@@ -2208,9 +2335,9 @@ mod tests {
 
     #[test]
     fn split_paths() {
-        assert_eq!(split_path("~/code/knn"), ("~/code".into(), "knn".into(), 7));
-        assert_eq!(split_path("/tmp"), ("/".into(), "tmp".into(), 1));
-        assert_eq!(split_path("~"), ("".into(), "~".into(), 0));
+        assert_eq!(split_path("~/code/knn"), ("~/code", "knn"));
+        assert_eq!(split_path("/tmp"), ("/", "tmp"));
+        assert_eq!(split_path("~"), ("", "~"));
     }
 
     #[test]
@@ -2280,22 +2407,6 @@ mod tests {
         assert_eq!(parse_cpr(b"\x1b[12;"), None);
     }
 
-    fn render(st: &mut State, w: u16, h: u16) -> String {
-        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| draw(f, st)).unwrap();
-        let buf = term.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            let mut line = String::new();
-            for x in 0..buf.area.width {
-                line.push_str(buf[(x, y)].symbol());
-            }
-            out.push_str(line.trim_end());
-            out.push('\n');
-        }
-        out
-    }
-
     const NOW: i64 = 1_000_000;
 
     fn demo() -> Data {
@@ -2353,172 +2464,13 @@ mod tests {
             tag: "vscode".into(),
             prog: "code".into(),
             args: vec!["/home/u/notes".into()],
-            open_cmd: "code '/home/u/notes'".into(),
         }];
         Data {
             entries: e,
             sessions,
             editors,
             branches: HashMap::new(),
-            hub_paths: Vec::new(),
         }
-    }
-
-    /// Writes assets/demo.svg from a real render with coalesced SVG background rects. Run with:
-    /// cargo test demo_svg -- --ignored
-    #[test]
-    #[ignore]
-    fn demo_svg() {
-        fn hex(c: Color, d: &str) -> String {
-            match c {
-                Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
-                Color::Yellow => "#e5c07b".into(),
-                Color::LightYellow => "#ffe9a3".into(),
-                Color::Blue => "#61afef".into(),
-                Color::Cyan => "#56b6c2".into(),
-                Color::Green => "#98c379".into(),
-                Color::Magenta => "#c678dd".into(),
-                Color::Gray => "#abb2bf".into(),
-                Color::DarkGray => "#5c6370".into(),
-                Color::Red | Color::LightRed => "#e06c75".into(),
-                Color::White => "#f0f0f0".into(),
-                Color::Indexed(n) => match n {
-                    0..=15 => d.into(),
-                    232..=255 => {
-                        let v = 8 + (n - 232) * 10;
-                        format!("#{v:02x}{v:02x}{v:02x}")
-                    }
-                    n => {
-                        let idx = n - 16;
-                        let steps = [0u8, 95, 135, 175, 215, 255];
-                        format!(
-                            "#{:02x}{:02x}{:02x}",
-                            steps[(idx / 36) as usize],
-                            steps[((idx / 6) % 6) as usize],
-                            steps[(idx % 6) as usize]
-                        )
-                    }
-                },
-                _ => d.into(),
-            }
-        }
-        fn esc(s: &str) -> String {
-            s.replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-        }
-        let mut st = State::new(
-            demo(),
-            "",
-            NOW,
-            View::Folders,
-            false,
-            None,
-            None,
-            Theme::dark(),
-            Some("/home/u".into()),
-        );
-        st.footer_hints = vec![
-            ("⏎", "travel".into()),
-            ("^o", "claude".into()),
-            ("^e", "vscode".into()),
-            ("^g", "hub".into()),
-            ("⇥", "sessions".into()),
-            ("?", "keys".into()),
-        ];
-        let (w, h) = (102u16, 11u16);
-        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| draw(f, &mut st)).unwrap();
-        let buf = term.backend().buffer().clone();
-        let (cw, lh, px, py) = (8.4f64, 21.0f64, 18.0f64, 18.0f64);
-        let width = (w as f64 * cw + 2.0 * px).ceil();
-        let height = (py + 34.0 + (h as f64 - 1.0) * lh + 20.0).ceil();
-        let mut o = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="The grace picker with live agent status and tool tags">
-<style>text{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;white-space:pre}}</style>
-<rect x="0.5" y="0.5" width="{}" height="{}" rx="12" fill="#16171b" stroke="#3a3d46"/>
-<circle cx="22" cy="19" r="6" fill="#ff5f57"/><circle cx="42" cy="19" r="6" fill="#febc2e"/><circle cx="62" cy="19" r="6" fill="#28c840"/>
-<text x="{}" y="24" text-anchor="middle" fill="#9a9ea8" style="font-size:12px">~ ❯ grace</text>
-"##,
-            width - 1.0,
-            height - 1.0,
-            width / 2.0
-        );
-        let top = py + 34.0;
-        for y in 0..h {
-            let base_y = top + y as f64 * lh;
-            // Coalesced background runs (including reversed whitespace cursor cells).
-            let cell_bg = |x: u16, y: u16| -> Option<String> {
-                let cell = &buf[(x, y)];
-                if cell.modifier.contains(Modifier::REVERSED) {
-                    Some(hex(cell.fg, "#d7dae0"))
-                } else if cell.bg != Color::Reset {
-                    Some(hex(cell.bg, "#282c38"))
-                } else {
-                    None
-                }
-            };
-            let mut x = 0u16;
-            while x < w {
-                let Some(bg_hex) = cell_bg(x, y) else {
-                    x += 1;
-                    continue;
-                };
-                let start = x;
-                while x < w && cell_bg(x, y).as_deref() == Some(bg_hex.as_str()) {
-                    x += 1;
-                }
-                o += &format!(
-                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{lh}\" fill=\"{bg_hex}\"/>\n",
-                    px + start as f64 * cw,
-                    base_y - 15.0,
-                    (x - start) as f64 * cw + 0.3,
-                );
-            }
-            let mut x = 0u16;
-            while x < w {
-                let c = &buf[(x, y)];
-                if c.symbol().trim().is_empty() {
-                    x += 1;
-                    continue;
-                }
-                let mut run = String::new();
-                let start = x;
-                let style = (c.fg, c.modifier);
-                while x < w
-                    && (buf[(x, y)].fg, buf[(x, y)].modifier) == style
-                    && !buf[(x, y)].symbol().is_empty()
-                {
-                    run.push_str(buf[(x, y)].symbol());
-                    x += 1;
-                }
-                let (fg, modf) = style;
-                let fill = if modf.contains(Modifier::REVERSED) {
-                    "#16171b".into()
-                } else {
-                    hex(fg, "#d7dae0")
-                };
-                let mut attrs = format!("fill=\"{fill}\"");
-                if modf.contains(Modifier::BOLD) {
-                    attrs += " font-weight=\"700\"";
-                }
-                if modf.contains(Modifier::DIM) {
-                    attrs += " opacity=\".55\"";
-                }
-                if modf.contains(Modifier::UNDERLINED) {
-                    attrs += " text-decoration=\"underline\"";
-                }
-                o += &format!(
-                    "<text x=\"{:.1}\" y=\"{:.1}\" textLength=\"{:.1}\" lengthAdjust=\"spacingAndGlyphs\" {attrs}>{}</text>\n",
-                    px + start as f64 * cw,
-                    base_y,
-                    (x - start) as f64 * cw,
-                    esc(&run)
-                );
-            }
-        }
-        o += "</svg>\n";
-        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/demo.svg"), o).unwrap();
     }
 
     #[test]
@@ -2534,7 +2486,7 @@ mod tests {
             Theme::dark(),
             Some("/home/u".into()),
         );
-        let out = render(&mut st, 100, 11);
+        let out = render_pick(&mut st, 100, 11);
         println!("{out}");
         let lines: Vec<&str> = out.lines().collect();
         assert!(
@@ -2579,12 +2531,12 @@ mod tests {
 
         st.query = "aiml".into();
         st.refilter();
-        let out = render(&mut st, 70, 8);
+        let out = render_pick(&mut st, 70, 8);
         assert!(out.lines().next().unwrap().ends_with(" 3/6 ╮"));
 
         st.query = "zzzqqq".into();
         st.refilter();
-        let out = render(&mut st, 70, 6);
+        let out = render_pick(&mut st, 70, 6);
         assert!(out.contains("No matching folders"));
 
         let mut empty = State::new(
@@ -2598,8 +2550,22 @@ mod tests {
             Theme::dark(),
             None,
         );
-        let out = render(&mut empty, 72, 8);
+        let out = render_pick(&mut empty, 72, 8);
         assert!(out.contains("No sites of grace yet"));
+
+        let mut tagged_empty = State::new(
+            Data::default(),
+            "",
+            0,
+            View::Folders,
+            false,
+            Some("claude".into()),
+            None,
+            Theme::dark(),
+            None,
+        );
+        let out = render_pick(&mut tagged_empty, 72, 8);
+        assert!(out.contains("No folders tagged \"claude\""));
     }
 
     #[test]
@@ -2617,7 +2583,7 @@ mod tests {
             Theme::dark(),
             Some("/home/u".into()),
         );
-        let out = render(&mut st, 100, 12);
+        let out = render_pick(&mut st, 100, 12);
         println!("{out}");
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[3].contains("NEEDS YOU (1)"), "{}", lines[3]);
@@ -2648,7 +2614,7 @@ mod tests {
             Some("/home/u".into()),
         );
         st.flash("no editor used here", ToastKind::Warn);
-        let out = render(&mut st, 100, 10);
+        let out = render_pick(&mut st, 100, 10);
         assert!(out.lines().last().unwrap().contains("no editor used here"));
     }
 
@@ -2675,12 +2641,17 @@ mod tests {
             "expected multi-word highlight in tag"
         );
         // Very narrow terminal with tag filter hides tab pills cleanly instead of colliding.
-        let out = render(&mut st, 44, 8);
+        let out = render_pick(&mut st, 44, 8);
         let first_line = out.lines().next().unwrap();
         assert_eq!(first_line.chars().count(), 44, "{first_line}");
         assert!(first_line.contains("✦ grace"), "{first_line}");
         assert!(!first_line.contains("Folders"), "{first_line}");
         assert_eq!(st.tab_folders_area, Rect::default());
         assert_eq!(st.tab_sessions_area, Rect::default());
+
+        // Unicode non-ASCII whitespace in delete_word does not panic on truncate.
+        st.query = "foo\u{3000}bar/".into();
+        st.delete_word();
+        assert_eq!(st.query, "foo\u{3000}");
     }
 }

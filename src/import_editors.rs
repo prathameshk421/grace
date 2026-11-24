@@ -1,8 +1,9 @@
 //! Import recent folders from editors. All reads are read-only.
-use crate::db::Db;
+use crate::db::{open_readonly_uri, Db};
+use crate::editors_live::APPS;
 use crate::model;
-use crate::platform;
-use rusqlite::{config::DbConfig, Connection, OpenFlags};
+use crate::platform::{self, IgnoreMatcher};
+use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -32,59 +33,41 @@ const ALL: &[&str] = &[
     "t3code",
 ];
 
-/// (app folder name, tag) for each source of the VS Code family.
-fn vscode_apps(source: &str) -> &'static [(&'static str, &'static str)] {
-    match source {
-        "vscode" => &[
-            ("Code", "vscode"),
-            ("Code - Insiders", "vscode"),
-            ("VSCodium", "vscodium"),
-        ],
-        "cursor" => &[("Cursor", "cursor")],
-        "windsurf" => &[("Windsurf", "windsurf")],
-        "antigravity" => &[
-            ("Antigravity", "antigravity"),
-            ("Antigravity IDE", "antigravity"),
-        ],
-        _ => &[],
-    }
-}
-
-/// Flatpak app IDs for VS Code family on Linux.
+/// Flatpak app IDs for VS Code family on Linux `(source, app_id, dir_name, tag)`.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn flatpak_apps(source: &str) -> &'static [(&'static str, &'static str, &'static str)] {
-    match source {
-        "vscode" => &[
-            ("com.visualstudio.code", "Code", "vscode"),
-            ("com.visualstudio.code-oss", "Code - OSS", "vscode"),
-            ("com.vscodium.codium", "VSCodium", "vscodium"),
-        ],
-        _ => &[],
-    }
-}
+pub(crate) const FLATPAK_APPS: &[(&str, &str, &str, &str)] = &[
+    ("vscode", "com.visualstudio.code", "Code", "vscode"),
+    (
+        "vscode",
+        "com.visualstudio.code-oss",
+        "Code - OSS",
+        "vscode",
+    ),
+    ("vscode", "com.vscodium.codium", "VSCodium", "vscodium"),
+];
 
 /// Import one source. `None` means the source was not found.
-pub fn import_source(db: &Db, source: &str) -> Option<usize> {
+pub fn import_source(db: &Db, source: &str, ignore: &IgnoreMatcher) -> Option<usize> {
     match source {
-        "claude" => crate::import::import_claude(db).ok().flatten(),
-        "zed" => import_zed(db),
-        "t3code" => import_t3code(db),
-        s => import_vscode_family(db, s),
+        "claude" => crate::import::import_claude(db, ignore).ok().flatten(),
+        "zed" => import_zed(db, ignore),
+        "t3code" => import_t3code(db, ignore),
+        s => import_vscode_family(db, s, ignore),
     }
 }
 
-/// Import all editor sources (not Claude history). Prints nothing. Returns the folder count.
-pub fn import_editors_quiet(db: &Db) -> usize {
+/// Import all editor sources (not Claude history). Prints nothing. Returns newly added folder count.
+pub fn import_editors_quiet(db: &Db, ignore: &IgnoreMatcher) -> usize {
     ALL.iter()
         .filter(|s| **s != "claude")
-        .filter_map(|s| import_source(db, s))
+        .filter_map(|s| import_source(db, s, ignore))
         .sum()
 }
 
-/// Import every source. Returns `(source, count)` for sources that exist.
-pub fn import_all(db: &Db) -> Vec<(&'static str, usize)> {
+/// Import every source. Returns `(source, newly_added_count)` for sources that exist.
+pub fn import_all(db: &Db, ignore: &IgnoreMatcher) -> Vec<(&'static str, usize)> {
     ALL.iter()
-        .filter_map(|s| import_source(db, s).map(|n| (*s, n)))
+        .filter_map(|s| import_source(db, s, ignore).map(|n| (*s, n)))
         .collect()
 }
 
@@ -97,15 +80,38 @@ pub fn detected_sources() -> Vec<(&'static str, PathBuf)> {
             out.push(("claude", p));
         }
     }
-    if let Some(root) = config_root() {
-        for src in ["vscode", "cursor", "windsurf", "antigravity"] {
-            for (app, _) in vscode_apps(src) {
-                let p = root.join(app);
+    let root = config_root();
+    for src in ["vscode", "cursor", "windsurf", "antigravity"] {
+        let mut found = None;
+        if let Some(r) = &root {
+            for a in APPS.iter().filter(|a| a.source == src) {
+                let p = r.join(a.dir);
                 if p.is_dir() {
-                    out.push((src, p));
+                    found = Some(p);
                     break;
                 }
             }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if found.is_none() {
+            if let Some(home) = platform::home_dir() {
+                for &(s, app_id, dir_name, _) in FLATPAK_APPS {
+                    if s == src {
+                        let p = home
+                            .join(".var/app")
+                            .join(app_id)
+                            .join("config")
+                            .join(dir_name);
+                        if p.is_dir() {
+                            found = Some(p);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(p) = found {
+            out.push((src, p));
         }
     }
     if let Some(p) = zed_db_path() {
@@ -123,22 +129,16 @@ pub fn detected_sources() -> Vec<(&'static str, PathBuf)> {
 
 // ---------- locations ----------
 
-fn env_dir(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
-
 /// Folder that holds the app data of editors (`Application Support`, `%APPDATA%`, `~/.config`).
 pub(crate) fn config_root() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         platform::home_dir().map(|h| h.join("Library").join("Application Support"))
     } else if cfg!(windows) {
-        env_dir("APPDATA")
+        platform::env_non_empty("APPDATA").map(PathBuf::from)
     } else {
-        env_dir("XDG_CONFIG_HOME")
-            .filter(|p| p.is_absolute())
+        platform::env_non_empty("XDG_CONFIG_HOME")
+            .filter(|v| Path::new(v).is_absolute())
+            .map(PathBuf::from)
             .or_else(|| platform::home_dir().map(|h| h.join(".config")))
     }
 }
@@ -147,10 +147,11 @@ fn zed_db_path() -> Option<PathBuf> {
     let base = if cfg!(target_os = "macos") {
         platform::home_dir()?.join("Library/Application Support/Zed")
     } else if cfg!(windows) {
-        env_dir("LOCALAPPDATA")?.join("Zed")
+        PathBuf::from(platform::env_non_empty("LOCALAPPDATA")?).join("Zed")
     } else {
-        env_dir("XDG_DATA_HOME")
-            .filter(|p| p.is_absolute())
+        platform::env_non_empty("XDG_DATA_HOME")
+            .filter(|v| Path::new(v).is_absolute())
+            .map(PathBuf::from)
             .or_else(|| platform::home_dir().map(|h| h.join(".local/share")))?
             .join("zed")
     };
@@ -220,6 +221,22 @@ fn file_uri_to_path(uri: &str) -> Option<String> {
     uri_to_path(uri, cfg!(windows))
 }
 
+/// Extract parent folder from a `.code-workspace` file path or `file://` URI.
+pub(crate) fn workspace_dir_from_cfg(cfg: &str, windows: bool) -> Option<String> {
+    let file = if cfg.starts_with("file:") {
+        uri_to_path(cfg, windows)?
+    } else if cfg.contains("://") {
+        return None;
+    } else {
+        platform::clean_path_str(cfg)
+    };
+    let (dir, name) = file.rsplit_once(['/', '\\'])?;
+    if !name.ends_with(".code-workspace") || dir.is_empty() {
+        return None;
+    }
+    Some(platform::clean_path_str(dir))
+}
+
 /// Folder paths decoded from `history.recentlyOpenedPathsList`, including `.code-workspace` files.
 pub fn parse_recent_folders(json: &str, windows: bool) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
@@ -241,34 +258,12 @@ pub fn parse_recent_folders(json: &str, windows: bool) -> Vec<String> {
             .and_then(|w| w.get("configPath"))
             .and_then(|c| c.as_str())
         {
-            if let Some(file) = uri_to_path(cfg, windows) {
-                if let Some((dir, name)) = file.rsplit_once(['/', '\\']) {
-                    if name.ends_with(".code-workspace") && !dir.is_empty() {
-                        out.push(platform::clean_path_str(dir));
-                    }
-                }
+            if let Some(dir) = workspace_dir_from_cfg(cfg, windows) {
+                out.push(dir);
             }
         }
     }
     out
-}
-
-/// The `folderUri` values with the `file:` scheme, in order, from `history.recentlyOpenedPathsList`.
-#[cfg(test)]
-pub fn parse_recent_folder_uris(json: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
-    v.get("entries")
-        .and_then(|e| e.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| e.get("folderUri").and_then(|u| u.as_str()))
-                .filter(|u| u.starts_with("file:"))
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Days since 1970-01-01 for a civil date.
@@ -283,7 +278,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Parse "YYYY-MM-DD HH:MM:SS" or ISO-8601 timestamp (including `+HH:MM` / `-HH:MM` offsets) into Unix seconds.
-pub fn parse_zed_timestamp(s: &str) -> Option<i64> {
+pub fn parse_timestamp(s: &str) -> Option<i64> {
     let s = s.trim();
     let (date, time_raw) = s.split_once([' ', 'T'])?;
     let mut d = date.split('-');
@@ -291,7 +286,6 @@ pub fn parse_zed_timestamp(s: &str) -> Option<i64> {
     if d.next().is_some() {
         return None;
     }
-    // Strip optional trailing Z or +HH:MM / -HH:MM timezone offset.
     let (time_no_tz, tz_offset_secs) = split_tz_offset(time_raw.trim());
     let time = time_no_tz.split('.').next()?;
     let mut t = time.split(':');
@@ -339,11 +333,6 @@ fn split_tz_offset(s: &str) -> (&str, i64) {
     (s, 0)
 }
 
-/// Parse "YYYY-MM-DDTHH:MM:SS(.fff)?(Z|±HH:MM)?" into Unix seconds.
-pub fn parse_iso_timestamp(s: &str) -> Option<i64> {
-    parse_zed_timestamp(s)
-}
-
 /// Build a `file:` URI for SQLite from a path. Special characters are percent-encoded.
 pub fn sqlite_uri(path: &str, query: &str) -> String {
     let p = platform::strip_verbatim(path).replace('\\', "/");
@@ -365,21 +354,8 @@ pub fn sqlite_uri(path: &str, query: &str) -> String {
 
 // ---------- readers ----------
 
-fn open_ro(path: &Path) -> Option<Connection> {
-    let raw = path.to_string_lossy();
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
-    let conn = Connection::open_with_flags(sqlite_uri(&raw, "mode=ro"), flags)
-        .or_else(|_| Connection::open_with_flags(sqlite_uri(&raw, "immutable=1"), flags))
-        .ok()?;
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
-    let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
-    let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false);
-    let _ = conn.execute_batch("PRAGMA trusted_schema = OFF;");
-    Some(conn)
-}
-
 fn recent_from_state_db(db_path: &Path) -> Vec<(String, i64)> {
-    let Some(conn) = open_ro(db_path) else {
+    let Some(conn) = open_readonly_uri(db_path, 200) else {
         return Vec::new();
     };
     let value: Option<rusqlite::types::Value> = conn
@@ -391,7 +367,8 @@ fn recent_from_state_db(db_path: &Path) -> Vec<(String, i64)> {
         .ok();
     let json = match value {
         Some(rusqlite::types::Value::Text(t)) => t,
-        Some(rusqlite::types::Value::Blob(b)) => String::from_utf8_lossy(&b).into_owned(),
+        Some(rusqlite::types::Value::Blob(b)) => String::from_utf8(b)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
         _ => return Vec::new(),
     };
     let base = mtime(db_path).unwrap_or_else(model::now);
@@ -408,6 +385,9 @@ fn recent_from_workspace_storage(dir: &Path) -> Vec<(String, i64)> {
     };
     let mut out = Vec::new();
     for e in rd.flatten() {
+        if !e.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
         let sub = e.path();
         let Ok(text) =
             platform::read_to_string_capped(&sub.join("workspace.json"), MAX_WORKSPACE_JSON_BYTES)
@@ -429,39 +409,63 @@ fn recent_from_workspace_storage(dir: &Path) -> Vec<(String, i64)> {
     out
 }
 
-/// Add folders to the database using canonicalized paths. Returns how many different folders were valid.
-fn store(db: &Db, found: Vec<(String, i64)>, tag: &str, seen: &mut HashSet<String>) -> usize {
+/// Add folders to the database using canonicalized paths. Returns how many new entries were inserted.
+pub(crate) fn store_with_mtime(
+    db: &Db,
+    found: Vec<(String, i64)>,
+    tag: &str,
+    seen: &mut HashSet<String>,
+    ignore: &IgnoreMatcher,
+    use_dir_mtime: bool,
+) -> usize {
+    let mut raw_seen = HashSet::new();
     let mut items = Vec::new();
-    for (raw, ts) in found {
-        if raw.is_empty() || platform::has_line_break_or_nul(&raw) {
+    for (raw, fallback_ts) in found {
+        if raw.is_empty() || platform::has_line_break_or_nul(&raw) || !raw_seen.insert(raw.clone())
+        {
             continue;
         }
         let dir = Path::new(&raw);
-        if !dir.is_dir() {
+        let Ok(meta) = std::fs::metadata(dir) else {
+            continue;
+        };
+        if !meta.is_dir() {
             continue;
         }
         let path = platform::normalize(dir);
-        if platform::ignored(&path) || !seen.insert(path.clone()) {
+        if ignore.is_ignored(&path) || !seen.insert(path.clone()) {
             continue;
         }
+        let ts = if use_dir_mtime {
+            meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(fallback_ts)
+        } else {
+            fallback_ts
+        };
         items.push((path, ts));
     }
     db.import_dirs_batch(&items, Some(tag)).unwrap_or(0)
 }
 
-fn import_vscode_family(db: &Db, source: &str) -> Option<usize> {
+fn import_vscode_family(db: &Db, source: &str, ignore: &IgnoreMatcher) -> Option<usize> {
     let mut roots: Vec<(PathBuf, &str)> = Vec::new();
     if let Some(root) = config_root() {
-        for (app, tag) in vscode_apps(source) {
-            let p = root.join(app);
+        for a in APPS.iter().filter(|a| a.source == source) {
+            let p = root.join(a.dir);
             if p.is_dir() {
-                roots.push((p, tag));
+                roots.push((p, a.tag));
             }
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     if let Some(home) = platform::home_dir() {
-        for (app_id, dir_name, tag) in flatpak_apps(source) {
+        for &(s, app_id, dir_name, tag) in FLATPAK_APPS {
+            if s != source {
+                continue;
+            }
             let p = home
                 .join(".var/app")
                 .join(app_id)
@@ -482,7 +486,7 @@ fn import_vscode_family(db: &Db, source: &str) -> Option<usize> {
         all.extend(recent_from_workspace_storage(
             &app_root.join("User/workspaceStorage"),
         ));
-        count += store(db, all, tag, &mut seen);
+        count += store_with_mtime(db, all, tag, &mut seen, ignore, false);
     }
     Some(count)
 }
@@ -512,20 +516,27 @@ fn zed_rows(conn: &Connection) -> Vec<(String, Option<String>)> {
     Vec::new()
 }
 
-fn import_zed(db: &Db) -> Option<usize> {
+fn import_zed(db: &Db, ignore: &IgnoreMatcher) -> Option<usize> {
     let path = zed_db_path().filter(|p| p.is_file())?;
-    let Some(conn) = open_ro(&path) else {
+    let Some(conn) = open_readonly_uri(&path, 200) else {
         return Some(0);
     };
     let now = model::now();
     let mut found = Vec::new();
     for (paths, ts) in zed_rows(&conn) {
-        let ts = ts.as_deref().and_then(parse_zed_timestamp).unwrap_or(now);
+        let ts = ts.as_deref().and_then(parse_timestamp).unwrap_or(now);
         for p in paths.split('\n').map(str::trim).filter(|p| !p.is_empty()) {
             found.push((platform::clean_path_str(p), ts));
         }
     }
-    Some(store(db, found, "zed", &mut HashSet::new()))
+    Some(store_with_mtime(
+        db,
+        found,
+        "zed",
+        &mut HashSet::new(),
+        ignore,
+        false,
+    ))
 }
 
 fn t3code_db_path() -> Option<PathBuf> {
@@ -557,20 +568,27 @@ fn t3code_rows(conn: &Connection) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-fn import_t3code(db: &Db) -> Option<usize> {
+fn import_t3code(db: &Db, ignore: &IgnoreMatcher) -> Option<usize> {
     let path = t3code_db_path().filter(|p| p.is_file())?;
-    let Some(conn) = open_ro(&path) else {
+    let Some(conn) = open_readonly_uri(&path, 200) else {
         return Some(0);
     };
     let now = model::now();
     let found = t3code_rows(&conn)
         .into_iter()
         .map(|(p, t)| {
-            let ts = t.as_deref().and_then(parse_iso_timestamp).unwrap_or(now);
+            let ts = t.as_deref().and_then(parse_timestamp).unwrap_or(now);
             (platform::clean_path_str(p.trim()), ts)
         })
         .collect();
-    Some(store(db, found, "t3code", &mut HashSet::new()))
+    Some(store_with_mtime(
+        db,
+        found,
+        "t3code",
+        &mut HashSet::new(),
+        ignore,
+        false,
+    ))
 }
 
 #[cfg(test)]
@@ -603,21 +621,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_zed_timestamps() {
-        assert_eq!(parse_zed_timestamp("1970-01-01 00:00:00"), Some(0));
-        assert_eq!(parse_zed_timestamp("2024-03-05 12:30:45"), Some(1709641845));
-        assert_eq!(parse_zed_timestamp("2000-02-29 00:00:01"), Some(951782401));
-        assert_eq!(parse_zed_timestamp("garbage"), None);
-        assert_eq!(parse_zed_timestamp("2024-13-01 00:00:00"), None);
-        // Timezone offsets (+ and -).
+    fn parses_timestamps() {
+        assert_eq!(parse_timestamp("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(parse_timestamp("2024-03-05 12:30:45"), Some(1709641845));
+        assert_eq!(parse_timestamp("2000-02-29 00:00:01"), Some(951782401));
+        assert_eq!(parse_timestamp("garbage"), None);
+        assert_eq!(parse_timestamp("2024-13-01 00:00:00"), None);
         assert_eq!(
-            parse_iso_timestamp("2024-03-05T14:30:45+02:00"),
+            parse_timestamp("2024-03-05T14:30:45+02:00"),
             Some(1709641845)
         );
         assert_eq!(
-            parse_iso_timestamp("2024-03-05T07:30:45-05:00"),
+            parse_timestamp("2024-03-05T07:30:45-05:00"),
             Some(1709641845)
         );
+        assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_timestamp("2024-03-05T12:30:45.960Z"),
+            Some(1709641845)
+        );
+        assert_eq!(parse_timestamp("nope"), None);
     }
 
     #[test]
@@ -629,15 +652,11 @@ mod tests {
             {"folderUri":"vscode-remote://ssh-remote%2Bhost/home/x"},
             {"folderUri":"file:///c/d%20e"}]}"#;
         assert_eq!(
-            parse_recent_folder_uris(j),
-            vec!["file:///a/b", "file:///c/d%20e"]
-        );
-        assert_eq!(
             parse_recent_folders(j, false),
             vec!["/a/b", "/ws", "/c/d e"]
         );
-        assert!(parse_recent_folder_uris("nope").is_empty());
-        assert!(parse_recent_folder_uris("{}").is_empty());
+        assert!(parse_recent_folders("nope", false).is_empty());
+        assert!(parse_recent_folders("{}", false).is_empty());
     }
 
     #[test]
@@ -690,16 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_iso_timestamps() {
-        assert_eq!(parse_iso_timestamp("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(
-            parse_iso_timestamp("2024-03-05T12:30:45.960Z"),
-            Some(1709641845)
-        );
-        assert_eq!(parse_iso_timestamp("nope"), None);
-    }
-
-    #[test]
     fn reads_t3code_projects() {
         let d = tempfile::tempdir().unwrap();
         let dbp = d.path().join("statev2.sqlite");
@@ -720,7 +729,7 @@ mod tests {
         )
         .unwrap();
         drop(c);
-        let conn = open_ro(&dbp).unwrap();
+        let conn = open_readonly_uri(&dbp, 200).unwrap();
         let rows = t3code_rows(&conn);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "/a");
