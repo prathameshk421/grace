@@ -583,7 +583,10 @@ fn check_agent_hooks(a: &Ansi, sum: &mut Summary, exe: &str, home_ref: Option<&s
     // A hook that calls another grace on PATH still works. Only a hook whose
     // grace is gone (or matches none) is outdated, so `--fix` leaves the rest.
     let mut via_other: Vec<(&str, String)> = Vec::new();
-    if statuses.iter().any(|(_, _, st)| matches!(st, HookStatus::OutdatedPath(_))) {
+    if statuses
+        .iter()
+        .any(|(_, _, st)| matches!(st, HookStatus::OutdatedPath(_)))
+    {
         for alt in platform::other_graces_on_path(exe) {
             let alt_statuses = setup::inspect_all(&alt);
             for (st, (name, _, alt_st)) in statuses.iter_mut().zip(alt_statuses) {
@@ -624,7 +627,11 @@ fn check_agent_hooks(a: &Ansi, sum: &mut Summary, exe: &str, home_ref: Option<&s
     let mut alts: Vec<&str> = via_other.iter().map(|(_, alt)| alt.as_str()).collect();
     alts.dedup();
     for alt in alts {
-        let names: Vec<&str> = via_other.iter().filter(|(_, p)| p == alt).map(|(n, _)| *n).collect();
+        let names: Vec<&str> = via_other
+            .iter()
+            .filter(|(_, p)| p == alt)
+            .map(|(n, _)| *n)
+            .collect();
         info_line(
             a,
             "agent hooks",

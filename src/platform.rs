@@ -295,7 +295,11 @@ fn stable_exe_in(exe: &Path, path: Option<&std::ffi::OsStr>) -> PathBuf {
 
 /// "s" for a plural count, "" for exactly one: `format!("{n} run{}", plural(n))`.
 pub fn plural(n: impl TryInto<i64>) -> &'static str {
-    if n.try_into().ok() == Some(1) { "" } else { "s" }
+    if n.try_into().ok() == Some(1) {
+        ""
+    } else {
+        "s"
+    }
 }
 
 /// Other `grace` programs on PATH: absolute paths, in PATH order, each a
@@ -737,7 +741,12 @@ mod tests {
     fn other_graces_skip_self_and_duplicates() {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
-        let (dev, brew, link, cargo) = (root.join("dev"), root.join("brew"), root.join("link"), root.join("cargo"));
+        let (dev, brew, link, cargo) = (
+            root.join("dev"),
+            root.join("brew"),
+            root.join("link"),
+            root.join("cargo"),
+        );
         for d in [&dev, &brew, &link, &cargo] {
             std::fs::create_dir_all(d).unwrap();
         }
