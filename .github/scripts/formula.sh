@@ -11,7 +11,6 @@ if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.+-]+)?$ ]]; then
   exit 1
 fi
 
-ver=${tag#v}
 base="https://github.com/prathameshk421/grace/releases/download/${tag}"
 
 sha() {
@@ -29,11 +28,12 @@ sha() {
   printf '%s' "$h"
 }
 
+# No `version` line: Homebrew reads it from the URL, and `brew audit --strict`
+# fails on a redundant one.
 cat <<EOF
 class Grace < Formula
   desc "Site of Grace for project navigation, AI coding tools, and tmux workspaces"
   homepage "https://github.com/prathameshk421/grace"
-  version "${ver}"
   license "MIT"
 
   on_macos do
