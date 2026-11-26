@@ -981,8 +981,19 @@ fn print_stats(cfg: &config::Config, stats: &model::Stats, home: Option<&str>) {
             let bar = "█".repeat(bar_len);
             let tool_shown = platform::sanitize_display(tool);
             println!(
-                "    {}{:<14}{} {}{:<18}{} {:>5} runs {}({} folders){}",
-                c.cyan, tool_shown, c.reset, c.gold, bar, c.reset, runs, c.dim, folders, c.reset
+                "    {}{:<14}{} {}{:<18}{} {:>5} run{:<1} {}({} folder{}){}",
+                c.cyan,
+                tool_shown,
+                c.reset,
+                c.gold,
+                bar,
+                c.reset,
+                runs,
+                platform::plural(*runs),
+                c.dim,
+                folders,
+                platform::plural(*folders),
+                c.reset
             );
         }
     }
@@ -994,8 +1005,15 @@ fn print_stats(cfg: &config::Config, stats: &model::Stats, home: Option<&str>) {
             let disp = picker::display_path(&e.path, home);
             let shown = platform::sanitize_display(&disp);
             println!(
-                "    {}{}{} {:<44} {}{} visits{}",
-                c.gold, pin, c.reset, shown, c.dim, e.visits, c.reset
+                "    {}{}{} {:<44} {}{} visit{}{}",
+                c.gold,
+                pin,
+                c.reset,
+                shown,
+                c.dim,
+                e.visits,
+                platform::plural(e.visits),
+                c.reset
             );
         }
     }

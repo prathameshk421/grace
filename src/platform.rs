@@ -293,6 +293,37 @@ fn stable_exe_in(exe: &Path, path: Option<&std::ffi::OsStr>) -> PathBuf {
         .unwrap_or(real)
 }
 
+/// "s" for a plural count, "" for exactly one: `format!("{n} run{}", plural(n))`.
+pub fn plural(n: impl TryInto<i64>) -> &'static str {
+    if n.try_into().ok() == Some(1) { "" } else { "s" }
+}
+
+/// Other `grace` programs on PATH: absolute paths, in PATH order, each a
+/// different file from `exe` and from each other.
+pub fn other_graces_on_path(exe: &str) -> Vec<String> {
+    other_graces_in(exe, std::env::var_os("PATH").as_deref())
+}
+
+fn other_graces_in(exe: &str, path: Option<&std::ffi::OsStr>) -> Vec<String> {
+    let name = if cfg!(windows) { "grace.exe" } else { "grace" };
+    let mut seen: Vec<PathBuf> = std::fs::canonicalize(exe).into_iter().collect();
+    let mut out = Vec::new();
+    for dir in path.map(std::env::split_paths).into_iter().flatten() {
+        let cand = dir.join(name);
+        if !dir.is_absolute() || !cand.is_file() {
+            continue;
+        }
+        let Ok(real) = std::fs::canonicalize(&cand) else {
+            continue;
+        };
+        if !seen.contains(&real) {
+            seen.push(real);
+            out.push(clean_path_str(&cand.to_string_lossy()));
+        }
+    }
+    out
+}
+
 /// Pre-resolved ignore matcher (`home` and canonicalized prefixes resolved once).
 #[derive(Debug, Clone, Default)]
 pub struct IgnoreMatcher {
@@ -698,6 +729,36 @@ pub fn pid_alive(_pid: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lists other grace files on PATH once each, skipping the running one,
+    /// links to it, relative dirs and missing dirs.
+    #[cfg(unix)]
+    #[test]
+    fn other_graces_skip_self_and_duplicates() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let (dev, brew, link, cargo) = (root.join("dev"), root.join("brew"), root.join("link"), root.join("cargo"));
+        for d in [&dev, &brew, &link, &cargo] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let me = dev.join("grace");
+        std::fs::write(&me, "").unwrap();
+        std::fs::write(brew.join("grace"), "").unwrap();
+        std::os::unix::fs::symlink(&me, link.join("grace")).unwrap();
+        std::os::unix::fs::symlink(brew.join("grace"), cargo.join("grace")).unwrap();
+        let path = std::env::join_paths([
+            PathBuf::from("rel"),
+            link.clone(),
+            dev.clone(),
+            root.join("missing"),
+            brew.clone(),
+            cargo.clone(),
+        ])
+        .unwrap();
+        let got = other_graces_in(&me.to_string_lossy(), Some(&path));
+        assert_eq!(got, vec![brew.join("grace").to_string_lossy().into_owned()]);
+        assert!(other_graces_in(&me.to_string_lossy(), None).is_empty());
+    }
 
     /// Homebrew layout: the program lives in a versioned Cellar folder and
     /// bin/grace links to it. The link on PATH wins over the Cellar path.

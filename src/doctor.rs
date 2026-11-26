@@ -579,7 +579,23 @@ fn check_database(a: &Ansi, sum: &mut Summary, home_ref: Option<&str>, fix: bool
 }
 
 fn check_agent_hooks(a: &Ansi, sum: &mut Summary, exe: &str, home_ref: Option<&str>, fix: bool) {
-    let statuses = setup::inspect_all(exe);
+    let mut statuses = setup::inspect_all(exe);
+    // A hook that calls another grace on PATH still works. Only a hook whose
+    // grace is gone (or matches none) is outdated, so `--fix` leaves the rest.
+    let mut via_other: Vec<(&str, String)> = Vec::new();
+    if statuses.iter().any(|(_, _, st)| matches!(st, HookStatus::OutdatedPath(_))) {
+        for alt in platform::other_graces_on_path(exe) {
+            let alt_statuses = setup::inspect_all(&alt);
+            for (st, (name, _, alt_st)) in statuses.iter_mut().zip(alt_statuses) {
+                if matches!(st.2, HookStatus::OutdatedPath(_))
+                    && matches!(alt_st, HookStatus::Connected(_))
+                {
+                    st.2 = alt_st;
+                    via_other.push((name, alt.clone()));
+                }
+            }
+        }
+    }
     let mut connected = Vec::new();
     let mut available = Vec::new();
     let mut outdated = Vec::new();
@@ -603,6 +619,23 @@ fn check_agent_hooks(a: &Ansi, sum: &mut Summary, exe: &str, home_ref: Option<&s
         );
     } else if available.is_empty() && outdated.is_empty() && conflicts.is_empty() {
         info_line(a, "agents", "no supported CLI agents detected yet");
+    }
+
+    let mut alts: Vec<&str> = via_other.iter().map(|(_, alt)| alt.as_str()).collect();
+    alts.dedup();
+    for alt in alts {
+        let names: Vec<&str> = via_other.iter().filter(|(_, p)| p == alt).map(|(n, _)| *n).collect();
+        info_line(
+            a,
+            "agent hooks",
+            &format!(
+                "{} call {}, not this grace {d}(run `grace setup <cli>` to switch){r}",
+                names.join(", "),
+                platform::short_path(Path::new(alt), home_ref),
+                d = a.dim,
+                r = a.reset
+            ),
+        );
     }
 
     for (name, p) in outdated {

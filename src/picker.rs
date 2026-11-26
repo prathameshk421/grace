@@ -1513,8 +1513,9 @@ fn draw_inspector(f: &mut Frame, area: Rect, st: &State) {
                 Span::styled(
                     cut(
                         &format!(
-                            "{} runs · {}{open_mark}",
+                            "{} run{} · {}{open_mark}",
                             tag.count,
+                            platform::plural(tag.count),
                             time_ago(tag.last_used, st.now)
                         ),
                         w.saturating_sub(12),
@@ -1538,8 +1539,9 @@ fn draw_inspector(f: &mut Frame, area: Rect, st: &State) {
     lines.push(Line::from(Span::styled(
         cut(
             &format!(
-                "{pin_s}{} visits · {}",
+                "{pin_s}{} visit{} · {}",
                 e.visits,
+                platform::plural(e.visits),
                 time_ago(e.last_visit, st.now)
             ),
             w,

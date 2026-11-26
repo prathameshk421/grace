@@ -638,7 +638,7 @@ pub fn parse_panes(out: &str) -> Vec<Pane> {
 // tmux.conf
 
 /// The keys of the hub, after ctrl-g.
-pub const KEYS: [(&str, &str, &str); 16] = [
+pub const KEYS: [(&str, &str, &str); 17] = [
     ("s", "sidebar", "hub toggle sidebar"),
     ("d", "diff", "hub toggle diff"),
     ("t", "tree", "hub toggle tree"),
@@ -650,6 +650,7 @@ pub const KEYS: [(&str, &str, &str); 16] = [
     ("n", "next workspace", ""),
     ("p", "prev workspace", ""),
     ("Tab", "last workspace", ""),
+    ("1-9", "go to workspace 1-9", ""),
     ("w", "close workspace", ""),
     ("q", "detach (keeps running)", ""),
     ("Q", "quit the hub", ""),

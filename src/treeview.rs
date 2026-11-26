@@ -806,7 +806,10 @@ impl tui::App for TreeView {
             }
             KeyCode::Char('i') if self.in_hub => {
                 if let Some(r) = self.rows.get(self.selected) {
-                    if crate::hub::paste_to_main(&r.path) {
+                    // Quote for the shell and end with a space, so names with
+                    // spaces stay one argument and the next insert is separate.
+                    let arg = format!("{} ", platform::quote_posix(&r.path));
+                    if crate::hub::paste_to_main(&arg) {
                         self.flash(format!("sent {} to main", r.name), ToastKind::Success);
                     } else {
                         self.flash("could not send to main pane", ToastKind::Warn);
