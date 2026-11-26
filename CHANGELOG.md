@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.2.1
 
 - Fix: `grace doctor` called a working agent hook "an older grace binary" when it pointed at another grace on PATH, for example `/opt/homebrew/bin/grace` while you ran a dev build. `doctor --fix` then moved every hook to that build. Now such hooks count as connected, and doctor says which grace they call. A hook whose grace is gone is still flagged.
 - Fix: `i` in `grace tree` (in the hub) pasted paths without quotes and without a space after them. A name with spaces became several shell arguments, and two inserts ran together. The path is now quoted for the shell and ends with a space.
