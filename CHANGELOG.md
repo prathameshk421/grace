@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.3.1
+
+- Fix: the launcher numbers changed when the ranking changed, so a number could open the wrong app. Apps and agents now keep a fixed order. The ranking only picks where the cursor starts, and Enter still opens the best choice.
+- Fix: the launcher in the inline picker drew two borders when it did not fit with a margin. It now covers the picker below the title row and joins its border with `├ ┤`.
+
 ## 2.3.0
 
 ### Open with...
