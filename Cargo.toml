@@ -1,6 +1,6 @@
 [package]
 name = "grace"
-version = "2.2.1"
+version = "2.2.2"
 edition = "2021"
 rust-version = "1.89"
 description = "Fast travel between your project folders, with tags for the AI tools you used there."

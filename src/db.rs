@@ -68,6 +68,22 @@ const STALE_AFTER: i64 = 12 * 3600;
 /// Seconds before a done row is deleted.
 const PRUNE_AFTER: i64 = 7 * 86400;
 
+/// True when an open session's shell is gone (dead PID).
+pub fn session_dead(shell_pid: Option<i64>) -> bool {
+    shell_pid.is_some_and(|p| !crate::platform::pid_alive(p))
+}
+
+/// True when an open session had no update for `STALE_AFTER` seconds.
+pub fn session_stale(updated_at: i64, now: i64) -> bool {
+    now.saturating_sub(updated_at) > STALE_AFTER
+}
+
+/// True when an open session should be shown as done: its shell died or it went stale.
+/// `Db::sessions` closes such rows. Views that cache sessions use this to know when to reload.
+pub fn session_expired(s: &Session, now: i64) -> bool {
+    s.status != Status::Done && (session_dead(s.shell_pid) || session_stale(s.updated_at, now))
+}
+
 /// Optional metadata attached to a live session update.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionMeta<'a> {
@@ -592,8 +608,8 @@ impl Db {
         let (mut active, mut stale_or_dead) = (0usize, 0usize);
         for row in rows {
             let (pid, updated) = row?;
-            let dead = pid.is_some_and(|p| !crate::platform::pid_alive(p));
-            let stale = now.saturating_sub(updated) > STALE_AFTER;
+            let dead = session_dead(pid);
+            let stale = session_stale(updated, now);
             if dead || stale {
                 stale_or_dead += 1;
             } else {
@@ -611,8 +627,8 @@ impl Db {
             .iter()
             .filter(|s| s.status != Status::Done)
             .filter_map(|s| {
-                let dead = s.shell_pid.is_some_and(|p| !crate::platform::pid_alive(p));
-                let stale = now.saturating_sub(s.updated_at) > STALE_AFTER;
+                let dead = session_dead(s.shell_pid);
+                let stale = session_stale(s.updated_at, now);
                 if dead {
                     Some((s.id, s.updated_at, s.updated_at))
                 } else if stale {

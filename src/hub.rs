@@ -928,9 +928,13 @@ pub fn conf_text(c: &ConfCtx) -> String {
         } else {
             String::new()
         };
+        // A fixed `-h 25` fails with "height too large" in a 24-row client
+        // (the macOS Terminal default), so use the full height there.
+        let popup = |h: &str| format!("display-popup -E -w 46 -h {h} {style}{}", tmux_quote(&sh));
         line(&format!(
-            "bind -T grace ? display-popup -E -w 46 -h 25 {style}{}",
-            tmux_quote(&sh)
+            "bind -T grace ? if -F \"#{{e|<:#{{client_height}},25}}\" {} {}",
+            tmux_quote(&popup("100%")),
+            tmux_quote(&popup("25"))
         ));
     } else {
         line(&format!(
@@ -1933,7 +1937,14 @@ pub fn run_sidebar(
         let ver = db.data_version();
         let rows = t.windows_and_glyphs().unwrap_or_default();
         let hub_paths: Vec<String> = rows.iter().map(|(_, p, _)| p.clone()).collect();
-        let db_changed = ver != last_ver;
+        // A shell that dies without an end hook writes nothing to the DB, so
+        // also reload when a cached open session has expired.
+        let now = crate::model::now();
+        let db_changed = ver != last_ver
+            || cached_data
+                .sessions
+                .iter()
+                .any(|s| crate::db::session_expired(s, now));
         let hubs_changed = hub_paths != last_hub_paths;
 
         frame = frame.wrapping_add(1);
@@ -1948,7 +1959,6 @@ pub fn run_sidebar(
         }
 
         if db_changed {
-            let now = crate::model::now();
             let entries = crate::load(db, reg, ignore, None).ok()?;
             let sessions = db.sessions(now).unwrap_or_default();
             last_ver = ver;
@@ -2015,17 +2025,28 @@ pub fn keys(wait: bool) -> Result<()> {
     let cfg = crate::config::load();
     let theme = Theme::from_env_and_config(&cfg);
     let a = Ansi::stdout(&cfg);
-    println!();
+    // 6 text lines plus the keys. Drop the blank lines when the popup is short.
+    let rows = crossterm::terminal::size()
+        .map(|(_, h)| h as usize)
+        .unwrap_or(usize::MAX);
+    let roomy = rows >= KEYS.len() + 6;
+    if roomy {
+        println!();
+    }
     println!("  {}{} grace hub keys{}", a.gold, theme.star(), a.reset);
     println!("  {}ctrl-g, then one key{}", a.dim, a.reset);
-    println!();
+    if roomy || rows >= KEYS.len() + 4 {
+        println!();
+    }
     for (k, l, _) in KEYS {
         println!("  {}{k:<5}{} {l}", a.gold, a.reset);
     }
     if !wait {
         return Ok(());
     }
-    println!();
+    if roomy {
+        println!();
+    }
     print!("  {}press any key{}", a.dim, a.reset);
     use std::io::Write;
     std::io::stdout().flush()?;
@@ -2267,7 +2288,8 @@ mod tests {
         assert!(c.contains("window-status-current-style"));
         assert!(c.contains("client_key_table"));
         assert!(c.contains("set-hook -g pane-exited"));
-        assert!(c.contains("bind -T grace ? display-popup -E"));
+        assert!(c.contains("bind -T grace ? if -F \"#{e|<:#{client_height},25}\" "));
+        assert!(c.contains("display-popup -E -w 46 -h 100%"));
         assert!(c.contains(
             "GRACE_TMUX_SOCKET=grace '/opt/my tools/grace' hub toggle sidebar '#{window_id}'"
         ));

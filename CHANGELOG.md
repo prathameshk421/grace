@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.2.2
+
+- Fix: the hub sidebar showed an agent as working after its terminal closed. A shell that dies does not run the end hook, so the database did not change and the sidebar did not reload. The sidebar now also reloads when the shell of an open session is gone or the session is stale. The agent moves to done within a few seconds.
+- Fix: `ctrl-g ?` did nothing in a 24-row terminal, the macOS Terminal default. tmux refused the 25-row popup with "height too large". The popup now uses the full height there and drops blank lines to fit.
+
 ## 2.2.1
 
 - Fix: `grace doctor` called a working agent hook "an older grace binary" when it pointed at another grace on PATH, for example `/opt/homebrew/bin/grace` while you ran a dev build. `doctor --fix` then moved every hook to that build. Now such hooks count as connected, and doctor says which grace they call. A hook whose grace is gone is still flagged.
