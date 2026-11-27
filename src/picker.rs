@@ -1786,12 +1786,29 @@ fn draw_launch_modal(f: &mut Frame, outer: Rect, st: &mut State) {
     } else {
         outer.y
     };
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
+    // When the modal cannot sit inside the picker frame with a margin (a short inline
+    // picker, or a narrow one), its border landed on or next to the frame and showed
+    // twice. Cover the picker below its title row instead: the picker's title stays
+    // visible, and the sides and bottom show one border.
+    let cramped = w.saturating_add(4) > outer.width || h.saturating_add(2) > outer.height;
+    let joined = cramped && outer.height > 6;
+    let rect = if joined {
+        Rect {
+            y: outer.y + 1,
+            height: outer.height - 1,
+            ..outer
+        }
+    } else if cramped {
+        outer
+    } else {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
     };
+    let w = rect.width;
     st.launch_modal_area = rect;
     f.render_widget(Clear, rect);
 
@@ -1827,6 +1844,16 @@ fn draw_launch_modal(f: &mut Frame, outer: Rect, st: &mut State) {
             (w as usize).saturating_sub(4),
             t,
         )));
+    // Under the picker's title row, join the two boxes: ├───┤ instead of a second ╭───╮.
+    let block = if joined {
+        block.border_set(ratatui::symbols::border::Set {
+            top_left: "├",
+            top_right: "┤",
+            ..t.border_type().to_border_set()
+        })
+    } else {
+        block
+    };
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     if inner.width < 4 || inner.height == 0 {
@@ -3483,6 +3510,19 @@ mod tests {
         // Outer picker top border stays visible and uncorrupted.
         let first_line = modal_out.lines().next().unwrap();
         assert!(first_line.contains("✦ grace"), "{first_line}");
+        // No doubled corners: the cramped modal joins the picker frame with ├ ┤.
+        for doubled in ["╭╭", "╮╮", "╰╰", "╯╯"] {
+            assert!(!modal_out.contains(doubled), "{doubled}\n{modal_out}");
+        }
+        let second_line = modal_out.lines().nth(1).unwrap();
+        assert!(
+            second_line.starts_with('├') && second_line.ends_with('┤'),
+            "{modal_out}"
+        );
+        let narrow = render_pick(&mut st, 80, 11);
+        for doubled in ["╭╭", "╮╮", "╰╰", "╯╯"] {
+            assert!(!narrow.contains(doubled), "{doubled}\n{narrow}");
+        }
         // Both columns render simultaneously on an 11-row viewport.
         assert!(
             modal_out.contains("APPS & EDITORS")

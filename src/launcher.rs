@@ -931,6 +931,8 @@ pub struct LaunchMenu {
     pub has_tmux: bool,
     matcher: Matcher,
     utf32_buf: Vec<char>,
+    /// Item the cursor starts on with no query: the open or last-used app.
+    preferred: Option<usize>,
 }
 
 impl LaunchMenu {
@@ -1020,7 +1022,13 @@ impl LaunchMenu {
                 )
             })
             .collect();
-        editors_scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        // The score picks where the cursor starts. The list keeps the fixed detection
+        // order, so each 1-9 hotkey always means the same app.
+        let preferred_editor = editors_scored
+            .iter()
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+            .map(|(_, idx, _)| *idx);
+        editors_scored.sort_by_key(|(_, idx, _)| *idx);
 
         let mut clis_scored: Vec<_> = clis_raw
             .into_iter()
@@ -1052,13 +1060,18 @@ impl LaunchMenu {
                 )
             })
             .collect();
-        clis_scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        clis_scored.sort_by_key(|(_, idx, _)| *idx);
 
+        let editors_len = editors_scored.len();
+        let editor_ids: Vec<usize> = editors_scored.iter().map(|(_, idx, _)| *idx).collect();
         let mut items: Vec<LaunchItem> = editors_scored
             .into_iter()
             .map(|(_, _, i)| i)
             .chain(clis_scored.into_iter().map(|(_, _, i)| i))
             .collect();
+        let preferred = preferred_editor
+            .and_then(|p| editor_ids.iter().position(|&i| i == p))
+            .or_else(|| (editors_len == 0 && !items.is_empty()).then_some(0));
 
         if in_sidebar {
             items.push(LaunchItem {
@@ -1115,14 +1128,16 @@ impl LaunchMenu {
             has_tmux,
             matcher: Matcher::new(MatcherConfig::DEFAULT),
             utf32_buf: Vec::new(),
+            preferred,
         };
         menu.refilter();
         menu
     }
 
     pub fn refilter(&mut self) {
-        let mut best_item: Option<usize> = None;
+        let best_item: Option<usize>;
         let matching: Vec<usize> = if self.query.trim().is_empty() {
+            best_item = self.preferred;
             (0..self.items.len()).collect()
         } else {
             let q = self.query.trim();
@@ -1411,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn ranking_prefers_open_and_last_used_and_live() {
+    fn order_is_stable_and_cursor_starts_on_preferred_app() {
         let e = sample_entry();
         let installed = sample_installed();
         let open = vec![OpenEditor {
@@ -1449,27 +1464,69 @@ mod tests {
             false,
         );
 
-        let editor_labels: Vec<&str> = menu
-            .items
-            .iter()
-            .filter(|i| i.target.kind == TargetKind::GuiApp)
-            .map(|i| i.target.label.as_str())
-            .collect();
-        // Open editor first, then folder-used vscode, then remaining t3code.
-        assert_eq!(editor_labels, vec!["Antigravity", "VS Code", "T3 Code"]);
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.target.label.as_str()).collect();
+        // Detection order, whatever is open, used or live: 1-9 always mean the same thing.
+        assert_eq!(
+            &labels[..6],
+            &[
+                "Antigravity",
+                "VS Code",
+                "T3 Code",
+                "claude",
+                "opencode",
+                "codex"
+            ]
+        );
+        // Badges still tell which is open, last used and live.
         assert_eq!(menu.items[0].badge, "open");
         assert_eq!(menu.items[1].badge, "last used");
+        assert_eq!(menu.items[3].badge, "last AI");
+        assert_eq!(menu.items[4].badge, "live");
+        // The cursor starts on the open app.
+        assert_eq!(menu.selected_item().unwrap().target.id, "antigravity");
+        assert_eq!(menu.item_for_hotkey('1').unwrap().target.id, "antigravity");
+    }
 
-        let cli_labels: Vec<&str> = menu
-            .items
-            .iter()
-            .filter(|i| i.target.kind == TargetKind::CliAgent)
-            .map(|i| i.target.label.as_str())
-            .collect();
-        // Live session first (opencode), then folder-used (claude), then global count (codex).
-        assert_eq!(cli_labels, vec!["opencode", "claude", "codex"]);
-        assert_eq!(menu.items[3].badge, "live");
-        assert_eq!(menu.items[4].badge, "last AI");
+    #[test]
+    fn using_an_app_moves_the_cursor_not_the_numbers() {
+        let installed = sample_installed();
+        let mut e = sample_entry();
+        let before = LaunchMenu::new(
+            &e,
+            &installed,
+            &[],
+            None,
+            &HashMap::new(),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(before.selected_item().unwrap().target.id, "vscode");
+        e.tags.insert(
+            0,
+            Tag {
+                tool: "t3code".into(),
+                count: 1,
+                last_used: 2000,
+            },
+        );
+        let after = LaunchMenu::new(
+            &e,
+            &installed,
+            &[],
+            None,
+            &HashMap::new(),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(after.selected_item().unwrap().target.id, "t3code");
+        for c in '1'..='6' {
+            assert_eq!(
+                before.item_for_hotkey(c).unwrap().target.id,
+                after.item_for_hotkey(c).unwrap().target.id
+            );
+        }
     }
 
     #[test]
@@ -1487,7 +1544,8 @@ mod tests {
             false,
         );
         // Query empty: digits 1..9 select rows cleanly, letters are NOT hotkeys.
-        assert_eq!(menu.item_for_hotkey('1').unwrap().target.id, "vscode");
+        assert_eq!(menu.item_for_hotkey('1').unwrap().target.id, "antigravity");
+        assert_eq!(menu.item_for_hotkey('2').unwrap().target.id, "vscode");
         assert!(menu.item_for_hotkey('t').is_none());
         assert!(menu.item_for_hotkey('h').is_none());
 
@@ -1586,8 +1644,9 @@ mod tests {
             .filter(|i| i.target.kind == TargetKind::GuiApp)
             .map(|i| (i.target.id.as_str(), i.badge.as_str()))
             .collect();
-        // VS Code (used on folder) ranks ahead of Claude Desktop; Claude Desktop must NOT get "last used".
-        assert_eq!(editor_order[0], ("vscode", "last used"));
+        // The CLI tag must not make the desktop app "last used" or start the cursor on it.
+        assert!(editor_order.contains(&("vscode", "last used")));
+        assert_eq!(menu.selected_item().unwrap().target.id, "vscode");
         let desktop = editor_order
             .iter()
             .find(|(id, _)| *id == "claude-desktop")
@@ -1713,8 +1772,9 @@ mod tests {
             .filter(|i| i.target.kind == TargetKind::GuiApp)
             .map(|i| (i.target.id.as_str(), i.badge.as_str()))
             .collect();
-        // VS Code ranks ahead of Codex (ChatGPT); codex CLI tag must NOT grant "last used" to codex-app.
-        assert_eq!(editor_order[0], ("vscode", "last used"));
+        // The CLI tag must not make the desktop app "last used" or start the cursor on it.
+        assert!(editor_order.contains(&("vscode", "last used")));
+        assert_eq!(menu.selected_item().unwrap().target.id, "vscode");
         let codex_gui = editor_order
             .iter()
             .find(|(id, _)| *id == "codex-app")
