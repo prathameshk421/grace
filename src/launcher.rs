@@ -32,6 +32,8 @@ pub enum LaunchMethod {
         pass_path: bool,
         focus_only: bool,
     },
+    /// Built only on macOS (an app opened through its URL scheme).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     GuiUrl {
         prog: String,
         args_before: Vec<String>,
@@ -1512,13 +1514,21 @@ mod tests {
         assert!(build_editor_choice(&t, "/tmp/bad\npath", None).is_err());
         assert!(build_editor_choice(&t, "/tmp/bad\0path", None).is_err());
 
-        let ok = build_editor_choice(&t, "/tmp/clean project", None).unwrap();
+        // "/tmp/..." is not absolute on Windows.
+        let clean = if cfg!(windows) {
+            r"C:\tmp\clean project"
+        } else {
+            "/tmp/clean project"
+        };
+        let ok = build_editor_choice(&t, clean, None).unwrap();
         assert_eq!(ok.prog, "vscode");
-        assert_eq!(ok.args, vec!["/tmp/clean project"]);
+        assert_eq!(ok.args, vec![clean]);
         assert!(!ok.in_terminal);
     }
 
+    // macOS `open -a` paths; Unix-style absolute folders.
     #[test]
+    #[cfg(unix)]
     fn focus_only_gui_omits_path_when_configured() {
         let t = InstalledTarget {
             id: "t3code".into(),
@@ -1633,7 +1643,9 @@ mod tests {
         assert!(left.contains(&menu.selected));
     }
 
+    // macOS `open -a` paths; Unix-style absolute folders.
     #[test]
+    #[cfg(unix)]
     fn gui_url_encodes_folder_into_claude_code_deeplink() {
         let t = InstalledTarget {
             id: "claude-desktop".into(),
