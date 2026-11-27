@@ -2945,6 +2945,9 @@ mod tests {
         assert_eq!(glyph(crate::model::Status::Working, 3, true, false), "*");
     }
 
+    // Unix only: the doorbell is off on Windows, and there two quick writes can share
+    // the same mtime and length, so the stamp cannot tell them apart.
+    #[cfg(unix)]
     #[test]
     fn wake_file_stamp_changes_on_atomic_write() {
         let d = tempfile::tempdir().unwrap();
