@@ -562,11 +562,18 @@ pub fn render_help_modal(
     rows: &[(&str, &str)],
     theme: Theme,
 ) {
+    // Fit the longest key (e.g. "→ / Ctrl-L") plus one space, at least 10 columns.
+    let key_w = rows
+        .iter()
+        .map(|(k, _)| k.chars().count() + 1)
+        .max()
+        .unwrap_or(0)
+        .max(10);
     let body: Vec<Line<'static>> = rows
         .iter()
         .map(|(k, d)| {
             Line::from(vec![
-                Span::styled(format!("{k:<10}"), theme.title_accent()),
+                Span::styled(format!("{k:<key_w$}"), theme.title_accent()),
                 Span::raw((*d).to_string()),
             ])
         })
@@ -587,6 +594,16 @@ mod tests {
 
     fn fit_text(f: &Fit<'_>) -> String {
         f.iter().map(|(s, _)| *s).collect()
+    }
+
+    #[test]
+    fn help_modal_keeps_a_space_after_long_keys() {
+        let rows = [("Enter", "Travel"), ("→ / Ctrl-L", "Open with app")];
+        let out = crate::tui::render_text(60, 12, |f| {
+            render_help_modal(f, f.area(), "keys", &rows, crate::theme::Theme::dark())
+        });
+        assert!(out.contains("→ / Ctrl-L Open with app"), "{out}");
+        assert!(!out.contains("Ctrl-LOpen"), "{out}");
     }
 
     #[test]

@@ -133,6 +133,11 @@ fn run_loop(app: &mut dyn App) -> Result<()> {
                     }
                 }
                 Event::Resize(_, _) => {
+                    // tmux can resize a pane more than once between two draws (a new
+                    // workspace starts detached at 80x24, then snaps to the client size).
+                    // ratatui only clears when it sees a new size, so stale cells and
+                    // wrapped lines stayed on screen. Always repaint the whole pane.
+                    term.clear()?;
                     dirty = true;
                     wake_ev = true;
                 }

@@ -48,8 +48,16 @@ pub enum Row {
     Item(usize),
 }
 
+#[cfg(test)]
 pub fn build_rows(entries: &[Entry], best: &Best, query: &str) -> Vec<Row> {
+    build_rows_top(entries, best, query).0
+}
+
+/// Rows grouped by status, plus the entry index of the best match.
+/// Groups put agents first, so the first row is not always the best match.
+pub fn build_rows_top(entries: &[Entry], best: &Best, query: &str) -> (Vec<Row>, Option<usize>) {
     let matches = picker::filter(entries, best, query);
+    let top = matches.first().copied();
     let status = |i: usize| best.get(&entries[i].path).map(|s| s.status);
     let mut rows = Vec::new();
     for g in GROUPS {
@@ -72,7 +80,7 @@ pub fn build_rows(entries: &[Entry], best: &Best, query: &str) -> Vec<Row> {
         rows.push(Row::Header(Section::Folders));
         rows.extend(folders);
     }
-    rows
+    (rows, top)
 }
 
 pub struct ReloadTick {
@@ -220,14 +228,24 @@ impl<'a> Sidebar<'a> {
     fn refilter(&mut self, keep: Option<&str>) {
         self.pattern = (!self.query.trim().is_empty())
             .then(|| Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart));
-        self.rows = build_rows(&self.data.entries, &self.best, &self.query);
+        let (rows, top) = build_rows_top(&self.data.entries, &self.best, &self.query);
+        self.rows = rows;
         let entries = &self.data.entries;
         let kept = keep.and_then(|p| {
             self.rows
                 .iter()
                 .position(|r| matches!(r, Row::Item(i) if entries[*i].path == p))
         });
-        self.selected = kept.or_else(|| picker_first(&self.rows)).unwrap_or(0);
+        // With a query, select the best match, not the first row of the agent groups.
+        let top_row = top.filter(|_| !self.query.trim().is_empty()).and_then(|t| {
+            self.rows
+                .iter()
+                .position(|r| matches!(r, Row::Item(i) if *i == t))
+        });
+        self.selected = kept
+            .or(top_row)
+            .or_else(|| picker_first(&self.rows))
+            .unwrap_or(0);
         if kept.is_none() {
             self.offset = 0;
         }
@@ -1135,6 +1153,36 @@ mod tests {
                 ("/h/code/knn".to_string(), false)
             ]
         );
+    }
+
+    #[test]
+    fn filter_selects_best_match_not_first_agent_row() {
+        // The agent row matches "other" only through scattered letters; the
+        // folder matches it exactly. Enter and the launcher must act on the folder.
+        let d = Data {
+            entries: vec![entry("/h/oxtxhxexr", &["claude"]), entry("/h/other", &[])],
+            sessions: vec![session("/h/oxtxhxexr", "claude", Status::Done)],
+            editors: vec![],
+            branches: HashMap::new(),
+            installed: None,
+        };
+        let mut sb = Sidebar::new(
+            d,
+            Vec::new(),
+            "/h",
+            Theme::dark(),
+            Some("/h".into()),
+            Box::new(|_| ReloadTick {
+                visible: true,
+                data: None,
+            }),
+            Box::new(|_, _| Ok(())),
+        );
+        for c in "other".chars() {
+            sb.key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert!(matches!(sb.rows[0], Row::Header(Section::Agents(_))));
+        assert_eq!(sb.selected_entry().unwrap().path, "/h/other");
     }
 
     #[test]
