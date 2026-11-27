@@ -1608,6 +1608,45 @@ fn create_window(
     setup_window(t, &ids, path, &exe, layout, &sizes)
 }
 
+/// Panes of open agent sessions in `path`, newest update first.
+fn session_panes(sessions: &[crate::model::Session], path: &str) -> Vec<String> {
+    let mut open: Vec<&crate::model::Session> = sessions
+        .iter()
+        .filter(|s| s.status != crate::model::Status::Done && platform::same_path(&s.path, path))
+        .filter(|s| s.tmux_pane.as_deref().is_some_and(|p| p.starts_with('%')))
+        .collect();
+    open.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    open.into_iter()
+        .filter_map(|s| s.tmux_pane.clone())
+        .collect()
+}
+
+/// Focus the hub pane where an open agent session of `path` runs. Pane ids are per tmux
+/// server, so the pane must exist in the hub and sit in `path` (or below it).
+/// Returns false when no such pane exists, so the caller can fall back to `switch`.
+fn focus_session_pane(t: &Tmux, db: &Db, path: &str) -> bool {
+    let sessions = db.sessions(crate::model::now()).unwrap_or_default();
+    for pane in session_panes(&sessions, path) {
+        let fmt = format!("#{{window_id}}{SEP}#{{pane_current_path}}");
+        let Ok(info) = t.run(&["display-message", "-p", "-t", &pane, &fmt]) else {
+            continue;
+        };
+        let Some((win, cwd)) = info.trim_end().split_once(SEP) else {
+            continue;
+        };
+        let inside = platform::same_path(cwd, path)
+            || cwd.starts_with(&format!("{}/", path.trim_end_matches('/')));
+        if win.starts_with('@')
+            && inside
+            && t.run(&["select-window", "-t", win]).is_ok()
+            && t.run(&["select-pane", "-t", &pane]).is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn switch(t: &Tmux, db: &Db, path: &str, resume: Option<HubRun<'_>>) -> Result<String> {
     if !Path::new(path).is_dir() {
         bail!("folder does not exist: {path}");
@@ -2384,6 +2423,10 @@ pub fn run_sidebar(
             } else {
                 None
             };
+            // Go to the pane where this folder's agent runs, not the first workspace.
+            if found.is_none() && focus_session_pane(&t_go, db, &e.path) {
+                return Ok(());
+            }
             let run = found.as_ref().map(|(tag, cmd)| HubRun::tool(tag, cmd));
             switch(&t_go, db, &e.path, run)
                 .map(|_| ())
@@ -2733,6 +2776,36 @@ mod tests {
             allow_passthrough,
             default_terminal: "tmux-256color",
         })
+    }
+
+    #[test]
+    fn session_panes_prefer_newest_open_session_of_folder() {
+        use crate::model::{Session, Status};
+        let mk = |id, path: &str, status, updated, pane: Option<&str>| Session {
+            id,
+            path: path.into(),
+            tool: "claude".into(),
+            status,
+            shell_pid: None,
+            started_at: 0,
+            updated_at: updated,
+            session_id: None,
+            detail: None,
+            tmux_pane: pane.map(String::from),
+            shell_start: None,
+            agent_pid: None,
+            agent_start: None,
+        };
+        let s = vec![
+            mk(1, "/r", Status::Done, 50, Some("%0")),
+            mk(2, "/r", Status::Ready, 10, Some("%8")),
+            mk(3, "/r", Status::Working, 20, Some("%9")),
+            mk(4, "/other", Status::Working, 30, Some("%4")),
+            mk(5, "/r", Status::Working, 40, None),
+            mk(6, "/r", Status::Working, 60, Some("junk")),
+        ];
+        assert_eq!(session_panes(&s, "/r"), vec!["%9", "%8"]);
+        assert!(session_panes(&s, "/none").is_empty());
     }
 
     #[test]
