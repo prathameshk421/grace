@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.3.0
+
+### Open with...
+- New: a launcher opens a folder with an app, an editor or a CLI agent. In the picker, press `→` or `Ctrl-L`, or run `grace -w`/`--with`. In the hub sidebar, `→` opens it as a drawer. Type to filter, or press `1`-`9`.
+- New: CLI agents start in a grace hub workspace. `Alt-Enter` opens a plain shell there.
+- New: Claude Desktop opens the folder in Claude Code through a `claude://` link. grace also finds the Codex app (ChatGPT Desktop).
+- New config keys: `default_action` (`travel` or `launch`) and `cli_in_hub`. `grace doctor` checks them.
+
+### Live sessions
+- grace now records the agent process and the start times of the agent and its shell. A reused PID no longer keeps a dead session open.
+- A working session with no update for 30 minutes counts as done.
+- One session is tracked across subfolders by its session ID, and "done" closes all its open rows.
+- The hub sidebar checks open sessions every 10 seconds and at each stale deadline, so a dead agent leaves WORKING in about 10 seconds.
+
+### Speed and idle CPU
+- A detached or hidden hub does no work. tmux hooks wake it on attach, detach and window change.
+- The diff pane checks git every 2 s, then 4 s, then 8 s when nothing changes, and recovers after a 30 s git timeout.
+- Agent hooks write at most once in 15 s for the same report. The SQLite WAL file stays small (1 MiB limit). `grace doctor --fix` truncates it.
+
+### Fixes
+- Fix: Enter on a live agent in the hub sidebar went to the first workspace of that folder, even when the agent ran in another one. It now goes to the pane where the agent runs.
+- Fix: a new hub workspace showed a garbled sidebar. tmux creates the window at 80x24 and then resizes it, and the old cells stayed on screen. The pane now repaints on every resize.
+- Fix: in the hub sidebar, a filter selected the first row of the agent groups, even when a folder matched better. Enter and `→` then acted on the wrong folder. The best match is now selected.
+- Fix: in the picker help, `→ / Ctrl-L` ran into its label. The key column now fits the longest key.
+
 ## 2.2.2
 
 - Fix: the hub sidebar showed an agent as working after its terminal closed. A shell that dies does not run the end hook, so the database did not change and the sidebar did not reload. The sidebar now also reloads when the shell of an open session is gone or the session is stale. The agent moves to done within a few seconds.
