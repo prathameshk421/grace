@@ -93,6 +93,12 @@ pub struct Session {
     pub status: Status,
     /// PID of the shell that started the CLI, if known. Used to find dead sessions.
     pub shell_pid: Option<i64>,
+    /// Start-time token of `shell_pid` (`platform::ProcInfo::start`), so a reused PID counts as dead.
+    pub shell_start: Option<i64>,
+    /// PID of the agent CLI process, pinned by a hook (`platform::agent_pin`).
+    pub agent_pid: Option<i64>,
+    /// Start-time token of `agent_pid`.
+    pub agent_start: Option<i64>,
     pub started_at: i64,
     /// Last status change.
     pub updated_at: i64,

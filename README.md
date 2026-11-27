@@ -76,9 +76,10 @@ Type `grace` to open the picker. Type to filter, press Enter, and your shell mov
 
 Inside the picker:
 - `Tab` switches between **Folders** and **Sessions** (or click the tabs)
+- `→` or `Ctrl-l` opens the **Open with…** launcher (installed GUI editors/apps + CLI agents into `grace hub`, `1`–`9` instant hotkeys, `Alt-Enter` for current shell)
 - `Alt-i` toggles the inline **Inspector** panel (git status, counts, session details)
 - `Alt-p` pin/unpin · `Ctrl-d` forget · `Ctrl-y` copy path · `Ctrl-g` open in `grace hub`
-- `ctrl-o` jump & launch last AI tool · `ctrl-e` focus/open editor · `?` all keys
+- `ctrl-o` jump & launch last AI tool · `ctrl-e` focus/open editor (falls back to launcher if unused) · `?` all keys
 
 ```sh
 grace          # open the picker
@@ -97,11 +98,12 @@ grace knn      # one match: go there now
 - **Middle:** your own shell in the folder. Run claude, codex or any CLI as usual.
 - **Right:** a live git diff on top and a file tree below. Both follow the folder of the window.
 
-Each folder gets its own workspace: a tmux window with its own shell. Agents keep running when you switch. Press Enter on a folder in the sidebar to switch to it. Press ctrl-o to switch and start the AI tool you used there last. The status bar shows each workspace with the status of its agent.
+Each folder gets its own workspace: a tmux window with its own shell. Agents keep running when you switch. Press Enter on a folder in the sidebar to switch to it. Press ctrl-o to switch and start the AI tool you used there last, or `→` / `ctrl-l` to pick any installed editor, app, or CLI agent (if the current workspace is busy, `grace` opens an extra workspace window for that agent side by side).
 
 ```sh
-grace hub              # open the hub in this folder
-grace hub ~/code/knn   # open the hub, or switch to that folder
+grace hub                        # open the hub in this folder
+grace hub ~/code/knn             # open the hub, or switch to that folder
+grace hub --run-tool opencode    # open/switch and launch a CLI tool inside a workspace
 ```
 
 ### Keys
@@ -353,8 +355,9 @@ cargo install --git https://github.com/prathameshk421/grace
 | `grace knn` | Start the picker with "knn". If only one folder matches, go there at once. |
 | `grace -t claude` | Show only folders where you used Claude. |
 | `grace -o` | Travel, then start the AI tool you used last in that folder. |
+| `grace -w [query]` | Open directly in **Open with…** launcher mode (skip folder list if 1 match). |
 | `grace --full` | Open the picker in full screen. |
-| `grace hub [path]` | Open the hub on tmux: sidebar, shell, diff and file tree. Inside the hub, switch to the folder. |
+| `grace hub [path] [--run-tool TOOL]` | Open the hub on tmux: sidebar, shell, diff and file tree. Optionally start a tool inside a workspace. |
 | `grace diff [path]` | Show the changed files of a git repository and a colored diff. |
 | `grace tree [path]` | Show the files of a folder as a tree, with git changes marked. |
 | `grace list` | Print all folders, best first (`-t <tag>` to filter, `--json` for JSON). |
@@ -406,6 +409,8 @@ With `all`, grace skips sources it cannot find. With a named source, it prints "
   editor = "zed"           # fallback editor for ctrl-e
   ascii = false            # set true for ASCII-only glyphs
   hub_layout = "full"      # "full" | "code+diff" | "sidebar+main" | "zen"
+  default_action = "travel" # "travel" | "launch" (Enter opens "Open with...")
+  cli_in_hub = true        # launch CLI agents from picker into grace hub
   ignore = ["/tmp/*", "~/Downloads/*"]
   ```
 

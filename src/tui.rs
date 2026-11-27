@@ -44,6 +44,12 @@ pub trait App {
     fn animating(&self) -> bool {
         false
     }
+    /// Hint that user input or focus should wake an idle/hidden view.
+    fn wake(&mut self) {}
+    /// True if `refresh` should run immediately after handling an input event.
+    fn wants_refresh_now(&self) -> bool {
+        false
+    }
 }
 
 struct TermGuard;
@@ -105,8 +111,9 @@ fn run_loop(app: &mut dyn App) -> Result<()> {
             wait = wait.min(Duration::from_millis(100));
         }
         if app.loading() {
-            wait = wait.min(Duration::from_millis(40));
+            wait = wait.min(Duration::from_millis(100));
         }
+        let mut wake_ev = false;
         if event::poll(wait)? {
             match event::read()? {
                 Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
@@ -114,6 +121,7 @@ fn run_loop(app: &mut dyn App) -> Result<()> {
                         return Ok(());
                     }
                     dirty = true;
+                    wake_ev = true;
                 }
                 Event::Mouse(m) => {
                     if app.mouse(m) == Flow::Quit {
@@ -121,18 +129,32 @@ fn run_loop(app: &mut dyn App) -> Result<()> {
                     }
                     if !matches!(m.kind, event::MouseEventKind::Moved) {
                         dirty = true;
+                        wake_ev = true;
                     }
                 }
-                Event::Resize(_, _) => dirty = true,
+                Event::Resize(_, _) => {
+                    dirty = true;
+                    wake_ev = true;
+                }
                 Event::FocusGained => {
                     app.focus(true);
                     dirty = true;
+                    wake_ev = true;
                 }
                 Event::FocusLost => {
                     app.focus(false);
                     dirty = true;
                 }
                 _ => {}
+            }
+        }
+        if wake_ev {
+            app.wake();
+            if app.wants_refresh_now() {
+                if app.refresh() {
+                    dirty = true;
+                }
+                next = Instant::now() + app.every();
             }
         }
         let now = Instant::now();

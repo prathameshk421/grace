@@ -8,6 +8,7 @@ mod hub;
 mod import;
 mod import_editors;
 mod integrations;
+mod launcher;
 mod model;
 mod picker;
 mod platform;
@@ -46,6 +47,7 @@ const AFTER_HELP: &str = "\
 Examples:
   grace                 open the picker
   grace knn             jump to the only match for \"knn\"
+  grace -w              open picker in \"Open with...\" launcher mode
   grace -t claude       only folders where you used Claude
   grace -o              travel and start the AI tool used there last
   grace hub             open the hub: sidebar, shell, diff and tree (needs tmux)
@@ -91,6 +93,9 @@ struct Cli {
     /// Also print the launch command of the last tool used there
     #[arg(short, long)]
     open: bool,
+    /// Open directly into the app/editor/CLI launcher ("Open with...")
+    #[arg(short = 'w', long = "with")]
+    with: bool,
     /// Start the picker with this search text
     query: Option<String>,
     #[command(subcommand)]
@@ -107,6 +112,9 @@ enum Cmd {
         /// Also print the launch command of the last tool used there
         #[arg(short, long)]
         open: bool,
+        /// Open directly into the app/editor/CLI launcher ("Open with...")
+        #[arg(short = 'w', long = "with")]
+        with: bool,
         /// Start the picker with this search text
         query: Option<String>,
     },
@@ -220,6 +228,9 @@ enum Cmd {
         /// Make the hub, but do not attach to it
         #[arg(long, hide = true)]
         no_attach: bool,
+        /// Start this tool inside the workspace (e.g. "claude", "opencode")
+        #[arg(long = "run-tool", value_name = "TOOL")]
+        run_tool: Option<String>,
     },
     /// Show the git changes of a folder, with a colored diff
     Diff {
@@ -259,6 +270,9 @@ enum HubCmd {
         /// Optional command to launch immediately (for hub action resume)
         #[arg(long)]
         run: Option<String>,
+        /// Optional tool tag to resolve and launch immediately
+        #[arg(long = "run-tool", value_name = "TOOL")]
+        run_tool: Option<String>,
     },
     /// Print the keys of the hub
     #[command(hide = true)]
@@ -267,6 +281,9 @@ enum HubCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Ring the hub doorbell so idle panes refresh on state transitions
+    #[command(hide = true)]
+    Wake,
 }
 
 #[derive(Subcommand)]
@@ -462,7 +479,7 @@ fn run_session(action: SessionCmd) -> Result<()> {
             let tool = reg.normalize_tag(&tool);
             let p = resolve(Some(path))?;
             if reg.is_ai_tag(&tool) && !ignore.is_ignored(&p) {
-                db.session_set(
+                let outcome = db.session_set(
                     &p,
                     &tool,
                     status,
@@ -472,7 +489,9 @@ fn run_session(action: SessionCmd) -> Result<()> {
                     },
                     now,
                 )?;
-                hub::sync_glyphs_if_running(&db, Some(&cfg));
+                if outcome.inserted || outcome.prev != Some(status) {
+                    hub::sync_glyphs_if_running(&db, Some(&cfg));
+                }
             }
         }
     }
@@ -552,11 +571,12 @@ fn set_hook_status(
     let (db, _) = db::Db::open_default()?;
     let tool = db.normalize_tool_tag(tool);
     let pane = current_tmux_pane();
+    let agent = platform::agent_pin();
     let sid = session_id.filter(|s| !s.is_empty());
     let det = detail
         .map(platform::sanitize_display)
         .filter(|s| !s.is_empty());
-    db.session_set(
+    let outcome = db.session_set(
         &p,
         &tool,
         status,
@@ -564,53 +584,25 @@ fn set_hook_status(
             session_id: sid,
             detail: det.as_deref(),
             tmux_pane: pane.as_deref(),
+            agent,
         },
         model::now(),
     )?;
-    hub::sync_glyphs_if_running(&db, Some(&cfg));
+    if outcome.inserted || outcome.prev != Some(status) {
+        hub::sync_glyphs_if_running(&db, Some(&cfg));
+    }
     Ok(())
 }
 
 /// Build an argv-safe editor choice for `ctrl-e`. Never uses shell evaluation for GUIs.
 fn editor_choice(
+    installed: Option<&[launcher::InstalledTarget]>,
     reg: &tools::Registry,
     cfg: &config::Config,
     e: &model::Entry,
     open: Option<&editors_live::OpenEditor>,
 ) -> Option<picker::EditorChoice> {
-    if let Some(o) = open {
-        return Some(picker::EditorChoice {
-            prog: o.prog.clone(),
-            args: o.args.clone(),
-            in_terminal: false,
-        });
-    }
-    if let Some(tag) = e.tags.iter().find(|t| reg.is_editor_tag(&t.tool)) {
-        if let Some((prog, mut args, in_terminal)) = reg.editor_launch(&tag.tool) {
-            args.push(e.path.clone());
-            return Some(picker::EditorChoice {
-                prog,
-                args,
-                in_terminal,
-            });
-        }
-    }
-    if let Some(ref fb) = cfg.editor {
-        let mut parts = fb.split_whitespace();
-        if let Some(prog) = parts.next() {
-            if tools::valid_launch(prog) {
-                let mut args: Vec<String> = parts.map(String::from).collect();
-                args.push(e.path.clone());
-                let in_terminal = tools::is_terminal_editor(prog);
-                return Some(picker::EditorChoice {
-                    prog: prog.to_string(),
-                    args,
-                    in_terminal,
-                });
-            }
-        }
-    }
-    None
+    launcher::resolve_editor_for_entry(installed, reg, cfg, e, open)
 }
 
 fn editor_label(
@@ -622,7 +614,10 @@ fn editor_label(
     if let Some(o) = open {
         return Some(o.tag.clone());
     }
-    if let Some(tag) = e.tags.iter().find(|t| reg.is_editor_tag(&t.tool)) {
+    if let Some(tag) = e.tags.iter().find(|t| {
+        reg.is_editor_tag(&t.tool)
+            || matches!(t.tool.as_str(), "t3code" | "claude-desktop" | "codex-app")
+    }) {
         return Some(tag.tool.clone());
     }
     cfg.editor
@@ -673,7 +668,7 @@ fn validate_emit_line(s: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn spawn_gui_editor(ed: &picker::EditorChoice) -> Result<()> {
+pub(crate) fn spawn_gui_editor(ed: &picker::EditorChoice) -> Result<()> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(&ed.prog);
     cmd.args(&ed.args)
@@ -715,6 +710,7 @@ struct TravelOpts<'a> {
     tag: Option<&'a str>,
     query: &'a str,
     open: bool,
+    with: bool,
     full: bool,
     initial_toast: Option<(String, theme::ToastKind)>,
 }
@@ -731,15 +727,48 @@ fn travel(t: TravelOpts<'_>, data: picker::Data) -> Result<()> {
         tag,
         query,
         open,
+        with,
         full,
         initial_toast,
     } = t;
     let entries_snap = data.entries.clone();
     let sessions_snap = data.sessions.clone();
+    let init_ver = db.data_version();
+    let init_deadline = db::Db::next_deadline(&data.sessions);
+    let init_has_pinned = data.sessions.iter().any(|s| {
+        s.status != model::Status::Done && (s.shell_pid.is_some() || s.agent_pid.is_some())
+    });
     let tag_owned = tag.map(String::from);
     let reload_tag = tag_owned.clone();
+    let mut last_view = view;
+    let mut last_ver = init_ver;
+    let mut next_deadline = init_deadline;
+    let mut has_pinned_open = init_has_pinned;
+    let mut last_pin_check = std::time::Instant::now();
+    let mut cached_editors = Vec::new();
+    let mut editors_loaded = false;
+    let mut last_editors_at = std::time::Instant::now();
     let reload = move |cur_view: picker::View| {
         let now = model::now();
+        let now_inst = std::time::Instant::now();
+        let switched_view = cur_view != last_view;
+        let db_changed = db.data_version() != last_ver;
+        let deadline_hit = now >= next_deadline;
+        let pin_due =
+            has_pinned_open && last_pin_check.elapsed() >= std::time::Duration::from_secs(10);
+        let editors_periodic = last_editors_at.elapsed() >= std::time::Duration::from_secs(30);
+
+        if cur_view == picker::View::Sessions
+            && !switched_view
+            && !db_changed
+            && !deadline_hit
+            && !pin_due
+            && !editors_periodic
+        {
+            return None;
+        }
+
+        last_view = cur_view;
         let (entries, sessions) = match cur_view {
             picker::View::Folders => (
                 load(db, reg, ignore, reload_tag.as_deref()).ok()?,
@@ -747,20 +776,37 @@ fn travel(t: TravelOpts<'_>, data: picker::Data) -> Result<()> {
             ),
             picker::View::Sessions => session_data(db, ignore, now).ok()?,
         };
+        if pin_due || switched_view {
+            last_pin_check = now_inst;
+        }
+        next_deadline = db::Db::next_deadline(&sessions);
+        has_pinned_open = sessions.iter().any(|s| {
+            s.status != model::Status::Done && (s.shell_pid.is_some() || s.agent_pid.is_some())
+        });
+        last_ver = db.data_version();
+        if !editors_loaded || editors_periodic {
+            cached_editors = editors_live::open_editors(ignore);
+            editors_loaded = true;
+            last_editors_at = now_inst;
+        }
         let branches = collect_branches(&entries);
         Some(picker::Data {
             entries,
             sessions,
-            editors: editors_live::open_editors(ignore),
+            editors: cached_editors.clone(),
             branches,
+            installed: None,
         })
     };
     let bg_tag = tag_owned;
     let bg_ignore = ignore.clone();
+    let bg_cfg = cfg.clone();
+    let bg_custom = db.custom_tools().unwrap_or_default();
     let after_first_frame: Option<Box<dyn FnOnce() -> Option<picker::Data> + Send + 'static>> =
         Some(Box::new(move || {
             let branches = collect_branches(&entries_snap);
             let editors = editors_live::open_editors(&bg_ignore);
+            let mut installed = None;
             let mut entries = entries_snap;
             let mut sessions = sessions_snap;
             if let Ok((bg_db, _)) = db::Db::open_default() {
@@ -783,14 +829,22 @@ fn travel(t: TravelOpts<'_>, data: picker::Data) -> Result<()> {
                                 }
                             }
                         }
+                        installed = Some(launcher::discover_installed(&bg_reg, &bg_cfg));
                     }
+                } else if let Ok(bg_reg) = tools::Registry::from_db(&bg_db) {
+                    installed = Some(launcher::discover_installed(&bg_reg, &bg_cfg));
                 }
+            }
+            if installed.is_none() {
+                let fallback_reg = tools::Registry::new(&bg_custom);
+                installed = Some(launcher::discover_installed(&fallback_reg, &bg_cfg));
             }
             Some(picker::Data {
                 entries,
                 sessions,
                 editors,
                 branches,
+                installed,
             })
         }));
 
@@ -834,19 +888,34 @@ fn travel(t: TravelOpts<'_>, data: picker::Data) -> Result<()> {
     })
         as Box<dyn FnMut() -> std::result::Result<String, String>>);
 
+    let has_tmux = launcher::has_tmux();
+    let cli_in_hub = cfg.cli_in_hub.unwrap_or(true) && has_tmux;
+    let default_launch = with
+        || cfg
+            .default_action
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("launch"));
+    let discover_launchers = Some(Box::new(|| launcher::discover_installed(reg, cfg))
+        as Box<dyn FnMut() -> Vec<launcher::InstalledTarget>>);
+
     let opts = picker::Opts {
         view,
         fullscreen: full,
+        start_in_launch: with,
+        default_launch,
+        cli_in_hub,
+        has_tmux,
         tag_filter: tag.map(String::from),
         initial_toast,
         shell_hook_missing: detect_missing_shell_hook(),
-        editor_cmd: Box::new(|e, o| editor_choice(reg, cfg, e, o)),
+        editor_cmd: Box::new(|e, o, inst| editor_choice(inst, reg, cfg, e, o)),
         tool_label: Box::new(|e| resume_tag(reg, e).map(String::from)),
         editor_label: Box::new(|e, o| editor_label(reg, cfg, e, o)),
         toggle_pin,
         forget_dir,
         import_all_now,
         add_cwd_now,
+        discover_launchers,
         after_first_frame,
         reload: Some(Box::new(reload)),
         reload_every: Some(Box::new(|v| match v {
@@ -857,10 +926,10 @@ fn travel(t: TravelOpts<'_>, data: picker::Data) -> Result<()> {
     let Some(choice) = picker::pick(data, query, model::now(), cfg, opts)? else {
         std::process::exit(1);
     };
-    emit_choice(reg, &choice, open)
+    emit_choice(Some(db), ignore, reg, cli_in_hub, &choice, open)
 }
 
-fn emit_editor_cmd(ed: &picker::EditorChoice) -> Result<String> {
+pub(crate) fn emit_editor_cmd(ed: &picker::EditorChoice) -> Result<String> {
     validate_emit_line(&ed.prog, "editor command")?;
     for a in &ed.args {
         validate_emit_line(a, "editor argument")?;
@@ -883,8 +952,64 @@ fn emit_editor_cmd(ed: &picker::EditorChoice) -> Result<String> {
     }
 }
 
-fn emit_choice(reg: &tools::Registry, choice: &picker::Choice, open: bool) -> Result<()> {
+fn format_launch_lines(
+    reg: &tools::Registry,
+    cli_in_hub: bool,
+    entry: &model::Entry,
+    lc: &launcher::LaunchChoice,
+) -> Result<(String, Option<String>)> {
+    validate_emit_line(&entry.path, "path")?;
+    match &lc.target.method {
+        launcher::LaunchMethod::TerminalEditor { .. } => {
+            let ed = launcher::build_editor_choice(&lc.target, &entry.path, None)?;
+            let cmd = emit_editor_cmd(&ed)?;
+            Ok((entry.path.clone(), Some(cmd)))
+        }
+        launcher::LaunchMethod::CliAgent {
+            tool_tag,
+            launch_cmd,
+        } => {
+            let canonical = reg.normalize_tag(tool_tag);
+            let cmd = reg
+                .launch_command(&canonical)
+                .unwrap_or_else(|| launch_cmd.clone());
+            if !tools::valid_launch(&cmd) {
+                bail!("invalid launch command for `{canonical}`");
+            }
+            if !lc.force_shell && cli_in_hub && tools::valid_name(&canonical) {
+                Ok((
+                    entry.path.clone(),
+                    Some(format!("grace hub --run-tool {canonical}")),
+                ))
+            } else {
+                validate_emit_line(&cmd, "launch command")?;
+                Ok((entry.path.clone(), Some(cmd)))
+            }
+        }
+        launcher::LaunchMethod::HubShell => Ok((entry.path.clone(), Some("grace hub".to_string()))),
+        launcher::LaunchMethod::Travel => Ok((entry.path.clone(), None)),
+        launcher::LaunchMethod::Gui { .. } | launcher::LaunchMethod::GuiUrl { .. } => {
+            bail!("GUI target does not emit shell lines")
+        }
+    }
+}
+
+fn emit_choice(
+    db: Option<&db::Db>,
+    ignore: &platform::IgnoreMatcher,
+    reg: &tools::Registry,
+    cli_in_hub: bool,
+    choice: &picker::Choice,
+    open: bool,
+) -> Result<()> {
     let e = &choice.entry;
+    let record = |tag: &str| {
+        if let Some(d) = db {
+            if !ignore.is_ignored(&e.path) && !tag.is_empty() {
+                let _ = d.record_tool(&e.path, tag, model::now());
+            }
+        }
+    };
     match &choice.action {
         picker::Action::Editor(ed) => {
             if ed.in_terminal {
@@ -911,6 +1036,39 @@ fn emit_choice(reg: &tools::Registry, choice: &picker::Choice, open: bool) -> Re
                 }
             }
         }
+        picker::Action::Launch(lc) => match &lc.target.method {
+            launcher::LaunchMethod::Gui { .. } | launcher::LaunchMethod::GuiUrl { .. } => {
+                let open_list = editors_live::open_editors(ignore);
+                let open_hit = launcher::find_open_for_target(&lc.target, &e.path, &open_list);
+                let ed = launcher::build_editor_choice(&lc.target, &e.path, open_hit)?;
+                record(&lc.target.tag);
+                spawn_gui_editor(&ed)?;
+            }
+            launcher::LaunchMethod::CliAgent { tool_tag, .. } => {
+                let canonical = reg.normalize_tag(tool_tag);
+                let (dir, cmd) = format_launch_lines(reg, cli_in_hub, e, lc)?;
+                record(&canonical);
+                println!("{dir}");
+                if let Some(c) = cmd {
+                    println!("{c}");
+                }
+            }
+            launcher::LaunchMethod::TerminalEditor { .. } => {
+                let (dir, cmd) = format_launch_lines(reg, cli_in_hub, e, lc)?;
+                record(&lc.target.tag);
+                println!("{dir}");
+                if let Some(c) = cmd {
+                    println!("{c}");
+                }
+            }
+            launcher::LaunchMethod::HubShell | launcher::LaunchMethod::Travel => {
+                let (dir, cmd) = format_launch_lines(reg, cli_in_hub, e, lc)?;
+                println!("{dir}");
+                if let Some(c) = cmd {
+                    println!("{c}");
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -1083,13 +1241,36 @@ fn run() -> Result<()> {
         Some(Cmd::Session { action }) => return run_session(action),
         Some(Cmd::Doctor { fix }) => return doctor::run(fix),
         Some(Cmd::Hub {
-            action: Some(HubCmd::Shell { run: cmd }),
+            action: Some(HubCmd::Shell { run: cmd, run_tool }),
             ..
-        }) => return hub::shell(cmd.as_deref()),
+        }) => {
+            if let Some(tag) = run_tool {
+                if !tools::valid_name(&tag) {
+                    bail!("invalid tool name `{tag}`");
+                }
+                let reg = match db::Db::open_readonly_default()? {
+                    Some(db) => tools::Registry::from_db(&db)?,
+                    None => tools::Registry::new(&[]),
+                };
+                let canonical = reg.normalize_tag(&tag);
+                let Some(tool_cmd) = reg.launch_command(&canonical) else {
+                    bail!("unknown tool `{tag}`");
+                };
+                if !tools::valid_launch(&tool_cmd) || platform::has_line_break_or_nul(&tool_cmd) {
+                    bail!("invalid launch command for `{canonical}`");
+                }
+                return hub::shell(Some(&tool_cmd));
+            }
+            return hub::shell(cmd.as_deref());
+        }
         Some(Cmd::Hub {
             action: Some(HubCmd::Keys { wait }),
             ..
         }) => return hub::keys(wait),
+        Some(Cmd::Hub {
+            action: Some(HubCmd::Wake),
+            ..
+        }) => return hub::wake(),
         Some(Cmd::Hub {
             action: Some(HubCmd::Quit),
             ..
@@ -1131,11 +1312,17 @@ fn run() -> Result<()> {
     let default_pick = || Cmd::Pick {
         tag: cli.tag.clone(),
         open: cli.open,
+        with: cli.with,
         query: cli.query.clone(),
     };
 
     match cli.cmd.unwrap_or_else(default_pick) {
-        Cmd::Pick { tag, open, query } => {
+        Cmd::Pick {
+            tag,
+            open,
+            with,
+            query,
+        } => {
             let reg = tools::Registry::from_db(&db)?;
             let toast = first_run_import_if_needed(&db, &ignore, fresh);
             let entries = load(&db, &reg, &ignore, tag.as_deref())?;
@@ -1144,6 +1331,7 @@ fn run() -> Result<()> {
                 sessions: db.sessions(now).unwrap_or_default(),
                 editors: Vec::new(),
                 branches: std::collections::HashMap::new(),
+                installed: None,
             };
             let q = query.as_deref().unwrap_or("");
             travel(
@@ -1156,6 +1344,7 @@ fn run() -> Result<()> {
                     tag: tag.as_deref(),
                     query: q,
                     open,
+                    with,
                     full,
                     initial_toast: toast,
                 },
@@ -1232,6 +1421,7 @@ fn run() -> Result<()> {
                 sessions,
                 editors: Vec::new(),
                 branches: std::collections::HashMap::new(),
+                installed: None,
             };
             let q = query.as_deref().unwrap_or("");
             travel(
@@ -1244,6 +1434,7 @@ fn run() -> Result<()> {
                     tag: None,
                     query: q,
                     open,
+                    with: false,
                     full,
                     initial_toast: None,
                 },
@@ -1254,6 +1445,7 @@ fn run() -> Result<()> {
             action,
             path,
             no_attach,
+            run_tool,
         } => match action {
             None => {
                 let _ = first_run_import_if_needed(&db, &ignore, fresh);
@@ -1261,14 +1453,40 @@ fn run() -> Result<()> {
                 if !Path::new(&p).is_dir() {
                     bail!("not a folder: {p}");
                 }
-                hub::start(&db, &p, !no_attach)?
+                let reg = tools::Registry::from_db(&db)?;
+                let resolved_run = match run_tool {
+                    Some(tag) => {
+                        if !tools::valid_name(&tag) {
+                            bail!("invalid tool name `{tag}`");
+                        }
+                        let canonical = reg.normalize_tag(&tag);
+                        let Some(cmd) = reg.launch_command(&canonical) else {
+                            bail!("unknown tool `{tag}`");
+                        };
+                        if !tools::valid_launch(&cmd) || platform::has_line_break_or_nul(&cmd) {
+                            bail!("invalid launch command for `{canonical}`");
+                        }
+                        if !ignore.is_ignored(&p) {
+                            let _ = db.record_tool(&p, &canonical, now);
+                        }
+                        Some((canonical, cmd))
+                    }
+                    None => None,
+                };
+                let run = resolved_run
+                    .as_ref()
+                    .map(|(tag, cmd)| hub::HubRun::tool(tag, cmd));
+                hub::start(&db, &p, !no_attach, run)?
             }
             Some(HubCmd::Toggle { what, window }) => hub::toggle(&db, &what, window.as_deref())?,
             Some(HubCmd::Sidebar { path }) => {
                 let reg = tools::Registry::from_db(&db)?;
                 hub::run_sidebar(&db, &reg, &ignore, &resolve(Some(path))?)?
             }
-            Some(HubCmd::Shell { .. }) | Some(HubCmd::Keys { .. }) | Some(HubCmd::Quit) => {}
+            Some(HubCmd::Shell { .. })
+            | Some(HubCmd::Keys { .. })
+            | Some(HubCmd::Wake)
+            | Some(HubCmd::Quit) => {}
         },
         Cmd::Add { path } => {
             let p = resolve(Some(path))?;
@@ -1597,5 +1815,115 @@ mod tests {
         assert!(validate_emit_line("/tmp/bad\npath", "path").is_err());
         assert!(validate_emit_line("/tmp/bad\rpath", "path").is_err());
         assert!(validate_emit_line("/tmp/bad\0path", "path").is_err());
+    }
+
+    #[test]
+    fn cli_parses_launcher_and_run_tool_flags() {
+        let c = parse_cli_from(["grace", "-w"]).unwrap();
+        assert!(c.with);
+        assert!(c.cmd.is_none());
+
+        let c = parse_cli_from(["grace", "--with", "knn"]).unwrap();
+        assert!(c.with);
+        assert_eq!(c.query.as_deref(), Some("knn"));
+
+        let c = parse_cli_from(["grace", "pick", "-w", "knn"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Pick {
+                with: true,
+                query: Some(ref q),
+                ..
+            }) if q == "knn"
+        ));
+
+        let c = parse_cli_from(["grace", "hub", "--run-tool", "opencode"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Hub {
+                action: None,
+                run_tool: Some(ref t),
+                ..
+            }) if t == "opencode"
+        ));
+
+        let c = parse_cli_from(["grace", "hub", "shell", "--run-tool", "claude"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Hub {
+                action: Some(HubCmd::Shell {
+                    run_tool: Some(ref t),
+                    ..
+                }),
+                ..
+            }) if t == "claude"
+        ));
+    }
+
+    #[test]
+    fn format_launch_lines_handles_hub_and_shell_modes() {
+        let reg = tools::Registry::new(&[]);
+        let entry = model::Entry {
+            path: "/tmp/myproj".into(),
+            visits: 1,
+            last_visit: 0,
+            pinned: false,
+            tags: Vec::new(),
+        };
+        let cli_target = launcher::InstalledTarget {
+            id: "cli:opencode".into(),
+            label: "opencode".into(),
+            tag: "opencode".into(),
+            kind: launcher::TargetKind::CliAgent,
+            method: launcher::LaunchMethod::CliAgent {
+                tool_tag: "opencode".into(),
+                launch_cmd: "opencode".into(),
+            },
+        };
+
+        let hub_lines = format_launch_lines(
+            &reg,
+            true,
+            &entry,
+            &launcher::LaunchChoice {
+                target: cli_target.clone(),
+                force_shell: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hub_lines,
+            (
+                "/tmp/myproj".into(),
+                Some("grace hub --run-tool opencode".into())
+            )
+        );
+
+        let shell_lines = format_launch_lines(
+            &reg,
+            true,
+            &entry,
+            &launcher::LaunchChoice {
+                target: cli_target.clone(),
+                force_shell: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(shell_lines, ("/tmp/myproj".into(), Some("opencode".into())));
+
+        let no_hub_lines = format_launch_lines(
+            &reg,
+            false,
+            &entry,
+            &launcher::LaunchChoice {
+                target: cli_target,
+                force_shell: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            no_hub_lines,
+            ("/tmp/myproj".into(), Some("opencode".into()))
+        );
     }
 }

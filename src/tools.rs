@@ -259,19 +259,56 @@ pub fn is_terminal_editor(prog: &str) -> bool {
     )
 }
 
-pub fn on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
+/// Resolve `name` to an executable file in an absolute `PATH` directory.
+/// Rejects path separators, NUL bytes, and relative `PATH` entries (such as `.` or empty entries).
+pub fn resolve_on_path(name: &str) -> Option<std::path::PathBuf> {
+    resolve_on_path_in(name, std::env::var_os("PATH").as_deref())
+}
+
+fn resolve_on_path_in(name: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return None;
+    }
+    let path = path?;
     let exts: &[&str] = if cfg!(windows) {
         &[".cmd", ".exe", ".bat", ""]
     } else {
         &[""]
     };
-    std::env::split_paths(&path).any(|dir| {
-        exts.iter()
-            .any(|ext| dir.join(format!("{name}{ext}")).is_file())
-    })
+    for dir in std::env::split_paths(path) {
+        if !dir.is_absolute() {
+            continue;
+        }
+        for ext in exts {
+            let cand = dir.join(format!("{name}{ext}"));
+            if is_executable_file(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn is_executable_file(p: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+pub fn on_path(name: &str) -> bool {
+    resolve_on_path(name).is_some()
 }
 
 #[cfg(test)]
@@ -375,5 +412,48 @@ mod tests {
         );
         assert!(!r.command_names().contains(&"bad;cmd".to_string()));
         assert!(r.command_names().contains(&"codex".to_string()));
+    }
+
+    #[test]
+    fn path_resolution_security() {
+        let d = tempfile::tempdir().unwrap();
+        let abs_dir = d.path().join("bin");
+        std::fs::create_dir_all(&abs_dir).unwrap();
+        let exe_name = if cfg!(windows) { "mycli.exe" } else { "mycli" };
+        let exe_path = abs_dir.join(exe_name);
+        std::fs::write(&exe_path, "echo ok").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Non-executable file must be ignored on Unix.
+            let non_exec = abs_dir.join("notexec");
+            std::fs::write(&non_exec, "hi").unwrap();
+            std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let path =
+                std::env::join_paths([std::path::PathBuf::from("relative"), abs_dir.clone()])
+                    .unwrap();
+            assert_eq!(resolve_on_path_in("notexec", Some(&path)), None);
+            assert_eq!(resolve_on_path_in("mycli", Some(&path)), Some(exe_path));
+        }
+        #[cfg(windows)]
+        {
+            let path =
+                std::env::join_paths([std::path::PathBuf::from("relative"), abs_dir.clone()])
+                    .unwrap();
+            assert_eq!(resolve_on_path_in("mycli", Some(&path)), Some(exe_path));
+        }
+
+        // Relative PATH entries alone must never match.
+        let rel_only = std::ffi::OsStr::new(".");
+        assert_eq!(resolve_on_path_in("Cargo.toml", Some(rel_only)), None);
+        // Path separators and NUL must be rejected.
+        let abs_os = abs_dir.as_os_str();
+        assert_eq!(resolve_on_path_in("../mycli", Some(abs_os)), None);
+        assert_eq!(resolve_on_path_in("a/b", Some(abs_os)), None);
+        assert_eq!(resolve_on_path_in("a\\b", Some(abs_os)), None);
+        assert_eq!(resolve_on_path_in("a\0b", Some(abs_os)), None);
+        assert_eq!(resolve_on_path_in("", Some(abs_os)), None);
     }
 }

@@ -422,13 +422,111 @@ pub struct Repo {
 
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-/// Status of the repository that holds `dir`, including per-file `+N -M` numstat.
-pub fn status(dir: &Path) -> Option<Repo> {
-    status_opts(dir, true)
+/// Cached repository root, prefix, and resolved `.git` directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoKey {
+    pub root: String,
+    pub prefix: String,
+    pub git_dir: Option<PathBuf>,
 }
 
-/// Status of the repository that holds `dir`, optionally skipping per-file `+N -M` line counts.
-pub fn status_opts(dir: &Path, with_numstat: bool) -> Option<Repo> {
+/// Cheap fingerprint of repository status, modified worktree files, and git metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusFingerprint {
+    pub porcelain_hash: u64,
+    pub files_hash: u64,
+    pub git_meta_hash: u64,
+}
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+fn fnv1a_update(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = FNV_OFFSET;
+    fnv1a_update(&mut h, bytes);
+    h
+}
+
+fn hash_path_stat(h: &mut u64, p: &Path) {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) => {
+            fnv1a_update(h, &[1]);
+            fnv1a_update(h, &m.len().to_le_bytes());
+            let mtime_ns: u128 = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            fnv1a_update(h, &mtime_ns.to_le_bytes());
+        }
+        Err(_) => fnv1a_update(h, &[0]),
+    }
+}
+
+fn resolve_commondir(git_dir: &Path) -> Option<PathBuf> {
+    let s = platform::read_to_string_capped(&git_dir.join("commondir"), 1024).ok()?;
+    let rel = s.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    let p = Path::new(rel);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        git_dir.join(p)
+    })
+}
+
+fn resolve_ref_path(gd: &Path, ref_rel: &str) -> PathBuf {
+    let direct = gd.join(ref_rel);
+    if std::fs::symlink_metadata(&direct).is_ok() {
+        return direct;
+    }
+    if let Some(common) = resolve_commondir(gd) {
+        let shared = common.join(ref_rel);
+        if std::fs::symlink_metadata(&shared).is_ok() {
+            return shared;
+        }
+    }
+    direct
+}
+
+/// Fingerprint `.git/index`, `HEAD`, and the current branch ref (with worktree `commondir` support).
+pub fn git_meta_hash(git_dir: Option<&Path>) -> u64 {
+    let mut h = FNV_OFFSET;
+    let Some(gd) = git_dir else {
+        return h;
+    };
+    hash_path_stat(&mut h, &gd.join("index"));
+    let head_path = gd.join("HEAD");
+    hash_path_stat(&mut h, &head_path);
+    if let Ok(head) = platform::read_to_string_capped(&head_path, 512) {
+        fnv1a_update(&mut h, head.as_bytes());
+        if let Some(ref_rel) = head.trim().strip_prefix("ref: ").map(str::trim) {
+            if Path::new(ref_rel)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                let ref_path = resolve_ref_path(gd, ref_rel);
+                hash_path_stat(&mut h, &ref_path);
+                if std::fs::symlink_metadata(&ref_path).is_err() {
+                    hash_path_stat(&mut h, &resolve_ref_path(gd, "packed-refs"));
+                }
+            }
+        }
+    }
+    h
+}
+
+/// Resolve the git repository root, subfolder prefix, and `.git` dir for `dir`.
+pub fn resolve_repo(dir: &Path) -> Option<RepoKey> {
     let rp = git(dir, &["rev-parse", "--show-toplevel", "--show-prefix"])?;
     let rp_str = String::from_utf8_lossy(&rp);
     let mut rp_lines = rp_str.lines();
@@ -438,9 +536,18 @@ pub fn status_opts(dir: &Path, with_numstat: bool) -> Option<Repo> {
         .unwrap_or("")
         .trim_end_matches('\r')
         .to_string();
+    let git_dir = resolve_git_dir(Path::new(&root)).map(|(d, _)| d);
+    Some(RepoKey {
+        root,
+        prefix,
+        git_dir,
+    })
+}
 
+/// Raw `git status --porcelain=v1 -z --branch --untracked-files=all` bytes for `root`.
+pub fn porcelain_raw(root: &Path) -> Option<Vec<u8>> {
     let (raw, trunc) = git_raw(
-        Path::new(&root),
+        root,
         &[
             "status",
             "--porcelain=v1",
@@ -449,44 +556,114 @@ pub fn status_opts(dir: &Path, with_numstat: bool) -> Option<Repo> {
             "--untracked-files=all",
         ],
     )?;
-    let out = trim_last_nul_record(raw, trunc);
-    let (branch, mut changes) = parse_porcelain(&out);
-    let branch = branch.unwrap_or_default();
+    Some(trim_last_nul_record(raw, trunc))
+}
 
-    if with_numstat {
-        let stats = if changes.iter().any(|c| !c.untracked()) {
-            let base = if branch.has_commits {
-                "HEAD"
-            } else {
-                EMPTY_TREE
-            };
-            numstat(Path::new(&root), base)
+fn populate_change_stats(root: &Path, branch: &Branch, changes: &mut [Change]) {
+    let stats = if changes.iter().any(|c| !c.untracked()) {
+        let base = if branch.has_commits {
+            "HEAD"
         } else {
-            HashMap::new()
+            EMPTY_TREE
         };
-        let mut untracked_seen = 0usize;
-        for c in &mut changes {
-            if c.untracked() {
-                if untracked_seen < MAX_UNTRACKED_STATS {
-                    untracked_seen += 1;
-                    let full = Path::new(&root).join(&c.path);
-                    if let Some(lines) = count_untracked_lines(&full) {
-                        c.added = Some(lines);
-                        c.deleted = Some(0);
-                    }
+        numstat(root, base)
+    } else {
+        HashMap::new()
+    };
+    let mut untracked_seen = 0usize;
+    for c in changes {
+        if c.untracked() {
+            if untracked_seen < MAX_UNTRACKED_STATS {
+                untracked_seen += 1;
+                let full = root.join(&c.path);
+                if let Some(lines) = count_untracked_lines(&full) {
+                    c.added = Some(lines);
+                    c.deleted = Some(0);
                 }
-            } else if let Some(&(a, d)) = stats.get(&c.path) {
-                c.added = Some(a);
-                c.deleted = Some(d);
             }
+        } else if let Some(&(a, d)) = stats.get(&c.path) {
+            c.added = Some(a);
+            c.deleted = Some(d);
         }
     }
-    Some(Repo {
-        root,
-        prefix,
+}
+
+fn build_repo(key: &RepoKey, out: &[u8], with_numstat: bool) -> Repo {
+    let (branch, mut changes) = parse_porcelain(out);
+    let branch = branch.unwrap_or_default();
+    if with_numstat {
+        populate_change_stats(Path::new(&key.root), &branch, &mut changes);
+    }
+    Repo {
+        root: key.root.clone(),
+        prefix: key.prefix.clone(),
         branch,
         changes,
-    })
+    }
+}
+
+/// Status of the repository that holds `dir`, including per-file `+N -M` numstat.
+#[cfg(test)]
+pub fn status(dir: &Path) -> Option<Repo> {
+    status_opts(dir, true)
+}
+
+/// Status of the repository that holds `dir`, optionally skipping per-file `+N -M` line counts.
+pub fn status_opts(dir: &Path, with_numstat: bool) -> Option<Repo> {
+    let key = resolve_repo(dir)?;
+    let out = porcelain_raw(Path::new(&key.root))?;
+    Some(build_repo(&key, &out, with_numstat))
+}
+
+/// Check repository status using a cached `RepoKey`, returning `(None, fp)` when `prev_fp` matches.
+pub fn status_with_key(
+    key: &RepoKey,
+    with_numstat: bool,
+    prev_fp: Option<&StatusFingerprint>,
+) -> Option<(Option<Repo>, StatusFingerprint)> {
+    let root_path = Path::new(&key.root);
+    let out = porcelain_raw(root_path)?;
+    let porcelain_hash = fnv1a(&out);
+    let git_meta_hash = git_meta_hash(key.git_dir.as_deref());
+    let (branch, mut changes) = parse_porcelain(&out);
+    let branch = branch.unwrap_or_default();
+    let mut files_hash = FNV_OFFSET;
+    for c in changes.iter().take(512) {
+        hash_path_stat(&mut files_hash, &root_path.join(&c.path));
+    }
+    let fp = StatusFingerprint {
+        porcelain_hash,
+        files_hash,
+        git_meta_hash,
+    };
+    if prev_fp == Some(&fp) {
+        return Some((None, fp));
+    }
+    if with_numstat {
+        populate_change_stats(root_path, &branch, &mut changes);
+    }
+    Some((
+        Some(Repo {
+            root: key.root.clone(),
+            prefix: key.prefix.clone(),
+            branch,
+            changes,
+        }),
+        fp,
+    ))
+}
+
+/// Check repository status for `TreeView` using a cached `RepoKey`, skipping parse when `(porcelain_hash, git_meta_hash)` matches.
+pub fn tree_status_with_key(
+    key: &RepoKey,
+    prev_fp: Option<(u64, u64)>,
+) -> Option<(Option<Repo>, (u64, u64))> {
+    let out = porcelain_raw(Path::new(&key.root))?;
+    let fp = (fnv1a(&out), git_meta_hash(key.git_dir.as_deref()));
+    if prev_fp == Some(fp) {
+        return Some((None, fp));
+    }
+    Some((Some(build_repo(key, &out, false)), fp))
 }
 
 fn count_untracked_lines(full: &Path) -> Option<u32> {
@@ -715,17 +892,9 @@ pub fn resolve_git_dir(dir: &Path) -> Option<(PathBuf, bool)> {
 
 fn has_stash_ref(git_dir: &Path, is_worktree: bool) -> bool {
     let common = if is_worktree {
-        match platform::read_to_string_capped(&git_dir.join("commondir"), 1024) {
-            Ok(s) => {
-                let rel = s.trim();
-                let p = Path::new(rel);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    git_dir.join(p)
-                }
-            }
-            Err(_) => return true,
+        match resolve_commondir(git_dir) {
+            Some(p) => p,
+            None => return true,
         }
     } else {
         git_dir.to_path_buf()
@@ -905,5 +1074,79 @@ mod tests {
         assert_eq!(sum.changed, 1);
         assert_eq!(sum.stashes, 0);
         assert!(!sum.worktree);
+    }
+
+    #[test]
+    fn fingerprints_detect_second_edit_and_tree_changes() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "Grace Test"]);
+        run(&["config", "user.email", "grace@example.com"]);
+        std::fs::write(p.join("a.txt"), "one\n").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
+
+        let key = resolve_repo(p).unwrap();
+
+        // First modification: status_with_key returns Some(Repo).
+        std::fs::write(p.join("a.txt"), "one\ntwo\n").unwrap();
+        let (repo1, fp1) = status_with_key(&key, true, None).unwrap();
+        let repo1 = repo1.unwrap();
+        assert_eq!(repo1.changes.len(), 1);
+        assert_eq!(repo1.changes[0].added, Some(1));
+
+        // Unchanged repo returns (None, fp1).
+        let (unchanged, fp_same) = status_with_key(&key, true, Some(&fp1)).unwrap();
+        assert!(unchanged.is_none());
+        assert_eq!(fp_same, fp1);
+
+        // Second edit to already-modified file keeps porcelain status ` M` identical
+        // but changes `files_hash`, so status_with_key returns Some(Repo).
+        std::fs::write(p.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let (repo2, fp2) = status_with_key(&key, true, Some(&fp1)).unwrap();
+        let repo2 = repo2.unwrap();
+        assert_eq!(fp2.porcelain_hash, fp1.porcelain_hash);
+        assert_ne!(fp2.files_hash, fp1.files_hash);
+        assert_eq!(repo2.changes[0].added, Some(3));
+
+        // Tree status fingerprint: unchanged -> None; new file -> Some; commit -> Some.
+        let (tree1, tfp1) = tree_status_with_key(&key, None).unwrap();
+        assert!(tree1.is_some());
+        let (tree_same, tfp_same) = tree_status_with_key(&key, Some(tfp1)).unwrap();
+        assert!(tree_same.is_none());
+        assert_eq!(tfp_same, tfp1);
+
+        std::fs::write(p.join("b.txt"), "hello\n").unwrap();
+        let (tree2, tfp2) = tree_status_with_key(&key, Some(tfp1)).unwrap();
+        assert!(tree2.is_some());
+        assert_ne!(tfp2, tfp1);
+
+        run(&["add", "b.txt"]);
+        let (tree3, tfp3) = tree_status_with_key(&key, Some(tfp2)).unwrap();
+        assert!(tree3.is_some());
+        assert_ne!(tfp3, tfp2);
+
+        run(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "add b"]);
+        let (tree4, tfp4) = tree_status_with_key(&key, Some(tfp3)).unwrap();
+        assert!(tree4.is_some());
+        assert_ne!(tfp4, tfp3);
     }
 }

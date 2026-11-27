@@ -167,6 +167,8 @@ pub enum Action {
     Editor(EditorChoice),
     /// ctrl-g: open the folder in `grace hub`.
     Hub,
+    /// right / ctrl-l / -w: launch a specific app, editor, or CLI agent.
+    Launch(crate::launcher::LaunchChoice),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,9 +184,17 @@ pub struct Data {
     pub sessions: Vec<Session>,
     pub editors: Vec<OpenEditor>,
     pub branches: HashMap<String, (String, bool)>,
+    pub installed: Option<Vec<crate::launcher::InstalledTarget>>,
 }
 
-pub type EditorCmd<'a> = Box<dyn Fn(&Entry, Option<&OpenEditor>) -> Option<EditorChoice> + 'a>;
+pub type EditorCmd<'a> = Box<
+    dyn Fn(
+            &Entry,
+            Option<&OpenEditor>,
+            Option<&[crate::launcher::InstalledTarget]>,
+        ) -> Option<EditorChoice>
+        + 'a,
+>;
 pub type LabelFn<'a> = Box<dyn Fn(&Entry) -> Option<String> + 'a>;
 pub type EditorLabelFn<'a> = Box<dyn Fn(&Entry, Option<&OpenEditor>) -> Option<String> + 'a>;
 pub type PinFn<'a> = Box<dyn FnMut(&Entry) -> Result<bool, String> + 'a>;
@@ -193,6 +203,10 @@ pub type ForgetFn<'a> = Box<dyn FnMut(&Entry) -> Result<(), String> + 'a>;
 pub struct Opts<'a> {
     pub view: View,
     pub fullscreen: bool,
+    pub start_in_launch: bool,
+    pub default_launch: bool,
+    pub cli_in_hub: bool,
+    pub has_tmux: bool,
     pub tag_filter: Option<String>,
     pub initial_toast: Option<(String, ToastKind)>,
     pub shell_hook_missing: Option<String>,
@@ -203,6 +217,7 @@ pub struct Opts<'a> {
     pub forget_dir: Option<ForgetFn<'a>>,
     pub import_all_now: Option<Box<dyn FnMut() -> Result<String, String> + 'a>>,
     pub add_cwd_now: Option<Box<dyn FnMut() -> Result<String, String> + 'a>>,
+    pub discover_launchers: Option<Box<dyn FnMut() -> Vec<crate::launcher::InstalledTarget> + 'a>>,
     /// Runs off the UI thread after frame 1 and sends updated `Data`.
     pub after_first_frame: Option<Box<dyn FnOnce() -> Option<Data> + Send + 'static>>,
     /// Reads the data again for a view.
@@ -220,8 +235,9 @@ const TAGS_MAX: usize = 32;
 const PARENT_MAX: usize = 30;
 const TICK: Duration = Duration::from_millis(100);
 const SUMMARY_DEBOUNCE: Duration = Duration::from_millis(120);
-const HELP_ROWS: [(&str, &str); 10] = [
+const HELP_ROWS: [(&str, &str); 11] = [
     ("Enter", "Travel to selected folder"),
+    ("→ / Ctrl-L", "Open with app, editor, or CLI"),
     ("Ctrl-O", "Travel and start last AI tool"),
     ("Ctrl-E", "Open or focus editor"),
     ("Ctrl-G", "Open folder in grace hub"),
@@ -420,11 +436,11 @@ pub fn inline_height(rows: usize, term_h: u16) -> u16 {
 // ---------------------------------------------------------------------------
 // State
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Modal {
     None,
     Help,
     ConfirmForget,
+    Launch(crate::launcher::LaunchMenu),
 }
 
 struct CachedWidths {
@@ -438,6 +454,8 @@ struct State {
     data: Data,
     best: Best,
     open: HashMap<String, Vec<OpenEditor>>,
+    installed: Option<Vec<crate::launcher::InstalledTarget>>,
+    global_counts: HashMap<String, i64>,
     query: String,
     pattern: Option<Pattern>,
     atom_patterns: Vec<Pattern>,
@@ -470,6 +488,8 @@ struct State {
     list_area: Rect,
     tab_folders_area: Rect,
     tab_sessions_area: Rect,
+    launch_modal_area: Rect,
+    launch_hit_rows: Vec<(Rect, Vec<usize>)>,
     last_click: DoubleClick,
     footer_hints: Vec<(&'static str, String)>,
 }
@@ -491,6 +511,8 @@ impl State {
             data: Data::default(),
             best: Best::new(),
             open: HashMap::new(),
+            installed: None,
+            global_counts: HashMap::new(),
             query: query.to_string(),
             pattern: None,
             atom_patterns: Vec::new(),
@@ -528,6 +550,8 @@ impl State {
             list_area: Rect::default(),
             tab_folders_area: Rect::default(),
             tab_sessions_area: Rect::default(),
+            launch_modal_area: Rect::default(),
+            launch_hit_rows: Vec::new(),
             last_click: DoubleClick::default(),
             footer_hints: Vec::new(),
         };
@@ -561,8 +585,18 @@ impl State {
     }
 
     /// Replace the data. The query and the selected folder stay.
-    fn set_data(&mut self, data: Data) {
+    fn set_data(&mut self, mut data: Data) {
         let keep = self.selected_entry().map(|e| e.path.clone());
+        if let Some(inst) = data.installed.take() {
+            self.installed = Some(inst);
+        }
+        self.global_counts.clear();
+        for e in &data.entries {
+            for t in &e.tags {
+                let c = self.global_counts.entry(t.tool.clone()).or_insert(0);
+                *c = c.saturating_add(t.count.max(0));
+            }
+        }
         self.best = best_by_path(&data.sessions);
         self.open.clear();
         for o in &data.editors {
@@ -1122,6 +1156,7 @@ fn draw(f: &mut Frame, st: &mut State) {
                 .collect();
             let fallback = [
                 ("⏎", "travel"),
+                ("→", "open"),
                 ("^o", "resume"),
                 ("^e", "editor"),
                 ("^g", "hub"),
@@ -1146,6 +1181,8 @@ fn draw(f: &mut Frame, st: &mut State) {
     f.render_widget(block, outer);
     st.animating = false;
     st.list_area = Rect::default();
+    st.launch_modal_area = Rect::default();
+    st.launch_hit_rows.clear();
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -1552,9 +1589,9 @@ fn draw_inspector(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(Paragraph::new(lines), pad);
 }
 
-fn draw_active_modal(f: &mut Frame, outer: Rect, st: &State) {
+fn draw_active_modal(f: &mut Frame, outer: Rect, st: &mut State) {
     let t = st.theme;
-    match st.modal {
+    match &st.modal {
         Modal::None => {}
         Modal::Help => render_help_modal(f, outer, "keys", &HELP_ROWS, t),
         Modal::ConfirmForget => {
@@ -1578,6 +1615,349 @@ fn draw_active_modal(f: &mut Frame, outer: Rect, st: &State) {
                 t,
             );
         }
+        Modal::Launch(_) => draw_launch_modal(f, outer, st),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_launch_col(
+    f: &mut Frame,
+    area: Rect,
+    menu: &crate::launcher::LaunchMenu,
+    row_indices: &[usize],
+    offset: usize,
+    t: Theme,
+    block_style: Style,
+) -> (Rect, Vec<usize>) {
+    use crate::launcher::{LaunchRow, TargetKind};
+    let vh = area.height as usize;
+    let (list_rect, sb_area) = slice_scrollbar(area, row_indices.len(), vh);
+    let lw = list_rect.width as usize;
+    let mut lines = Vec::new();
+    let mut vis_rows = Vec::new();
+    for &ri in row_indices.iter().skip(offset).take(vh) {
+        vis_rows.push(ri);
+        match menu.rows[ri] {
+            LaunchRow::Header(hdr) => {
+                let mut b = RowBuf {
+                    spans: Vec::new(),
+                    used: 0,
+                    base: block_style,
+                };
+                b.pad(1);
+                b.push(
+                    cut(hdr, lw.saturating_sub(1)),
+                    block_style.patch(t.muted()).add_modifier(Modifier::BOLD),
+                );
+                b.pad_to(lw);
+                lines.push(Line::from(b.spans));
+            }
+            LaunchRow::Item(idx) => {
+                let item = &menu.items[idx];
+                let sel = ri == menu.selected;
+                let mut base = block_style;
+                if sel {
+                    if let Some(bg) = t.sel_bg() {
+                        base = base.bg(bg);
+                    }
+                }
+                let mut b = RowBuf {
+                    spans: Vec::new(),
+                    used: 0,
+                    base,
+                };
+                if sel {
+                    b.push(t.bar_glyph(), t.fg(base, t.accent()));
+                } else {
+                    b.pad(1);
+                }
+                if let Some(hk) = menu.hotkey_for_row(ri) {
+                    b.push(
+                        format!("{hk} "),
+                        base.patch(t.keycap_style()).patch(t.muted()),
+                    );
+                } else {
+                    b.pad(2);
+                }
+                let badge_display = if item.is_open {
+                    format!("{} open", t.editor_glyph())
+                } else {
+                    item.badge.clone()
+                };
+                let badge_w = if badge_display.is_empty() {
+                    0
+                } else {
+                    sw(&badge_display) + 2
+                };
+                let label_budget = lw.saturating_sub(b.used + badge_w + 1);
+                let label_clean = platform::sanitize_display(&item.target.label);
+                let label_style = match item.target.kind {
+                    TargetKind::HubShell | TargetKind::Travel => {
+                        if sel {
+                            t.fg(base, t.accent()).add_modifier(Modifier::BOLD)
+                        } else {
+                            base.patch(t.muted())
+                        }
+                    }
+                    _ => {
+                        let s = t.fg(base, t.tag_color(&item.target.tag));
+                        if sel {
+                            s.add_modifier(Modifier::BOLD)
+                        } else {
+                            s
+                        }
+                    }
+                };
+                b.push_fit(
+                    &fit_end(&label_clean, label_budget),
+                    &[],
+                    label_style,
+                    label_style,
+                );
+                if !badge_display.is_empty() {
+                    let bw = sw(&badge_display);
+                    if b.used + bw < lw {
+                        b.pad(lw.saturating_sub(b.used + bw + 1));
+                        let b_style = if item.is_open {
+                            t.fg(base, t.open_blue())
+                        } else if item.badge == "live" || item.badge.starts_with("last") {
+                            t.fg(base, t.accent())
+                        } else {
+                            base.patch(t.muted())
+                        };
+                        b.push(badge_display, b_style);
+                    }
+                }
+                b.pad_to(lw);
+                lines.push(Line::from(b.spans));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines).style(block_style), list_rect);
+    if let Some(sb_area) = sb_area {
+        render_scrollbar(f, sb_area, row_indices.len(), offset, vh, t);
+    }
+    (list_rect, vis_rows)
+}
+
+fn draw_launch_modal(f: &mut Frame, outer: Rect, st: &mut State) {
+    use crate::launcher::LaunchRow;
+    use ratatui::widgets::Clear;
+    if outer.width < 20 || outer.height < 6 {
+        return;
+    }
+    let t = st.theme;
+    let Modal::Launch(ref mut menu) = st.modal else {
+        return;
+    };
+    let (left_rows, right_rows) = menu.split_columns();
+    let two_col = outer.width >= 76 && !left_rows.is_empty() && !right_rows.is_empty();
+    let w = if two_col {
+        88u16
+            .min(outer.width.saturating_sub(2))
+            .max(72.min(outer.width))
+    } else {
+        60u16
+            .min(outer.width.saturating_sub(2))
+            .max(24.min(outer.width))
+    };
+    let content_rows = if two_col {
+        left_rows.len().max(right_rows.len())
+    } else {
+        menu.rows.len()
+    };
+    let max_h = if outer.height >= 13 {
+        outer.height.saturating_sub(2)
+    } else if outer.height >= 8 {
+        outer.height.saturating_sub(1)
+    } else {
+        outer.height
+    };
+    let h = ((content_rows.max(3) + 4) as u16)
+        .min(max_h)
+        .min(18)
+        .max(6.min(outer.height));
+    let x = outer.x + (outer.width.saturating_sub(w)) / 2;
+    let y = if outer.height >= 8 {
+        let centered = outer.y + (outer.height.saturating_sub(h)) / 2;
+        centered
+            .max(outer.y + 1)
+            .min(outer.y + outer.height.saturating_sub(h))
+    } else {
+        outer.y
+    };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    st.launch_modal_area = rect;
+    f.render_widget(Clear, rect);
+
+    let mut block_style = Style::default();
+    if let Some(bg) = t.modal_bg() {
+        block_style = block_style.bg(bg);
+    }
+    let title_budget = (w as usize).saturating_sub(16);
+    let title = format!(
+        " {} open \"{}\" with ",
+        t.star(),
+        cut(&menu.folder_name, title_budget)
+    );
+    let hints: &[(&str, &str)] = match (two_col, menu.has_tmux && menu.cli_in_hub) {
+        (true, true) => &[
+            ("1-9", "go"),
+            ("⇥", "col"),
+            ("⏎", "open"),
+            ("⌥⏎", "shell"),
+            ("←", "back"),
+        ],
+        (true, false) => &[("1-9", "go"), ("⇥", "col"), ("⏎", "open"), ("←", "back")],
+        (false, true) => &[("1-9", "go"), ("⏎", "open"), ("←", "back"), ("⌥⏎", "shell")],
+        (false, false) => &[("1-9", "go"), ("⏎", "open"), ("←", "back")],
+    };
+    let block = Block::bordered()
+        .border_type(t.border_type())
+        .border_style(t.border_style(true))
+        .style(block_style)
+        .title_top(Line::from(Span::styled(title, t.title_accent())))
+        .title_bottom(Line::from(hint_spans(
+            hints,
+            (w as usize).saturating_sub(4),
+            t,
+        )));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.width < 4 || inner.height == 0 {
+        return;
+    }
+
+    let show_filter = inner.height >= 4 || !menu.query.is_empty();
+    let body = if show_filter {
+        let iw = inner.width as usize;
+        let q = cut_tail(&menu.query, iw.saturating_sub(6));
+        let mut q_spans = vec![
+            Span::raw(" "),
+            Span::styled("❯ ", t.title_accent()),
+            Span::raw(q),
+            Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+        ];
+        if menu.query.is_empty() && iw > 20 {
+            q_spans.push(Span::styled(
+                " type to filter",
+                block_style.patch(t.muted()),
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(q_spans)).style(block_style),
+            Rect { height: 1, ..inner },
+        );
+        Rect {
+            y: inner.y + 1,
+            height: inner.height - 1,
+            ..inner
+        }
+    } else {
+        inner
+    };
+    if body.height == 0 {
+        return;
+    }
+    if menu.rows.is_empty() {
+        center_msg(f, body, "No matching tools", t);
+        return;
+    }
+
+    let vh = body.height as usize;
+    st.launch_hit_rows.clear();
+    if two_col {
+        let left_w = body.width.saturating_sub(1) / 2;
+        let left_rect = Rect {
+            x: body.x,
+            y: body.y,
+            width: left_w,
+            height: body.height,
+        };
+        let sep_rect = Rect {
+            x: body.x + left_w,
+            y: body.y,
+            width: 1,
+            height: body.height,
+        };
+        let right_rect = Rect {
+            x: body.x + left_w + 1,
+            y: body.y,
+            width: body.width.saturating_sub(left_w + 1),
+            height: body.height,
+        };
+
+        let vr = t.v_rule();
+        let sep_style = t.fg(block_style, t.border_color());
+        let sep_lines: Vec<Line> = (0..sep_rect.height)
+            .map(|_| Line::from(Span::styled(vr, sep_style)))
+            .collect();
+        f.render_widget(Paragraph::new(sep_lines), sep_rect);
+
+        if let Some(sel_pos) = left_rows.iter().position(|&ri| ri == menu.selected) {
+            menu.offset = scroll_by(
+                left_rows.len(),
+                |i| matches!(menu.rows[left_rows[i]], LaunchRow::Header(_)),
+                sel_pos,
+                menu.offset,
+                vh,
+            );
+        } else {
+            menu.offset = menu.offset.min(left_rows.len().saturating_sub(vh));
+        }
+        if let Some(sel_pos) = right_rows.iter().position(|&ri| ri == menu.selected) {
+            menu.right_offset = scroll_by(
+                right_rows.len(),
+                |i| matches!(menu.rows[right_rows[i]], LaunchRow::Header(_)),
+                sel_pos,
+                menu.right_offset,
+                vh,
+            );
+        } else {
+            menu.right_offset = menu.right_offset.min(right_rows.len().saturating_sub(vh));
+        }
+
+        st.launch_hit_rows.push(render_launch_col(
+            f,
+            left_rect,
+            menu,
+            &left_rows,
+            menu.offset,
+            t,
+            block_style,
+        ));
+        st.launch_hit_rows.push(render_launch_col(
+            f,
+            right_rect,
+            menu,
+            &right_rows,
+            menu.right_offset,
+            t,
+            block_style,
+        ));
+    } else {
+        let all_rows: Vec<usize> = (0..menu.rows.len()).collect();
+        menu.offset = scroll_by(
+            menu.rows.len(),
+            |idx| matches!(menu.rows[idx], LaunchRow::Header(_)),
+            menu.selected,
+            menu.offset,
+            vh,
+        );
+        st.launch_hit_rows.push(render_launch_col(
+            f,
+            body,
+            menu,
+            &all_rows,
+            menu.offset,
+            t,
+            block_style,
+        ));
     }
 }
 
@@ -1741,7 +2121,11 @@ fn restore() {
 }
 
 fn update_footer_hints(st: &mut State, opts: &Opts) {
-    let mut hints = vec![("⏎", "travel".to_string())];
+    let mut hints = if opts.default_launch {
+        vec![("⏎", "open with".to_string())]
+    } else {
+        vec![("⏎", "travel".to_string()), ("→", "open".to_string())]
+    };
     if let Some(e) = st.selected_entry() {
         if let Some(tool) = (opts.tool_label)(e) {
             hints.push(("^o", tool));
@@ -1787,8 +2171,31 @@ fn run<B: Backend>(
             if let Ok(maybe) = rx.try_recv() {
                 if *bg_view == st.view {
                     if let Some(d) = maybe {
+                        let prev = if let Modal::Launch(ref menu) = st.modal {
+                            Some((
+                                menu.query.clone(),
+                                menu.selected_item().map(|i| i.target.id.clone()),
+                            ))
+                        } else {
+                            None
+                        };
                         st.now = crate::model::now();
                         st.set_data(d);
+                        if let Some((prev_q, prev_id)) = prev {
+                            if open_launch_modal(st, opts) {
+                                if let Modal::Launch(ref mut m) = st.modal {
+                                    m.query = prev_q;
+                                    m.refilter();
+                                    if let Some(id) = prev_id {
+                                        if let Some(ri) = m.rows.iter().position(|r| {
+                                            matches!(r, crate::launcher::LaunchRow::Item(idx) if m.items[*idx].target.id == id)
+                                        }) {
+                                            m.selected = ri;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         dirty = true;
                         hints_dirty = true;
                     }
@@ -1894,7 +2301,49 @@ fn handle_mouse(
     m: MouseEvent,
     next_reload: &mut Option<Instant>,
 ) -> Option<Choice> {
-    if st.modal != Modal::None {
+    if let Modal::Launch(ref mut menu) = st.modal {
+        match m.kind {
+            MouseEventKind::ScrollUp => menu.mv(-1),
+            MouseEventKind::ScrollDown => menu.mv(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = Position {
+                    x: m.column,
+                    y: m.row,
+                };
+                if !st.launch_modal_area.contains(pos) {
+                    st.modal = Modal::None;
+                } else if let Some((hit_rect, vis_rows)) =
+                    st.launch_hit_rows.iter().find(|(r, _)| r.contains(pos))
+                {
+                    if let Some(&idx) = vis_rows.get((m.row - hit_rect.y) as usize) {
+                        if matches!(
+                            menu.rows.get(idx),
+                            Some(crate::launcher::LaunchRow::Item(_))
+                        ) {
+                            let is_dbl = st.last_click.click(idx);
+                            menu.selected = idx;
+                            if is_dbl {
+                                if let (Some(item), Some(e)) =
+                                    (menu.selected_item().cloned(), st.selected_entry().cloned())
+                                {
+                                    return Some(Choice {
+                                        entry: e,
+                                        action: Action::Launch(crate::launcher::LaunchChoice {
+                                            target: item.target,
+                                            force_shell: false,
+                                        }),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return None;
+    }
+    if !matches!(st.modal, Modal::None) {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             st.modal = Modal::None;
         }
@@ -1947,6 +2396,36 @@ fn switch_view(st: &mut State, opts: &mut Opts, next: View, next_reload: &mut Op
     }
 }
 
+fn ensure_installed(st: &mut State, opts: &mut Opts) {
+    if st.installed.is_none() {
+        if let Some(cb) = opts.discover_launchers.as_mut() {
+            st.installed = Some(cb());
+        }
+    }
+}
+
+fn open_launch_modal(st: &mut State, opts: &mut Opts) -> bool {
+    let Some(e) = st.selected_entry().cloned() else {
+        return false;
+    };
+    ensure_installed(st, opts);
+    let installed = st.installed.as_deref().unwrap_or(&[]);
+    let open_here: Vec<OpenEditor> = st.open.get(&e.path).cloned().unwrap_or_default();
+    let active = st.best.get(&e.path);
+    let menu = crate::launcher::LaunchMenu::new(
+        &e,
+        installed,
+        &open_here,
+        active,
+        &st.global_counts,
+        opts.cli_in_hub,
+        opts.has_tmux,
+        false,
+    );
+    st.modal = Modal::Launch(menu);
+    true
+}
+
 /// Returns `Some(res)` to exit the picker with `res`, `None` to keep running.
 fn handle_key(
     st: &mut State,
@@ -1956,6 +2435,12 @@ fn handle_key(
 ) -> Option<Option<Choice>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let launch_entry = if matches!(st.modal, Modal::Launch(_)) {
+        st.selected_entry().cloned()
+    } else {
+        None
+    };
 
     // Modal intercept.
     match st.modal {
@@ -1989,6 +2474,55 @@ fn handle_key(
                 }
                 KeyCode::Esc | KeyCode::Char('n' | 'N') => st.modal = Modal::None,
                 KeyCode::Char('c') if ctrl => st.modal = Modal::None,
+                _ => {}
+            }
+            return None;
+        }
+        Modal::Launch(ref mut menu) => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Left => st.modal = Modal::None,
+                KeyCode::Char('c') if ctrl => st.modal = Modal::None,
+                KeyCode::Tab | KeyCode::BackTab => menu.toggle_section(),
+                KeyCode::Up => menu.mv(-1),
+                KeyCode::Down => menu.mv(1),
+                KeyCode::Char('p') | KeyCode::Char('k') if ctrl && !alt => menu.mv(-1),
+                KeyCode::Char('n') | KeyCode::Char('j') if ctrl && !alt => menu.mv(1),
+                KeyCode::PageUp => menu.mv(-8),
+                KeyCode::PageDown => menu.mv(8),
+                KeyCode::Enter => {
+                    if let (Some(item), Some(e)) = (menu.selected_item().cloned(), launch_entry) {
+                        return Some(Some(Choice {
+                            entry: e,
+                            action: Action::Launch(crate::launcher::LaunchChoice {
+                                target: item.target,
+                                force_shell: alt || shift,
+                            }),
+                        }));
+                    }
+                }
+                KeyCode::Char('w') if ctrl => menu.delete_word(),
+                KeyCode::Char('u') if ctrl => menu.clear_query(),
+                KeyCode::Backspace => {
+                    menu.query.pop();
+                    menu.refilter();
+                }
+                KeyCode::Char(c) if is_plain_char(&key) => {
+                    if menu.query.is_empty() {
+                        if let (Some(item), Some(e)) =
+                            (menu.item_for_hotkey(c).cloned(), launch_entry)
+                        {
+                            return Some(Some(Choice {
+                                entry: e,
+                                action: Action::Launch(crate::launcher::LaunchChoice {
+                                    target: item.target,
+                                    force_shell: false,
+                                }),
+                            }));
+                        }
+                    }
+                    menu.query.push(c);
+                    menu.refilter();
+                }
                 _ => {}
             }
             return None;
@@ -2043,9 +2577,17 @@ fn handle_key(
         KeyCode::Esc => return Some(None),
         KeyCode::Char('c') if ctrl => return Some(None),
         KeyCode::Enter => {
-            if let Some(c) = choose(st, Action::Travel) {
+            if opts.default_launch {
+                open_launch_modal(st, opts);
+            } else if let Some(c) = choose(st, Action::Travel) {
                 return Some(Some(c));
             }
+        }
+        KeyCode::Right => {
+            open_launch_modal(st, opts);
+        }
+        KeyCode::Char('l') if ctrl => {
+            open_launch_modal(st, opts);
         }
         KeyCode::Char('o') if ctrl => {
             if let Some(c) = choose(st, Action::Resume) {
@@ -2059,14 +2601,19 @@ fn handle_key(
         }
         KeyCode::Char('e') if ctrl => {
             if let Some(e) = st.selected_entry().cloned() {
-                match (opts.editor_cmd)(&e, st.selected_open_editor(&e)) {
+                ensure_installed(st, opts);
+                match (opts.editor_cmd)(&e, st.selected_open_editor(&e), st.installed.as_deref()) {
                     Some(cmd) => {
                         return Some(Some(Choice {
                             entry: e,
                             action: Action::Editor(cmd),
                         }))
                     }
-                    None => st.flash("no editor used here", ToastKind::Warn),
+                    None => {
+                        if !open_launch_modal(st, opts) {
+                            st.flash("no editor used here", ToastKind::Warn);
+                        }
+                    }
                 }
             }
         }
@@ -2167,7 +2714,13 @@ fn run_fullscreen(st: &mut State, opts: &mut Opts) -> Result<Option<Choice>> {
 
 fn run_inline(st: &mut State, opts: &mut Opts) -> Result<Option<Choice>> {
     let (_, term_h) = crossterm::terminal::size()?;
-    let rows = st.rows.len();
+    let min_rows =
+        if matches!(st.modal, Modal::Launch(_)) || opts.start_in_launch || opts.default_launch {
+            14
+        } else {
+            0
+        };
+    let rows = st.rows.len().max(min_rows);
     let h = inline_height(rows, term_h);
     let mut terminal = match Terminal::with_options(
         TtyBackend(CrosstermBackend::new(io::stderr())),
@@ -2209,8 +2762,12 @@ pub fn pick(
     if let Some((msg, kind)) = opts.initial_toast.take() {
         st.toast = Some(Toast::new(msg, kind, 4000));
     }
-    // Fast travel: one match for a given query, so skip the UI.
-    if !query.trim().is_empty() && st.matches.len() == 1 {
+    // Fast travel: one match for a given query, so skip the UI (unless launcher mode requested).
+    if !query.trim().is_empty()
+        && st.matches.len() == 1
+        && !opts.start_in_launch
+        && !opts.default_launch
+    {
         let entry = st.data.entries[st.matches[0]].clone();
         return Ok(Some(Choice {
             entry,
@@ -2219,6 +2776,9 @@ pub fn pick(
     }
     if !io::stderr().is_terminal() {
         bail!("grace requires an interactive terminal for the picker");
+    }
+    if (opts.start_in_launch || opts.default_launch) && st.matches.len() == 1 {
+        open_launch_modal(&mut st, &mut opts);
     }
 
     let default_hook = std::panic::take_hook();
@@ -2277,6 +2837,9 @@ mod tests {
             tool: tool.into(),
             status,
             shell_pid: None,
+            shell_start: None,
+            agent_pid: None,
+            agent_start: None,
             started_at: 0,
             updated_at,
             session_id: None,
@@ -2472,6 +3035,7 @@ mod tests {
             sessions,
             editors,
             branches: HashMap::new(),
+            installed: None,
         }
     }
 
@@ -2655,5 +3219,301 @@ mod tests {
         st.query = "foo\u{3000}bar/".into();
         st.delete_word();
         assert_eq!(st.query, "foo\u{3000}");
+    }
+
+    fn mock_launch_targets() -> Vec<crate::launcher::InstalledTarget> {
+        use crate::launcher::{InstalledTarget, LaunchMethod, TargetKind};
+        vec![
+            InstalledTarget {
+                id: "antigravity".into(),
+                label: "Antigravity".into(),
+                tag: "antigravity".into(),
+                kind: TargetKind::GuiApp,
+                method: LaunchMethod::Gui {
+                    prog: "open".into(),
+                    args_before: vec!["-a".into(), "Antigravity".into()],
+                    pass_path: false,
+                    focus_only: true,
+                },
+            },
+            InstalledTarget {
+                id: "t3code".into(),
+                label: "T3 Code".into(),
+                tag: "t3code".into(),
+                kind: TargetKind::GuiApp,
+                method: LaunchMethod::Gui {
+                    prog: "open".into(),
+                    args_before: vec!["-a".into(), "T3 Code".into()],
+                    pass_path: false,
+                    focus_only: true,
+                },
+            },
+            InstalledTarget {
+                id: "cli:opencode".into(),
+                label: "opencode".into(),
+                tag: "opencode".into(),
+                kind: TargetKind::CliAgent,
+                method: LaunchMethod::CliAgent {
+                    tool_tag: "opencode".into(),
+                    launch_cmd: "opencode".into(),
+                },
+            },
+        ]
+    }
+
+    fn test_opts<'a>() -> Opts<'a> {
+        Opts {
+            view: View::Folders,
+            fullscreen: false,
+            start_in_launch: false,
+            default_launch: false,
+            cli_in_hub: true,
+            has_tmux: true,
+            tag_filter: None,
+            initial_toast: None,
+            shell_hook_missing: None,
+            editor_cmd: Box::new(|_, _, _| None),
+            tool_label: Box::new(|_| None),
+            editor_label: Box::new(|_, _| None),
+            toggle_pin: None,
+            forget_dir: None,
+            import_all_now: None,
+            add_cwd_now: None,
+            discover_launchers: Some(Box::new(mock_launch_targets)),
+            after_first_frame: None,
+            reload: None,
+            reload_every: None,
+        }
+    }
+
+    #[test]
+    fn launch_modal_renders_filters_and_handles_keys() {
+        let mut opts = test_opts();
+        let mut st = State::new(
+            demo(),
+            "",
+            NOW,
+            View::Folders,
+            false,
+            None,
+            None,
+            Theme::dark(),
+            Some("/home/u".into()),
+        );
+        let mut next_reload = None;
+
+        // Ctrl-E with no editor opens launch modal instead of dead-ending.
+        st.mv(1); // svm (only claude tag)
+        assert!(handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut next_reload
+        )
+        .is_none());
+        assert!(matches!(st.modal, Modal::Launch(_)));
+
+        // Normal & narrow/short modal rendering stays well-formed.
+        let out = render_pick(&mut st, 100, 14);
+        assert!(out.contains("open \"svm\" with"), "{out}");
+        assert!(
+            out.contains("APPS & EDITORS") && out.contains("CLI AGENTS · HUB"),
+            "{out}"
+        );
+        let short = render_pick(&mut st, 44, 7);
+        assert!(short.contains("open \"svm\" with"), "{short}");
+
+        // Esc / Left closes modal.
+        assert!(handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Left),
+            &mut next_reload
+        )
+        .is_none());
+        assert!(matches!(st.modal, Modal::None));
+
+        // Right opens modal; digit '1' fires instant launch when query is empty.
+        assert!(handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Right),
+            &mut next_reload
+        )
+        .is_none());
+        let res = handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Char('1')),
+            &mut next_reload,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(res.action, Action::Launch(ref c) if c.target.id == "antigravity" && !c.force_shell)
+        );
+
+        // Typing "t3" filters cleanly instead of firing hotkey 3.
+        assert!(handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Right),
+            &mut next_reload
+        )
+        .is_none());
+        for ch in "t3".chars() {
+            assert!(handle_key(
+                &mut st,
+                &mut opts,
+                KeyEvent::from(KeyCode::Char(ch)),
+                &mut next_reload
+            )
+            .is_none());
+        }
+        let res = handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Enter),
+            &mut next_reload,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(res.action, Action::Launch(ref c) if c.target.id == "t3code" && !c.force_shell)
+        );
+
+        // Alt-Enter sets force_shell = true.
+        st.modal = Modal::None;
+        assert!(handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Right),
+            &mut next_reload
+        )
+        .is_none());
+        for ch in "opencode".chars() {
+            assert!(handle_key(
+                &mut st,
+                &mut opts,
+                KeyEvent::from(KeyCode::Char(ch)),
+                &mut next_reload
+            )
+            .is_none());
+        }
+        let res = handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            &mut next_reload,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(res.action, Action::Launch(ref c) if c.target.id == "cli:opencode" && c.force_shell)
+        );
+    }
+
+    #[test]
+    fn launch_modal_two_col_and_default_launch_footer() {
+        use crate::launcher::{InstalledTarget, LaunchMethod, TargetKind};
+        let gui = |id: &str, label: &str| InstalledTarget {
+            id: id.into(),
+            label: label.into(),
+            tag: id.into(),
+            kind: TargetKind::GuiApp,
+            method: LaunchMethod::Gui {
+                prog: "open".into(),
+                args_before: vec!["-a".into(), label.into()],
+                pass_path: false,
+                focus_only: true,
+            },
+        };
+        let cli = |name: &str| InstalledTarget {
+            id: format!("cli:{name}"),
+            label: name.into(),
+            tag: name.into(),
+            kind: TargetKind::CliAgent,
+            method: LaunchMethod::CliAgent {
+                tool_tag: name.into(),
+                launch_cmd: name.into(),
+            },
+        };
+        let many: Vec<InstalledTarget> = vec![
+            gui("vscode", "VS Code"),
+            gui("zed", "Zed"),
+            gui("t3code", "T3 Code"),
+            gui("antigravity", "Antigravity"),
+            gui("claude-desktop", "Claude Desktop"),
+            cli("claude"),
+            cli("codex"),
+            cli("agy"),
+            cli("opencode"),
+            cli("copilot"),
+        ];
+
+        let mut opts = test_opts();
+        opts.default_launch = true;
+        opts.discover_launchers = Some(Box::new(move || many.clone()));
+        let mut st = State::new(
+            demo(),
+            "",
+            NOW,
+            View::Folders,
+            false,
+            None,
+            None,
+            Theme::dark(),
+            Some("/home/u".into()),
+        );
+        update_footer_hints(&mut st, &opts);
+        let picker_out = render_pick(&mut st, 100, 11);
+        assert!(picker_out.contains("open with"), "{picker_out}");
+        assert!(!picker_out.contains("⏎ travel"), "{picker_out}");
+
+        // Enter with default_launch opens the 2-column Launch modal.
+        let mut next_reload = None;
+        assert!(handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Enter),
+            &mut next_reload
+        )
+        .is_none());
+        let modal_out = render_pick(&mut st, 100, 11);
+        // Outer picker top border stays visible and uncorrupted.
+        let first_line = modal_out.lines().next().unwrap();
+        assert!(first_line.contains("✦ grace"), "{first_line}");
+        // Both columns render simultaneously on an 11-row viewport.
+        assert!(
+            modal_out.contains("APPS & EDITORS")
+                && modal_out.contains("CLI AGENTS · HUB")
+                && modal_out.contains("VS Code")
+                && modal_out.contains("opencode")
+                && modal_out.contains("copilot"),
+            "{modal_out}"
+        );
+
+        // Tab jumps selection into the right (CLI AGENTS) column and back.
+        let is_cli_selected = |st: &State| {
+            let Modal::Launch(ref m) = st.modal else {
+                panic!("expected launch modal");
+            };
+            m.selected_item().unwrap().target.kind == TargetKind::CliAgent
+        };
+        assert!(!is_cli_selected(&st));
+        handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Tab),
+            &mut next_reload,
+        );
+        assert!(is_cli_selected(&st));
+        handle_key(
+            &mut st,
+            &mut opts,
+            KeyEvent::from(KeyCode::Tab),
+            &mut next_reload,
+        );
+        assert!(!is_cli_selected(&st));
     }
 }

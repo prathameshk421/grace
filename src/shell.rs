@@ -639,6 +639,7 @@ _grace() {
     '--full[Draw picker fullscreen]' \
     '-t[Filter by tool tag]:tag:' '--tag[Filter by tool tag]:tag:' \
     '-o[Launch last AI tool]' '--open[Launch last AI tool]' \
+    '-w[Open in app/editor/CLI launcher]' '--with[Open in app/editor/CLI launcher]' \
     '-h[Print help]' '--help[Print help]' \
     '-V[Print version]' '--version[Print version]' \
     '1:command:->cmd' \
@@ -653,10 +654,10 @@ _grace() {
         doctor) compadd -- --fix ;;
         prune) compadd -- --dry-run --older-than ;;
         list) compadd -- -t --tag --json ;;
-        pick) compadd -- -t --tag -o --open ;;
+        pick) compadd -- -t --tag -o --open -w --with ;;
         sessions) compadd -- -l --list --json -o --open ;;
         pin|unpin|forget|diff|tree) _files -/ ;;
-        hub) compadd quit; _files -/ ;;
+        hub) compadd -- quit --run-tool; _files -/ ;;
         tool)
           if (( CURRENT >= 3 )) && [[ $words[2] == add ]]; then
             compadd -- --tag --launch
@@ -681,7 +682,7 @@ const BASH_COMPLETIONS: &str = r#"_grace_completions() {
     case "${COMP_WORDS[i]}" in
       -t|--tag) ((i++)); continue ;;
       --) break ;;
-      --full|-o|--open) continue ;;
+      --full|-o|--open|-w|--with) continue ;;
       -*) continue ;;
       *) sub="${COMP_WORDS[i]}"; sub_idx=$i; break ;;
     esac
@@ -690,7 +691,7 @@ const BASH_COMPLETIONS: &str = r#"_grace_completions() {
     if [[ "$prev" == -t || "$prev" == --tag ]]; then
       return 0
     fi
-    COMPREPLY=( $(compgen -W "$cmds -t --tag -o --open --full -h --help -V --version" -- "$cur") )
+    COMPREPLY=( $(compgen -W "$cmds -t --tag -o --open -w --with --full -h --help -V --version" -- "$cur") )
     return 0
   fi
   case "$sub" in
@@ -707,13 +708,13 @@ const BASH_COMPLETIONS: &str = r#"_grace_completions() {
     list)
       COMPREPLY=( $(compgen -W "-t --tag --json" -- "$cur") ) ;;
     pick)
-      COMPREPLY=( $(compgen -W "-t --tag -o --open" -- "$cur") ) ;;
+      COMPREPLY=( $(compgen -W "-t --tag -o --open -w --with" -- "$cur") ) ;;
     sessions)
       COMPREPLY=( $(compgen -W "-l --list --json -o --open" -- "$cur") ) ;;
     pin|unpin|forget|diff|tree)
       COMPREPLY=( $(compgen -d -- "$cur") ) ;;
     hub)
-      COMPREPLY=( $(compgen -W "quit" -- "$cur") $(compgen -d -- "$cur") ) ;;
+      COMPREPLY=( $(compgen -W "quit --run-tool" -- "$cur") $(compgen -d -- "$cur") ) ;;
     tool)
       if (( sub_idx + 1 < COMP_CWORD )) && [[ "${COMP_WORDS[sub_idx+1]}" == add ]]; then
         COMPREPLY=( $(compgen -W "--tag --launch" -- "$cur") )
@@ -732,6 +733,7 @@ complete -c grace -s h -l help -d "Print help"
 complete -c grace -s V -l version -d "Print version"
 complete -c grace -n "__fish_use_subcommand" -s t -l tag -x -d "Filter by tool tag"
 complete -c grace -n "__fish_use_subcommand" -s o -l open -d "Launch last AI tool"
+complete -c grace -n "__fish_use_subcommand" -s w -l with -d "Open in app/editor/CLI launcher"
 complete -c grace -n "__fish_use_subcommand" -a "pick" -d "Open the folder picker"
 complete -c grace -n "__fish_use_subcommand" -a "list" -d "Print tracked folders"
 complete -c grace -n "__fish_use_subcommand" -a "pin" -d "Pin folder"
@@ -761,6 +763,7 @@ complete -c grace -n "__fish_seen_subcommand_from list" -s t -l tag -x -d "Filte
 complete -c grace -n "__fish_seen_subcommand_from list" -l json -d "Output JSON"
 complete -c grace -n "__fish_seen_subcommand_from pick" -s t -l tag -x -d "Filter by tool tag"
 complete -c grace -n "__fish_seen_subcommand_from pick" -s o -l open -d "Launch last AI tool"
+complete -c grace -n "__fish_seen_subcommand_from pick" -s w -l with -d "Open in app/editor/CLI launcher"
 complete -c grace -n "__fish_seen_subcommand_from sessions" -s l -l list -d "Print plain table"
 complete -c grace -n "__fish_seen_subcommand_from sessions" -l json -d "Output JSON"
 complete -c grace -n "__fish_seen_subcommand_from sessions" -s o -l open -d "Launch last AI tool"
@@ -770,6 +773,7 @@ complete -c grace -n "__fish_seen_subcommand_from tool; and not __fish_seen_subc
 complete -c grace -n "__fish_seen_subcommand_from tool; and __fish_seen_subcommand_from add" -l tag -x -d "Tag name for tool"
 complete -c grace -n "__fish_seen_subcommand_from tool; and __fish_seen_subcommand_from add" -l launch -x -d "Launch command"
 complete -c grace -n "__fish_seen_subcommand_from hub" -a "quit" -d "Stop hub"
+complete -c grace -n "__fish_seen_subcommand_from hub" -l run-tool -x -d "Start tool inside workspace"
 complete -c grace -n "__fish_seen_subcommand_from pin unpin forget diff tree hub" -a "(__fish_complete_directories)"
 "#;
 
@@ -783,7 +787,7 @@ const POWERSHELL_COMPLETIONS: &str = r#"Register-ArgumentCompleter -Native -Comm
   for ($i = 1; $i -lt $elems.Count; $i++) {
     if ($skipNext) { $skipNext = $false; continue }
     $t = $elems[$i]
-    if ($t -eq '--full' -or $t -eq '-o' -or $t -eq '--open' -or $t -like '--tag=*') { continue }
+    if ($t -eq '--full' -or $t -eq '-o' -or $t -eq '--open' -or $t -eq '-w' -or $t -eq '--with' -or $t -like '--tag=*') { continue }
     if ($t -ceq '-t' -or $t -ceq '--tag') { $skipNext = $true; continue }
     if ($t.StartsWith('-')) { continue }
     $sub = $t
@@ -793,7 +797,7 @@ const POWERSHELL_COMPLETIONS: &str = r#"Register-ArgumentCompleter -Native -Comm
   if ($skipNext -and $wordToComplete -ne '') { return }
   $typingSub = ($null -eq $sub) -or ($subIdx -eq ($elems.Count - 1) -and $wordToComplete -ne '')
   if ($typingSub) {
-    ($cmds + @('-t','--tag','-o','--open','--full','-h','--help','-V','--version')) | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+    ($cmds + @('-t','--tag','-o','--open','-w','--with','--full','-h','--help','-V','--version')) | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
       [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
     }
     return
@@ -813,9 +817,9 @@ const POWERSHELL_COMPLETIONS: &str = r#"Register-ArgumentCompleter -Native -Comm
     'doctor'      { @('--fix') }
     'prune'       { @('--dry-run','--older-than') }
     'list'        { @('-t','--tag','--json') }
-    'pick'        { @('-t','--tag','-o','--open') }
+    'pick'        { @('-t','--tag','-o','--open','-w','--with') }
     'sessions'    { @('-l','--list','--json','-o','--open') }
-    'hub'         { @('quit') }
+    'hub'         { @('quit','--run-tool') }
     'tool'        { if ('add' -cin $subArgs) { @('--tag','--launch') } else { @('add','rm','list') } }
     default       { @() }
   }

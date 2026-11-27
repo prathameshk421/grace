@@ -675,9 +675,354 @@ pub fn restrict_file_0600(path: &Path) {
     }
 }
 
-/// True if a process with this PID exists and belongs to us (non-zombie on Linux).
-#[cfg(unix)]
+/// Identity and state of one process, read from the OS.
+///
+/// `start` is an opaque start-time token. It only compares against other
+/// tokens from the same OS: microseconds since the epoch on macOS, clock
+/// ticks since boot on Linux, and FILETIME units (100 ns) on Windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcInfo {
+    pub ppid: i64,
+    pub start: i64,
+    /// The process exited, but its parent did not reap it yet.
+    pub zombie: bool,
+    /// The process belongs to our effective user. Always true on Windows
+    /// when the process opens for query.
+    pub mine: bool,
+    pub name: String,
+}
+
+/// Ancestor names that stop the agent walk: we left the agent's process tree.
+const PIN_DENY: &[&str] = &["launchd", "init", "systemd", "tmux", "sshd", "login"];
+
+/// Ancestor names that the agent walk steps over: shells and small wrappers
+/// between the agent and the hook.
+const PIN_SHIMS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "fish",
+    "ksh",
+    "env",
+    "nohup",
+    "timeout",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "bash.exe",
+    "sh.exe",
+];
+
+/// Most ancestor hops `agent_pin` follows.
+const PIN_MAX_HOPS: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinClass {
+    Deny,
+    Shim,
+    Agent,
+}
+
+/// Basename (split on `/` and `\`), lowercase, without a leading `-` (login shells).
+fn normalize_proc_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.trim_start_matches('-').to_ascii_lowercase()
+}
+
+/// Classify a name from `normalize_proc_name`.
+fn pin_class(norm: &str) -> PinClass {
+    if PIN_DENY.contains(&norm) {
+        PinClass::Deny
+    } else if PIN_SHIMS.contains(&norm) {
+        PinClass::Shim
+    } else {
+        PinClass::Agent
+    }
+}
+
+/// Walk up from `pid` (the parent of a process that started at `child_start`)
+/// and return `(pid, start)` of the first ancestor that is not a shim.
+/// `lookup` reads one process. Pure, so tests can feed a fake process table.
+fn pin_walk(
+    mut pid: i64,
+    mut child_start: i64,
+    lookup: impl Fn(i64) -> Option<ProcInfo>,
+) -> Option<(i64, i64)> {
+    for _ in 0..PIN_MAX_HOPS {
+        if pid <= 1 {
+            return None;
+        }
+        let info = lookup(pid)?;
+        // A parent that started after its child is a reused PID.
+        if !info.mine || info.zombie || info.start > child_start {
+            return None;
+        }
+        match pin_class(&normalize_proc_name(&info.name)) {
+            PinClass::Deny => return None,
+            PinClass::Agent => return Some((pid, info.start)),
+            PinClass::Shim => {
+                child_start = info.start;
+                pid = info.ppid;
+            }
+        }
+    }
+    None
+}
+
+/// Parse the text of `/proc/<pid>/stat`. The name sits between the first `(`
+/// and the last `)`, so names with spaces or `)` parse correctly.
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_proc_stat(stat: &str, mine: bool) -> Option<ProcInfo> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let name = stat[open + 1..close].to_string();
+    let fields: Vec<&str> = stat[close + 1..].split_ascii_whitespace().collect();
+    let state = *fields.first()?;
+    let ppid = fields.get(1)?.parse::<i64>().ok()?;
+    let start = fields.get(19)?.parse::<i64>().ok()?;
+    Some(ProcInfo {
+        ppid,
+        start,
+        zombie: matches!(state, "Z" | "X"),
+        mine,
+        name,
+    })
+}
+
+/// Bytes of a C name buffer up to the first NUL.
+#[cfg(target_os = "macos")]
+fn c_name(buf: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&b| b != 0)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Read identity and state of a process. `None` when it does not exist or
+/// the OS does not let us read it.
+#[cfg(target_os = "macos")]
+pub fn proc_info(pid: i64) -> Option<ProcInfo> {
+    if pid <= 0 || pid > libc::c_int::MAX as i64 {
+        return None;
+    }
+    // SAFETY: `proc_bsdinfo` is a plain C struct of integers and byte arrays,
+    // so all-zero bytes are a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer points to a live `proc_bsdinfo` of exactly `size` bytes,
+    // and the kernel writes at most `size` bytes into it.
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret != size {
+        return None;
+    }
+    let start = (info.pbi_start_tvsec as i64)
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec as i64);
+    let mut name = c_name(&info.pbi_name);
+    if name.is_empty() {
+        name = c_name(&info.pbi_comm);
+    }
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    Some(ProcInfo {
+        ppid: info.pbi_ppid as i64,
+        start,
+        // SZOMB in <sys/proc.h>.
+        zombie: info.pbi_status == 5,
+        mine: info.pbi_uid == euid,
+        name,
+    })
+}
+
+/// Read identity and state of a process. `None` when it does not exist or
+/// the OS does not let us read it.
+#[cfg(target_os = "linux")]
+pub fn proc_info(pid: i64) -> Option<ProcInfo> {
+    use std::os::unix::fs::MetadataExt;
+    if pid <= 0 || pid > i32::MAX as i64 {
+        return None;
+    }
+    let stat = read_to_string_capped(Path::new(&format!("/proc/{pid}/stat")), 1024).ok()?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let mine = std::fs::metadata(format!("/proc/{pid}"))
+        .ok()
+        .is_some_and(|m| m.uid() == euid);
+    parse_linux_proc_stat(&stat, mine)
+}
+
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const STILL_ACTIVE: u32 = 259;
+
+    /// A process handle that closes on drop.
+    struct Handle(HANDLE);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from a successful `OpenProcess` and is closed once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// `(running, creation_time)` of a process. `None` when it does not open.
+    pub(super) fn query(pid: i64) -> Option<(bool, Option<i64>)> {
+        if pid <= 0 || pid > u32::MAX as i64 {
+            return None;
+        }
+        // SAFETY: plain Win32 call. A null result means failure.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+        if h.is_null() {
+            return None;
+        }
+        let h = Handle(h);
+        let mut code: u32 = 0;
+        // SAFETY: `h` is a valid process handle and `code` is a valid out pointer.
+        let running = unsafe { GetExitCodeProcess(h.0, &mut code) } != 0 && code == STILL_ACTIVE;
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: `h` is a valid process handle and all four out pointers are valid.
+        let ok = unsafe { GetProcessTimes(h.0, &mut created, &mut exited, &mut kernel, &mut user) };
+        let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        let start = (ok != 0).then_some(ticks as i64);
+        Some((running, start))
+    }
+
+    /// `pid -> (ppid, exe name)` for every process, from one ToolHelp snapshot.
+    pub(super) fn process_table() -> std::collections::HashMap<i64, (i64, String)> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let mut out = std::collections::HashMap::new();
+        // SAFETY: plain Win32 call. `INVALID_HANDLE_VALUE` means failure.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return out;
+        }
+        let snap = Handle(snap);
+        // SAFETY: `PROCESSENTRY32W` is a plain C struct, so all-zero bytes are valid.
+        let mut e: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: `snap` is a valid snapshot handle and `e` has `dwSize` set.
+        let mut more = unsafe { Process32FirstW(snap.0, &mut e) } != 0;
+        while more {
+            let len = e
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(e.szExeFile.len());
+            let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+            out.insert(e.th32ProcessID as i64, (e.th32ParentProcessID as i64, name));
+            // SAFETY: same handle and buffer as above.
+            more = unsafe { Process32NextW(snap.0, &mut e) } != 0;
+        }
+        out
+    }
+}
+
+/// Read identity and state of a process. `None` when it does not open.
+/// Takes a ToolHelp snapshot for `ppid` and `name`, so it costs a few ms.
+#[cfg(windows)]
+pub fn proc_info(pid: i64) -> Option<ProcInfo> {
+    let (running, start) = win::query(pid)?;
+    let start = start?;
+    let (ppid, name) = win::process_table()
+        .remove(&pid)
+        .unwrap_or((0, String::new()));
+    Some(ProcInfo {
+        ppid,
+        start,
+        zombie: !running,
+        mine: true,
+        name,
+    })
+}
+
+/// Read identity and state of a process. Not supported on this OS.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub fn proc_info(_pid: i64) -> Option<ProcInfo> {
+    None
+}
+
+/// Start-time token of a process, as `ProcInfo::start`. On Windows this
+/// skips the ToolHelp snapshot that `proc_info` takes.
+pub fn proc_start(pid: i64) -> Option<i64> {
+    #[cfg(windows)]
+    {
+        match win::query(pid)? {
+            (true, start) => start,
+            (false, _) => None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        proc_info(pid).filter(|i| !i.zombie).map(|i| i.start)
+    }
+}
+
+/// True if the process with this PID exists, belongs to us and is not a zombie.
+/// With `expected_start`, the process must also have that start time, so a
+/// reused PID counts as dead.
+pub fn pid_alive_at(pid: i64, expected_start: Option<i64>) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    match expected_start {
+        Some(exp) => alive_with_start(pid, exp),
+        None => pid_exists(pid),
+    }
+}
+
+/// True if a process with this PID exists and belongs to us (not a zombie).
+/// Same as `pid_alive_at(pid, None)`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn pid_alive(pid: i64) -> bool {
+    pid_alive_at(pid, None)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn alive_with_start(pid: i64, exp: i64) -> bool {
+    proc_info(pid).is_some_and(|i| !i.zombie && i.mine && i.start == exp)
+}
+
+#[cfg(windows)]
+fn alive_with_start(pid: i64, exp: i64) -> bool {
+    matches!(win::query(pid), Some((true, Some(start))) if start == exp)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn alive_with_start(pid: i64, _exp: i64) -> bool {
+    pid_exists(pid)
+}
+
+#[cfg(unix)]
+fn pid_exists(pid: i64) -> bool {
     if pid <= 0 || pid > i32::MAX as i64 {
         return false;
     }
@@ -687,47 +1032,54 @@ pub fn pid_alive(pid: i64) -> bool {
     if !exists {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        if let Some(after) = stat.rsplit(')').next() {
-            if let Some(state) = after.trim_start().chars().next() {
-                if matches!(state, 'Z' | 'X') {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-/// True if a process with this PID exists and is accessible.
-#[cfg(windows)]
-pub fn pid_alive(pid: i64) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    const STILL_ACTIVE: u32 = 259;
-    if pid <= 0 || pid > u32::MAX as i64 {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if proc_info(pid).is_some_and(|i| i.zombie) {
         return false;
     }
-    // SAFETY: plain Win32 calls. The handle is closed before return.
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
-        if h.is_null() {
-            return false;
-        }
-        let mut code: u32 = 0;
-        let ok = GetExitCodeProcess(h, &mut code) != 0;
-        CloseHandle(h);
-        ok && code == STILL_ACTIVE
-    }
+    true
 }
 
-/// True if a process with this PID exists. Unknown platform: assume yes.
+#[cfg(windows)]
+fn pid_exists(pid: i64) -> bool {
+    matches!(win::query(pid), Some((true, _)))
+}
+
+/// Unknown platform: assume the process exists.
 #[cfg(not(any(unix, windows)))]
-pub fn pid_alive(_pid: i64) -> bool {
+fn pid_exists(_pid: i64) -> bool {
     true
+}
+
+/// PID and start time of the agent CLI that runs this process: the first
+/// ancestor that is not a shell or wrapper. Hooks call this to pin a session
+/// to its agent. `None` when the walk reaches a deny-listed process
+/// (launchd, tmux, sshd...), a process of another user, or 6 hops.
+#[cfg(not(windows))]
+pub fn agent_pin() -> Option<(i64, i64)> {
+    let me = proc_info(std::process::id() as i64)?;
+    pin_walk(me.ppid, me.start, proc_info)
+}
+
+/// PID and start time of the agent CLI that runs this process. One ToolHelp
+/// snapshot gives the tree; each hop checks that the parent started before
+/// its child, so a reused parent PID stops the walk.
+#[cfg(windows)]
+pub fn agent_pin() -> Option<(i64, i64)> {
+    let table = win::process_table();
+    let me = std::process::id() as i64;
+    let my_start = win::query(me)?.1?;
+    let my_ppid = table.get(&me)?.0;
+    pin_walk(my_ppid, my_start, |pid| {
+        let (ppid, name) = table.get(&pid)?.clone();
+        let (running, start) = win::query(pid)?;
+        Some(ProcInfo {
+            ppid,
+            start: start?,
+            zombie: !running,
+            mine: true,
+            name,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -812,6 +1164,151 @@ mod tests {
         assert!(!pid_alive(999_999_999));
         assert!(!pid_alive(0));
         assert!(!pid_alive(-5));
+        assert!(!pid_alive_at(0, Some(1)));
+        assert!(!pid_alive_at(-5, None));
+        assert!(!pid_alive_at(999_999_999, Some(1)));
+    }
+
+    /// The running test reads its own identity, and only its own start time
+    /// counts as alive.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn self_proc_info_and_start_check() {
+        let me = std::process::id() as i64;
+        let info = proc_info(me).expect("proc_info(self)");
+        assert!(!info.zombie);
+        assert!(info.mine);
+        assert!(info.start > 0);
+        assert!(!info.name.is_empty());
+        #[cfg(unix)]
+        assert_eq!(info.ppid, std::os::unix::process::parent_id() as i64);
+        assert_eq!(proc_start(me), Some(info.start));
+        assert!(pid_alive_at(me, Some(info.start)));
+        assert!(!pid_alive_at(me, Some(info.start + 1)));
+        assert!(pid_alive_at(me, None));
+        // The parent started before us.
+        let parent = proc_info(info.ppid).expect("proc_info(parent)");
+        assert!(parent.start <= info.start);
+        assert!(proc_info(999_999_999).is_none());
+    }
+
+    #[test]
+    fn proc_name_normalization_and_classes() {
+        assert_eq!(normalize_proc_name("-zsh"), "zsh");
+        assert_eq!(normalize_proc_name("/bin/Bash"), "bash");
+        assert_eq!(
+            normalize_proc_name(r"C:\Windows\System32\cmd.exe"),
+            "cmd.exe"
+        );
+        assert_eq!(normalize_proc_name("PwSh.EXE"), "pwsh.exe");
+        assert_eq!(normalize_proc_name("node"), "node");
+        for n in ["launchd", "init", "systemd", "tmux", "sshd", "login"] {
+            assert_eq!(pin_class(n), PinClass::Deny, "{n}");
+        }
+        for n in [
+            "sh", "bash", "zsh", "fish", "env", "nohup", "timeout", "cmd.exe", "pwsh.exe",
+        ] {
+            assert_eq!(pin_class(n), PinClass::Shim, "{n}");
+        }
+        for n in [
+            "node", "bun", "python", "python3", "claude", "codex", "node.exe",
+        ] {
+            assert_eq!(pin_class(n), PinClass::Agent, "{n}");
+        }
+    }
+
+    fn fake(ppid: i64, start: i64, name: &str) -> ProcInfo {
+        ProcInfo {
+            ppid,
+            start,
+            zombie: false,
+            mine: true,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn pin_walk_skips_shims_and_stops_at_deny() {
+        use std::collections::HashMap;
+        let table: HashMap<i64, ProcInfo> = [
+            (1, fake(0, 1, "launchd")),
+            (10, fake(1, 10, "login")),
+            (20, fake(10, 20, "-zsh")),
+            (30, fake(20, 30, "node")),
+            (40, fake(30, 40, "/bin/sh")),
+            (50, fake(40, 50, "env")),
+        ]
+        .into_iter()
+        .collect();
+        let look = |pid: i64| table.get(&pid).cloned();
+        // hook (start 60) -> env -> sh -> node: pins node.
+        assert_eq!(pin_walk(50, 60, look), Some((30, 30)));
+        // From zsh: login is on the deny list.
+        assert_eq!(pin_walk(20, 25, look), None);
+        // PID 1 and below stop the walk.
+        assert_eq!(pin_walk(1, 5, look), None);
+        assert_eq!(pin_walk(0, 5, look), None);
+        // Unknown parent.
+        assert_eq!(pin_walk(99, 100, look), None);
+        // A parent that started after its child is a reused PID.
+        assert_eq!(pin_walk(30, 29, look), None);
+    }
+
+    #[test]
+    fn pin_walk_rejects_foreign_zombie_and_deep_chains() {
+        let foreign = |_: i64| {
+            Some(ProcInfo {
+                mine: false,
+                ..fake(1, 1, "node")
+            })
+        };
+        assert_eq!(pin_walk(5, 10, foreign), None);
+        let zombie = |_: i64| {
+            Some(ProcInfo {
+                zombie: true,
+                ..fake(1, 1, "node")
+            })
+        };
+        assert_eq!(pin_walk(5, 10, zombie), None);
+        // Shells all the way up: the walk stops after 6 hops.
+        let shells = |pid: i64| Some(fake(pid - 1, pid, "bash"));
+        assert_eq!(pin_walk(100, 1000, shells), None);
+        // Five shells, then an agent: within 6 hops.
+        let near = |pid: i64| Some(fake(pid - 1, pid, if pid == 95 { "claude" } else { "sh" }));
+        assert_eq!(pin_walk(100, 1000, near), Some((95, 95)));
+    }
+
+    #[test]
+    fn linux_proc_stat_parser() {
+        let tail = |state: &str| {
+            let mut f = vec![state.to_string(), "4242".into()];
+            f.extend((2..19).map(|i| i.to_string()));
+            f.push("987654".into());
+            f.extend(["0".into(), "1".into()]);
+            f.join(" ")
+        };
+        let s = format!("123 (my prog) x) {}\n", tail("S"));
+        let p = parse_linux_proc_stat(&s, true).unwrap();
+        assert_eq!(
+            p,
+            ProcInfo {
+                ppid: 4242,
+                start: 987654,
+                zombie: false,
+                mine: true,
+                name: "my prog) x".into(),
+            }
+        );
+        let z = parse_linux_proc_stat(&format!("7 (sh) {}", tail("Z")), false).unwrap();
+        assert!(z.zombie && !z.mine);
+        assert!(
+            parse_linux_proc_stat(&format!("7 (sh) {}", tail("X")), true)
+                .unwrap()
+                .zombie
+        );
+        assert!(parse_linux_proc_stat("7 (sh) S 1 2", true).is_none());
+        assert!(parse_linux_proc_stat("garbage", true).is_none());
+        assert!(parse_linux_proc_stat(") 7 (", true).is_none());
     }
 
     #[test]

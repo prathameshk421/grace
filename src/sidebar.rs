@@ -1,4 +1,6 @@
 //! The hub sidebar: live agents by status, then folders by frecency. Type to filter.
+use crate::editors_live::OpenEditor;
+use crate::launcher::{InstalledTarget, LaunchChoice, LaunchMenu, LaunchRow, TargetKind};
 use crate::model::{Entry, Status};
 use crate::picker::{self, best_by_path, split_path, Best, Data};
 use crate::platform;
@@ -20,9 +22,13 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-const HINTS: [(&str, &str); 2] = [("⏎", "go"), ("^o", "resume")];
+const HINTS: [(&str, &str); 3] = [("⏎", "go"), ("^o", "run"), ("→", "open")];
+const LAUNCH_HINTS: [(&str, &str); 3] = [("1-9", "go"), ("←", "back"), ("⏎", "open")];
 const GROUPS: [Status; 4] = [
     Status::Waiting,
     Status::Ready,
@@ -69,8 +75,16 @@ pub fn build_rows(entries: &[Entry], best: &Best, query: &str) -> Vec<Row> {
     rows
 }
 
-pub type Reload<'a> = Box<dyn FnMut() -> Option<(Data, Vec<String>)> + 'a>;
+pub struct ReloadTick {
+    pub visible: bool,
+    pub data: Option<(Data, Vec<String>)>,
+}
+
+pub type Reload<'a> = Box<dyn FnMut(bool) -> ReloadTick + 'a>;
 pub type Go<'a> = Box<dyn FnMut(&Entry, bool) -> Result<(), String> + 'a>;
+pub type DiscoverFn<'a> = Box<dyn FnMut() -> (Vec<InstalledTarget>, Vec<OpenEditor>) + 'a>;
+pub type LaunchFn<'a> =
+    Box<dyn FnMut(&Entry, &LaunchChoice, &[OpenEditor]) -> Result<String, String> + 'a>;
 
 pub struct Sidebar<'a> {
     data: Data,
@@ -91,14 +105,25 @@ pub struct Sidebar<'a> {
     home: Option<String>,
     theme: Theme,
     focused: bool,
+    visible: bool,
+    force_refresh: bool,
     meta_cache: String,
     start: Instant,
     toast: Option<Toast>,
     animating: bool,
     list_area: Rect,
+    launch_header_area: Rect,
+    launch_list_area: Rect,
     last_click: DoubleClick,
     reload: Reload<'a>,
     go: Go<'a>,
+    installed: Option<Vec<InstalledTarget>>,
+    open_editors: Vec<OpenEditor>,
+    global_counts: HashMap<String, i64>,
+    launch_menu: Option<(Entry, LaunchMenu)>,
+    bg_rx: Option<Receiver<(Vec<InstalledTarget>, Vec<OpenEditor>)>>,
+    discover: Option<DiscoverFn<'a>>,
+    launch: Option<LaunchFn<'a>>,
 }
 
 impl<'a> Sidebar<'a> {
@@ -130,14 +155,25 @@ impl<'a> Sidebar<'a> {
             home,
             theme,
             focused: true,
+            visible: true,
+            force_refresh: false,
             meta_cache: String::new(),
             start: Instant::now(),
             toast: None,
             animating: false,
             list_area: Rect::default(),
+            launch_header_area: Rect::default(),
+            launch_list_area: Rect::default(),
             last_click: DoubleClick::default(),
             reload,
             go,
+            installed: None,
+            open_editors: Vec::new(),
+            global_counts: HashMap::new(),
+            launch_menu: None,
+            bg_rx: None,
+            discover: None,
+            launch: None,
         };
         s.set_data(data, hub_paths);
         let cur = s.current.clone();
@@ -145,9 +181,37 @@ impl<'a> Sidebar<'a> {
         s
     }
 
+    pub fn with_launcher(
+        mut self,
+        global_counts: HashMap<String, i64>,
+        bg_rx: Option<Receiver<(Vec<InstalledTarget>, Vec<OpenEditor>)>>,
+        discover: Option<DiscoverFn<'a>>,
+        launch: Option<LaunchFn<'a>>,
+    ) -> Self {
+        if !global_counts.is_empty() {
+            self.global_counts = global_counts;
+        }
+        self.bg_rx = bg_rx;
+        self.discover = discover;
+        self.launch = launch;
+        self
+    }
+
+    pub fn with_visible(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
     fn set_data(&mut self, data: Data, hub_paths: Vec<String>) {
         let keep = self.selected_entry().map(|e| e.path.clone());
         self.best = best_by_path(&data.sessions);
+        self.global_counts.clear();
+        for e in &data.entries {
+            for t in &e.tags {
+                let c = self.global_counts.entry(t.tool.clone()).or_insert(0);
+                *c = c.saturating_add(t.count.max(0));
+            }
+        }
         self.data = data;
         self.hub_paths = hub_paths;
         self.refilter(keep.as_deref());
@@ -213,6 +277,69 @@ impl<'a> Sidebar<'a> {
             self.refilter(Some(&e.path));
         }
     }
+
+    fn ensure_installed(&mut self) {
+        if self.installed.is_none() {
+            if let Some(rx) = &self.bg_rx {
+                if let Ok((inst, open)) = rx.try_recv() {
+                    self.installed = Some(inst);
+                    self.open_editors = open;
+                    self.bg_rx = None;
+                }
+            }
+        }
+        if self.installed.is_none() {
+            if let Some(cb) = self.discover.as_mut() {
+                let (inst, open) = cb();
+                self.installed = Some(inst);
+                self.open_editors = open;
+                self.bg_rx = None;
+            }
+        }
+    }
+
+    fn open_launch_drawer(&mut self) {
+        let Some(e) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.ensure_installed();
+        let installed = self.installed.as_deref().unwrap_or(&[]);
+        let open_here: Vec<OpenEditor> = self
+            .open_editors
+            .iter()
+            .filter(|o| platform::same_path(&o.path, &e.path))
+            .cloned()
+            .collect();
+        let active = self.best.get(&e.path);
+        let menu = LaunchMenu::new(
+            &e,
+            installed,
+            &open_here,
+            active,
+            &self.global_counts,
+            true,
+            true,
+            true,
+        );
+        self.launch_menu = Some((e, menu));
+    }
+
+    fn execute_launch(&mut self, target: InstalledTarget) {
+        let Some((entry, _)) = self.launch_menu.take() else {
+            return;
+        };
+        let Some(cb) = self.launch.as_mut() else {
+            return;
+        };
+        let choice = LaunchChoice {
+            target,
+            force_shell: false,
+        };
+        match cb(&entry, &choice, &self.open_editors) {
+            Ok(msg) => self.flash(&msg, ToastKind::Success),
+            Err(err) => self.flash(&err, ToastKind::Error),
+        }
+    }
 }
 
 fn picker_first(rows: &[Row]) -> Option<usize> {
@@ -228,7 +355,53 @@ impl tui::App for Sidebar<'_> {
         self.focused = focused;
     }
 
+    fn poll_bg(&mut self) -> bool {
+        if let Some(rx) = &self.bg_rx {
+            if let Ok((inst, open)) = rx.try_recv() {
+                self.installed = Some(inst);
+                self.open_editors = open;
+                self.bg_rx = None;
+                return self.launch_menu.is_some();
+            }
+        }
+        false
+    }
+
+    fn loading(&self) -> bool {
+        self.bg_rx.is_some() && self.launch_menu.is_some()
+    }
+
     fn mouse(&mut self, m: MouseEvent) -> Flow {
+        if let Some((_, ref mut menu)) = self.launch_menu {
+            match m.kind {
+                MouseEventKind::ScrollUp => menu.mv(-1),
+                MouseEventKind::ScrollDown => menu.mv(1),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let pos = ratatui::layout::Position {
+                        x: m.column,
+                        y: m.row,
+                    };
+                    if self.launch_header_area.contains(pos) {
+                        self.launch_menu = None;
+                        return Flow::Continue;
+                    }
+                    if self.launch_list_area.contains(pos) {
+                        let idx = menu.offset + (m.row - self.launch_list_area.y) as usize;
+                        if matches!(menu.rows.get(idx), Some(LaunchRow::Item(_))) {
+                            let dbl = self.last_click.click(idx);
+                            menu.selected = idx;
+                            if dbl {
+                                if let Some(item) = menu.selected_item().cloned() {
+                                    self.execute_launch(item.target);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Flow::Continue;
+        }
         match m.kind {
             MouseEventKind::ScrollUp => self.mv(-1),
             MouseEventKind::ScrollDown => self.mv(1),
@@ -255,11 +428,53 @@ impl tui::App for Sidebar<'_> {
 
     fn key(&mut self, k: KeyEvent) -> Flow {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some((_, ref mut menu)) = self.launch_menu {
+            match k.code {
+                KeyCode::Esc | KeyCode::Left => {
+                    self.launch_menu = None;
+                }
+                KeyCode::Char('c') if ctrl => {
+                    self.launch_menu = None;
+                }
+                KeyCode::Tab | KeyCode::BackTab => menu.toggle_section(),
+                KeyCode::Up => menu.mv(-1),
+                KeyCode::Down => menu.mv(1),
+                KeyCode::Char('p') | KeyCode::Char('k') if ctrl => menu.mv(-1),
+                KeyCode::Char('n') | KeyCode::Char('j') if ctrl => menu.mv(1),
+                KeyCode::PageUp => menu.mv(-10),
+                KeyCode::PageDown => menu.mv(10),
+                KeyCode::Enter => {
+                    if let Some(item) = menu.selected_item().cloned() {
+                        self.execute_launch(item.target);
+                    }
+                }
+                KeyCode::Char('w') if ctrl => menu.delete_word(),
+                KeyCode::Char('u') if ctrl => menu.clear_query(),
+                KeyCode::Backspace => {
+                    menu.query.pop();
+                    menu.refilter();
+                }
+                KeyCode::Char(c) if is_plain_char(&k) => {
+                    if menu.query.is_empty() {
+                        if let Some(item) = menu.item_for_hotkey(c).cloned() {
+                            self.execute_launch(item.target);
+                            return Flow::Continue;
+                        }
+                    }
+                    menu.query.push(c);
+                    menu.refilter();
+                }
+                _ => {}
+            }
+            return Flow::Continue;
+        }
         match k.code {
             KeyCode::Esc => self.clear_query(),
             KeyCode::Char('c') | KeyCode::Char('u') if ctrl => self.clear_query(),
             KeyCode::Enter => self.choose(false),
             KeyCode::Char('o') if ctrl => self.choose(true),
+            KeyCode::Right => self.open_launch_drawer(),
+            KeyCode::Char('l') if ctrl => self.open_launch_drawer(),
             KeyCode::Up => self.mv(-1),
             KeyCode::Down => self.mv(1),
             KeyCode::Char('p') | KeyCode::Char('k') if ctrl => self.mv(-1),
@@ -287,7 +502,14 @@ impl tui::App for Sidebar<'_> {
         if expired {
             self.toast = None;
         }
-        if let Some((d, hp)) = (self.reload)() {
+        let force = std::mem::take(&mut self.force_refresh);
+        let was_visible = self.visible;
+        let tick = (self.reload)(force);
+        self.visible = tick.visible;
+        if !self.visible {
+            return expired;
+        }
+        if let Some((d, hp)) = tick.data {
             let changed = d.entries != self.data.entries
                 || d.sessions != self.data.sessions
                 || hp != self.hub_paths;
@@ -296,7 +518,7 @@ impl tui::App for Sidebar<'_> {
                 return true;
             }
         }
-        expired
+        expired || !was_visible
     }
 
     fn every(&self) -> Duration {
@@ -304,7 +526,17 @@ impl tui::App for Sidebar<'_> {
     }
 
     fn animating(&self) -> bool {
-        self.animating
+        self.animating && self.visible
+    }
+
+    fn wake(&mut self) {
+        if !self.visible {
+            self.force_refresh = true;
+        }
+    }
+
+    fn wants_refresh_now(&self) -> bool {
+        self.force_refresh
     }
 }
 
@@ -355,14 +587,27 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
         let fw = foot.width as usize;
         let line = match &active_toast {
             Some(toast) => toast_line(toast, fw, t),
-            None => hint_line(&HINTS, fw, t),
+            None => {
+                let pairs = if sb.launch_menu.is_some() {
+                    &LAUNCH_HINTS[..]
+                } else {
+                    &HINTS[..]
+                };
+                hint_line(pairs, fw, t)
+            }
         };
         f.render_widget(Paragraph::new(line), foot);
     }
 
     sb.animating = false;
     sb.list_area = Rect::default();
+    sb.launch_header_area = Rect::default();
+    sb.launch_list_area = Rect::default();
     if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if sb.launch_menu.is_some() {
+        draw_launch_drawer(f, inner, sb);
         return;
     }
     let iw = inner.width as usize;
@@ -485,6 +730,182 @@ fn draw(f: &mut Frame, sb: &mut Sidebar) {
     f.render_widget(Paragraph::new(lines), list);
     if let Some(sb_area) = sb_area {
         render_scrollbar(f, sb_area, sb.rows.len(), sb.offset, h, t);
+    }
+}
+
+fn draw_launch_drawer(f: &mut Frame, inner: Rect, sb: &mut Sidebar) {
+    let t = sb.theme;
+    let focused = sb.focused;
+    let Some((_, ref mut menu)) = sb.launch_menu else {
+        return;
+    };
+    let iw = inner.width as usize;
+    let arrow = if t.ascii { "<" } else { "←" };
+    let hdr_area = Rect { height: 1, ..inner };
+    sb.launch_header_area = hdr_area;
+    let hdr_txt = cut(&format!(" {arrow} {}", menu.folder_name), iw);
+    f.render_widget(
+        Paragraph::new(Span::styled(hdr_txt, t.title_accent())),
+        hdr_area,
+    );
+    if inner.height < 2 {
+        return;
+    }
+
+    let q = cut_tail(&menu.query, iw.saturating_sub(5));
+    let mut q_spans = vec![
+        Span::raw(" "),
+        Span::styled("❯ ", t.title_accent()),
+        Span::raw(q),
+    ];
+    if focused {
+        q_spans.push(Span::styled(
+            " ",
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+    }
+    if menu.query.is_empty() && iw > 12 {
+        q_spans.push(Span::styled(" filter", t.muted()));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(q_spans)),
+        Rect {
+            y: inner.y + 1,
+            height: 1,
+            ..inner
+        },
+    );
+
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    if body.height == 0 {
+        return;
+    }
+    if menu.rows.is_empty() {
+        center_msg(f, body, "No matches", t);
+        return;
+    }
+    let h = body.height as usize;
+    menu.offset = picker::scroll_by(
+        menu.rows.len(),
+        |idx| matches!(menu.rows[idx], LaunchRow::Header(_)),
+        menu.selected,
+        menu.offset,
+        h,
+    );
+    let (list, sb_area) = slice_scrollbar(body, menu.rows.len(), h);
+    sb.launch_list_area = list;
+    let lw = list.width as usize;
+    let mut lines = Vec::new();
+    for ri in menu.offset..menu.rows.len().min(menu.offset + h) {
+        let row = menu.rows[ri];
+        match row {
+            LaunchRow::Header(hdr) => {
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        cut(hdr, lw.saturating_sub(1)),
+                        t.muted().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            LaunchRow::Item(idx) => {
+                let item = &menu.items[idx];
+                let sel = ri == menu.selected;
+                let mut base = Style::default();
+                if sel {
+                    let bg = if focused { t.sel_bg() } else { t.sel_bg_dim() };
+                    if let Some(bg) = bg {
+                        base = base.bg(bg);
+                    }
+                }
+                let bar_style = if focused {
+                    t.fg(base, t.accent())
+                } else {
+                    t.fg(base, t.border_color())
+                };
+                let mut spans = vec![Span::styled(
+                    if sel { t.bar_glyph() } else { " " },
+                    bar_style,
+                )];
+                if let Some(hk) = menu.hotkey_for_row(ri) {
+                    spans.push(Span::styled(
+                        format!("{hk} "),
+                        base.patch(t.keycap_style()).patch(t.muted()),
+                    ));
+                } else {
+                    spans.push(Span::styled("  ", base));
+                }
+                let badge_txt: Cow<'_, str> = if item.is_open {
+                    if lw < 36 {
+                        Cow::Borrowed(t.editor_glyph())
+                    } else {
+                        Cow::Borrowed("open")
+                    }
+                } else if item.badge == "live" {
+                    if lw < 36 {
+                        Cow::Borrowed(if t.ascii { "!" } else { "●" })
+                    } else {
+                        Cow::Borrowed("live")
+                    }
+                } else if lw < 36 && matches!(item.badge.as_str(), "last used" | "last AI") {
+                    Cow::Borrowed(t.star())
+                } else if lw < 32 {
+                    Cow::Borrowed("")
+                } else {
+                    Cow::Borrowed(item.badge.as_str())
+                };
+                let badge_w = if badge_txt.is_empty() {
+                    0
+                } else {
+                    sw(&badge_txt) + 1
+                };
+                let avail = lw.saturating_sub(4 + badge_w);
+                let label_clean = platform::sanitize_display(&item.target.label);
+                let fit = fit_end(&label_clean, avail);
+                let label_style = match item.target.kind {
+                    TargetKind::HubShell | TargetKind::Travel => {
+                        if sel {
+                            t.fg(base, t.accent()).add_modifier(Modifier::BOLD)
+                        } else {
+                            base.patch(t.muted())
+                        }
+                    }
+                    _ => {
+                        let s = t.fg(base, t.tag_color(&item.target.tag));
+                        if sel {
+                            s.add_modifier(Modifier::BOLD)
+                        } else {
+                            s
+                        }
+                    }
+                };
+                let mut used = 0usize;
+                push_fit_coalesced(&mut spans, &mut used, &fit, &[], label_style, label_style);
+                let pad = lw.saturating_sub(3 + used + badge_w + 1);
+                spans.push(Span::styled(spaces(pad), base));
+                if !badge_txt.is_empty() {
+                    let b_style = if item.is_open {
+                        t.fg(base, t.open_blue())
+                    } else if item.badge == "live" || item.badge.starts_with("last") {
+                        t.fg(base, t.accent())
+                    } else {
+                        base.patch(t.muted())
+                    };
+                    spans.push(Span::styled(" ", base));
+                    spans.push(Span::styled(badge_txt.into_owned(), b_style));
+                }
+                spans.push(Span::styled(" ", base));
+                lines.push(Line::from(spans));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), list);
+    if let Some(sb_area) = sb_area {
+        render_scrollbar(f, sb_area, menu.rows.len(), menu.offset, h, t);
     }
 }
 
@@ -616,6 +1037,9 @@ mod tests {
             tool: tool.into(),
             status,
             shell_pid: None,
+            shell_start: None,
+            agent_pid: None,
+            agent_start: None,
             started_at: 0,
             updated_at: 1,
             session_id: None,
@@ -638,6 +1062,7 @@ mod tests {
             ],
             editors: vec![],
             branches: HashMap::new(),
+            installed: None,
         }
     }
 
@@ -648,7 +1073,10 @@ mod tests {
             "/h/notes",
             Theme::dark(),
             Some("/h".into()),
-            Box::new(|| None),
+            Box::new(|_| ReloadTick {
+                visible: true,
+                data: None,
+            }),
             go,
         )
     }
@@ -743,5 +1171,179 @@ mod tests {
             tall.contains("NEEDS YOU") && tall.contains("notes"),
             "{tall}"
         );
+    }
+
+    fn mock_installed() -> Vec<InstalledTarget> {
+        use crate::launcher::LaunchMethod;
+        vec![
+            InstalledTarget {
+                id: "antigravity".into(),
+                label: "Antigravity".into(),
+                tag: "antigravity".into(),
+                kind: TargetKind::GuiApp,
+                method: LaunchMethod::Gui {
+                    prog: "open".into(),
+                    args_before: vec!["-a".into(), "Antigravity".into()],
+                    pass_path: false,
+                    focus_only: true,
+                },
+            },
+            InstalledTarget {
+                id: "cli:claude".into(),
+                label: "claude".into(),
+                tag: "claude".into(),
+                kind: TargetKind::CliAgent,
+                method: LaunchMethod::CliAgent {
+                    tool_tag: "claude".into(),
+                    launch_cmd: "claude".into(),
+                },
+            },
+            InstalledTarget {
+                id: "cli:opencode".into(),
+                label: "opencode".into(),
+                tag: "opencode".into(),
+                kind: TargetKind::CliAgent,
+                method: LaunchMethod::CliAgent {
+                    tool_tag: "opencode".into(),
+                    launch_cmd: "opencode".into(),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn launch_drawer_opens_filters_and_fires_hotkeys() {
+        let launched = std::cell::RefCell::new(Vec::new());
+        let mut sb = sidebar(Box::new(|_, _| Ok(()))).with_launcher(
+            HashMap::new(),
+            None,
+            Some(Box::new(|| (mock_installed(), Vec::new()))),
+            Some(Box::new(|e, c, _| {
+                launched
+                    .borrow_mut()
+                    .push((e.path.clone(), c.target.id.clone()));
+                Ok(format!("started {}", c.target.label))
+            })),
+        );
+        // Move to knn (/h/code/knn) and open drawer with Right.
+        sb.mv(-10);
+        sb.mv(1);
+        assert_eq!(sb.selected_entry().unwrap().path, "/h/code/knn");
+        sb.key(KeyEvent::from(KeyCode::Right));
+        assert!(sb.launch_menu.is_some());
+
+        // Narrow 25-col rendering fits width cleanly and keeps "← back" visible.
+        let narrow = tui::render_text(25, 14, |f| draw(f, &mut sb));
+        let narrow_lines: Vec<&str> = narrow.lines().collect();
+        assert!(narrow_lines.last().unwrap().contains("← back"), "{narrow}");
+        for l in &narrow_lines {
+            assert!(l.chars().count() <= 25, "{l}");
+        }
+
+        // Narrow 30-col rendering fits width cleanly.
+        let out = tui::render_text(30, 14, |f| draw(f, &mut sb));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("← knn"), "{}", lines[0]);
+        assert!(out.contains("APPS") && out.contains("CLI → HUB"), "{out}");
+        for l in &lines {
+            assert!(l.chars().count() <= 30, "{l}");
+        }
+
+        // Tab jumps selection between Apps and CLI sections.
+        assert_eq!(
+            sb.launch_menu
+                .as_ref()
+                .unwrap()
+                .1
+                .selected_item()
+                .unwrap()
+                .target
+                .kind,
+            TargetKind::GuiApp
+        );
+        sb.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(
+            sb.launch_menu
+                .as_ref()
+                .unwrap()
+                .1
+                .selected_item()
+                .unwrap()
+                .target
+                .kind,
+            TargetKind::CliAgent
+        );
+        sb.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(
+            sb.launch_menu
+                .as_ref()
+                .unwrap()
+                .1
+                .selected_item()
+                .unwrap()
+                .target
+                .kind,
+            TargetKind::GuiApp
+        );
+
+        // Esc / Left dismisses drawer.
+        sb.key(KeyEvent::from(KeyCode::Left));
+        assert!(sb.launch_menu.is_none());
+
+        // Ctrl-L opens drawer, typing "opencode" filters and Enter launches.
+        sb.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(sb.launch_menu.is_some());
+        for c in "opencode".chars() {
+            sb.key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        sb.key(KeyEvent::from(KeyCode::Enter));
+        assert!(sb.launch_menu.is_none());
+
+        // Reopen and use instant digit hotkey '1'.
+        sb.key(KeyEvent::from(KeyCode::Right));
+        sb.key(KeyEvent::from(KeyCode::Char('1')));
+        assert!(sb.launch_menu.is_none());
+
+        drop(sb);
+        assert_eq!(
+            launched.into_inner(),
+            vec![
+                ("/h/code/knn".into(), "cli:opencode".into()),
+                ("/h/code/knn".into(), "antigravity".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_sidebar_stops_animation_and_wakes_on_input() {
+        let vis_flag = std::rc::Rc::new(std::cell::Cell::new(true));
+        let vf = vis_flag.clone();
+        let mut sb = Sidebar::new(
+            data(),
+            Vec::new(),
+            "/h/notes",
+            Theme::dark(),
+            Some("/h".into()),
+            Box::new(move |_| ReloadTick {
+                visible: vf.get(),
+                data: None,
+            }),
+            Box::new(|_, _| Ok(())),
+        );
+        let _ = tui::render_text(30, 14, |f| draw(f, &mut sb));
+        assert!(sb.animating());
+
+        vis_flag.set(false);
+        assert!(!sb.refresh());
+        assert!(!sb.animating());
+        assert!(!sb.wants_refresh_now());
+
+        sb.wake();
+        assert!(sb.wants_refresh_now());
+
+        vis_flag.set(true);
+        assert!(sb.refresh());
+        assert!(sb.animating());
+        assert!(!sb.wants_refresh_now());
     }
 }

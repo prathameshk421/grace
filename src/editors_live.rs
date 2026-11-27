@@ -371,27 +371,57 @@ fn windows_process_listing() -> String {
 
 /// Validate that a discovered macOS `.app` bundle is safe to execute/open.
 #[cfg(target_os = "macos")]
-fn trusted_bundle(bundle: &str) -> bool {
+pub(crate) fn trusted_bundle(bundle: &str) -> bool {
+    trusted_bundle_with_home(bundle, platform::home_dir().as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_bundle_with_home(bundle: &str, home: Option<&Path>) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let p = Path::new(bundle);
-    if !p.is_absolute() || !p.is_dir() {
+    if !p.is_absolute() {
         return false;
     }
-    let home_apps = platform::home_dir().map(|h| h.join("Applications"));
-    let in_trusted_root = bundle.starts_with("/Applications/")
-        || bundle.starts_with("/System/Applications/")
-        || home_apps.as_ref().is_some_and(|ha| p.starts_with(ha));
-    if !in_trusted_root {
-        return false;
-    }
-    let Ok(meta) = std::fs::metadata(p) else {
+    let Ok(lmeta) = std::fs::symlink_metadata(p) else {
         return false;
     };
+    if lmeta.file_type().is_symlink() || !lmeta.is_dir() {
+        return false;
+    }
+    let home_apps = home.map(|h| h.join("Applications"));
+    let in_trusted_root = |cand: &Path| -> bool {
+        cand.starts_with("/Applications/")
+            || cand.starts_with("/System/Applications/")
+            || home_apps.as_ref().is_some_and(|ha| {
+                let ha_canon = std::fs::canonicalize(ha).unwrap_or_else(|_| ha.clone());
+                cand.starts_with(ha) || cand.starts_with(&ha_canon)
+            })
+    };
+    if !in_trusted_root(p) {
+        return false;
+    }
     // SAFETY: geteuid is always safe.
     let euid = unsafe { libc::geteuid() };
-    let owner_ok = meta.uid() == 0 || meta.uid() == euid;
-    let not_world_writable = meta.permissions().mode() & 0o002 == 0;
-    owner_ok && not_world_writable
+    let safe_meta = |m: &std::fs::Metadata| {
+        let owner_ok = m.uid() == 0 || m.uid() == euid;
+        let not_world_writable = m.permissions().mode() & 0o002 == 0;
+        owner_ok && not_world_writable
+    };
+    if !safe_meta(&lmeta) {
+        return false;
+    }
+    if let Ok(canon) = std::fs::canonicalize(p) {
+        if !canon.is_dir() || !in_trusted_root(&canon) {
+            return false;
+        }
+        let Ok(cmeta) = std::fs::metadata(&canon) else {
+            return false;
+        };
+        if !safe_meta(&cmeta) {
+            return false;
+        }
+    }
+    true
 }
 
 enum LaunchMode {
@@ -652,5 +682,33 @@ mod tests {
         refresh_if_stale_with(&db, Some(&[]), &IgnoreMatcher::default());
         let t: i64 = db.get_meta(IMPORTED_AT).unwrap().unwrap().parse().unwrap();
         assert!(crate::model::now() - t < 60);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_bundle_rejects_untrusted_and_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = d.path().join("Outside.app");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(!trusted_bundle_with_home(
+            outside.to_str().unwrap(),
+            Some(d.path())
+        ));
+
+        let apps = d.path().join("Applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let valid = apps.join("Valid.app");
+        std::fs::create_dir_all(&valid).unwrap();
+        assert!(trusted_bundle_with_home(
+            valid.to_str().unwrap(),
+            Some(d.path())
+        ));
+
+        let linked = apps.join("Linked.app");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        assert!(!trusted_bundle_with_home(
+            linked.to_str().unwrap(),
+            Some(d.path())
+        ));
     }
 }

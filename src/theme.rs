@@ -530,8 +530,8 @@ impl Theme {
     pub fn tag_color(self, tool: &str) -> Color {
         if self.light {
             return match tool {
-                "claude" => Color::Rgb(184, 82, 50),
-                "codex" => Color::Rgb(91, 76, 212),
+                "claude" | "claude-desktop" => Color::Rgb(184, 82, 50),
+                "codex" | "codex-app" => Color::Rgb(91, 76, 212),
                 "antigravity" => Color::Rgb(16, 98, 214),
                 "gemini" => Color::Rgb(124, 58, 237),
                 "aider" => Color::Rgb(21, 128, 61),
@@ -553,8 +553,8 @@ impl Theme {
         }
         const MONO: Color = Color::Rgb(207, 212, 222);
         match tool {
-            "claude" => Color::Rgb(217, 119, 87),
-            "codex" => Color::Rgb(177, 167, 255),
+            "claude" | "claude-desktop" => Color::Rgb(217, 119, 87),
+            "codex" | "codex-app" => Color::Rgb(177, 167, 255),
             "antigravity" => Color::Rgb(49, 134, 255),
             "gemini" => Color::Rgb(179, 129, 221),
             "aider" => Color::Rgb(60, 230, 130),

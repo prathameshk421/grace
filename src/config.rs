@@ -16,6 +16,10 @@ pub struct Config {
     pub ascii: Option<bool>,
     /// Default hub layout preset ("full", "code+diff", "sidebar+main", "zen").
     pub hub_layout: Option<String>,
+    /// Default Enter action in picker: "travel" (default) | "launch".
+    pub default_action: Option<String>,
+    /// Whether CLI agents launched from the picker open in `grace hub` (default true).
+    pub cli_in_hub: Option<bool>,
 }
 
 /// Resolve the optional config path.
@@ -71,12 +75,16 @@ pub fn parse(text: &str) -> Config {
             .filter(|s| !s.is_empty())
             .map(String::from)
     });
+    let default_action = str_opt("default_action");
+    let cli_in_hub = doc.get("cli_in_hub").and_then(Item::as_bool);
     Config {
         theme: str_opt("theme"),
         editor: str_opt("editor"),
         ignore,
         ascii,
         hub_layout,
+        default_action,
+        cli_in_hub,
     }
 }
 
@@ -177,6 +185,8 @@ mod tests {
 theme = "light"
 editor = "zed"
 ascii = false
+default_action = "launch"
+cli_in_hub = false
 ignore = ["/tmp/*", "~/Downloads/*"]
 [hub]
 layout = "code+diff"
@@ -185,6 +195,8 @@ layout = "code+diff"
         assert_eq!(c.theme.as_deref(), Some("light"));
         assert_eq!(c.editor.as_deref(), Some("zed"));
         assert_eq!(c.ascii, Some(false));
+        assert_eq!(c.default_action.as_deref(), Some("launch"));
+        assert_eq!(c.cli_in_hub, Some(false));
         assert_eq!(c.ignore, vec!["/tmp/*", "~/Downloads/*"]);
         assert_eq!(c.hub_layout.as_deref(), Some("code+diff"));
         assert_eq!(parse("not = [valid"), Config::default());

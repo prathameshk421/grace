@@ -42,6 +42,9 @@ const HELP_ROWS: [(&str, &str); 10] = [
 ];
 const SIDE_BY_SIDE: u16 = 70;
 const DIFF_DEBOUNCE: Duration = Duration::from_millis(35);
+const MIN_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -49,13 +52,25 @@ enum Focus {
     Diff,
 }
 
-type DiffBgResult = (Option<Repo>, DiffScope, Vec<DiffLine>, Option<String>);
+enum BgDiffResult {
+    Unchanged(Option<git::RepoKey>, git::StatusFingerprint),
+    Updated {
+        key: Option<git::RepoKey>,
+        fp: Option<git::StatusFingerprint>,
+        repo: Option<Repo>,
+        scope: DiffScope,
+        lines: Vec<DiffLine>,
+        path: Option<String>,
+    },
+}
 type FileDiffResult = (u64, DiffScope, Option<String>, Vec<DiffLine>);
 
 pub struct DiffView {
     dir: PathBuf,
     editor: Option<String>,
     repo: Option<Repo>,
+    repo_key: Option<git::RepoKey>,
+    last_fp: Option<git::StatusFingerprint>,
     selected: usize,
     list_off: usize,
     raw_diff: Vec<DiffLine>,
@@ -70,6 +85,7 @@ pub struct DiffView {
     focus: Focus,
     focused: bool,
     in_hub: bool,
+    hub_vis: crate::hub::HubVisibility,
     meta_cache: String,
     theme: Theme,
     hints: [(&'static str, &'static str); 6],
@@ -79,11 +95,16 @@ pub struct DiffView {
     toast: Option<Toast>,
     list_area: Rect,
     diff_area: Rect,
-    bg_rx: Option<Receiver<DiffBgResult>>,
+    bg_rx: Option<Receiver<BgDiffResult>>,
+    bg_started: Option<Instant>,
     diff_rx: Option<Receiver<FileDiffResult>>,
+    diff_started: Option<Instant>,
     diff_seq: u64,
     pending_diff_at: Option<Instant>,
     last_bg: Instant,
+    backoff: Duration,
+    force_refresh: bool,
+    checked_once: bool,
 }
 
 pub fn mark_color(m: Mark, theme: Theme) -> Color {
@@ -191,6 +212,7 @@ pub fn open_in_editor_or_default(
 impl DiffView {
     pub fn in_hub(mut self, yes: bool) -> DiffView {
         self.in_hub = yes;
+        self.hub_vis = crate::hub::HubVisibility::new(yes);
         if yes {
             self.hints[5] = ("q", "hide");
         }
@@ -207,6 +229,8 @@ impl DiffView {
             dir,
             editor: None,
             repo: None,
+            repo_key: None,
+            last_fp: None,
             selected: 0,
             list_off: 0,
             raw_diff: Vec::new(),
@@ -221,6 +245,7 @@ impl DiffView {
             focus: Focus::List,
             focused: true,
             in_hub: false,
+            hub_vis: crate::hub::HubVisibility::new(false),
             meta_cache: String::new(),
             theme,
             hints: HINTS,
@@ -231,12 +256,17 @@ impl DiffView {
             list_area: Rect::default(),
             diff_area: Rect::default(),
             bg_rx: None,
+            bg_started: None,
             diff_rx: None,
+            diff_started: None,
             diff_seq: 0,
             pending_diff_at: None,
             last_bg: Instant::now() - Duration::from_secs(30),
+            backoff: MIN_BACKOFF,
+            force_refresh: false,
+            checked_once: false,
         };
-        v.reload_async();
+        v.reload_async(false);
         v
     }
 
@@ -250,6 +280,8 @@ impl DiffView {
             dir: PathBuf::from("."),
             editor: None,
             repo,
+            repo_key: None,
+            last_fp: None,
             selected: 0,
             list_off: 0,
             raw_diff,
@@ -264,6 +296,7 @@ impl DiffView {
             focus: Focus::List,
             focused: true,
             in_hub: false,
+            hub_vis: crate::hub::HubVisibility::new(false),
             meta_cache: String::new(),
             theme: Theme::dark(),
             hints: HINTS,
@@ -274,10 +307,15 @@ impl DiffView {
             list_area: Rect::default(),
             diff_area: Rect::default(),
             bg_rx: None,
+            bg_started: None,
             diff_rx: None,
+            diff_started: None,
             diff_seq: 0,
             pending_diff_at: None,
             last_bg: Instant::now(),
+            backoff: MIN_BACKOFF,
+            force_refresh: false,
+            checked_once: true,
         };
         v.rebuild_visible_diff();
         v
@@ -314,8 +352,24 @@ impl DiffView {
     }
 
     fn reload_sync(&mut self) {
+        self.bg_rx = None;
+        self.bg_started = None;
+        self.last_fp = None;
+        self.repo_key = git::resolve_repo(&self.dir);
+        self.backoff = MIN_BACKOFF;
+        self.last_bg = Instant::now();
+        self.checked_once = true;
         let keep = self.changes().get(self.selected).map(|c| c.path.clone());
-        self.repo = git::status(&self.dir);
+        if let Some(ref key) = self.repo_key {
+            if let Some((Some(repo), fp)) = git::status_with_key(key, true, None) {
+                self.repo = Some(repo);
+                self.last_fp = Some(fp);
+            } else {
+                self.repo = None;
+            }
+        } else {
+            self.repo = None;
+        }
         let n = self.changes().len();
         self.selected = keep
             .and_then(|p| self.changes().iter().position(|c| c.path == p))
@@ -323,48 +377,96 @@ impl DiffView {
         self.load_diff();
     }
 
-    fn reload_async(&mut self) {
+    fn reload_async(&mut self, force: bool) {
         if self.bg_rx.is_some() {
             return;
         }
-        if self.in_hub {
-            let (win_active, attached) = crate::hub::pane_activity();
-            if (!self.focused || !win_active || !attached)
-                && self.last_bg.elapsed() < Duration::from_secs(15)
-            {
-                return;
-            }
+        let vis = self.hub_vis.poll(force, false);
+        if !vis.visible() {
+            return;
+        }
+        if vis.became_visible || force {
+            self.backoff = MIN_BACKOFF;
+        } else if self.last_bg.elapsed() < self.backoff {
+            return;
         }
         self.last_bg = Instant::now();
         let dir = self.dir.clone();
+        let mut repo_key = self.repo_key.clone();
+        let prev_fp = if self.repo.is_some() && !force {
+            self.last_fp
+        } else {
+            None
+        };
+        let had_repo = self.repo.is_some();
+        let checked_once = self.checked_once;
         let keep = self.changes().get(self.selected).map(|c| c.path.clone());
         let selected_idx = self.selected;
         let scope = self.scope;
         let (tx, rx) = mpsc::channel();
         self.bg_rx = Some(rx);
+        self.bg_started = Some(Instant::now());
         std::thread::spawn(move || {
-            let repo = git::status(&dir);
-            let (lines, path) = match &repo {
-                Some(r) => {
+            if repo_key.is_none() {
+                repo_key = git::resolve_repo(&dir);
+            }
+            let status = if let Some(ref k) = repo_key {
+                match git::status_with_key(k, true, prev_fp.as_ref()) {
+                    Some(r) => Some(r),
+                    None => {
+                        repo_key = git::resolve_repo(&dir);
+                        repo_key
+                            .as_ref()
+                            .and_then(|k2| git::status_with_key(k2, true, None))
+                    }
+                }
+            } else {
+                None
+            };
+            let msg = match status {
+                Some((None, fp)) => BgDiffResult::Unchanged(repo_key, fp),
+                Some((Some(r), fp)) => {
                     let idx = keep
                         .as_ref()
                         .and_then(|p| r.changes.iter().position(|c| &c.path == p))
                         .unwrap_or(selected_idx.min(r.changes.len().saturating_sub(1)));
-                    if let Some(c) = r.changes.get(idx) {
-                        (git::file_diff(r, c, scope), Some(c.path.clone()))
+                    let (lines, path) = if let Some(c) = r.changes.get(idx) {
+                        (git::file_diff(&r, c, scope), Some(c.path.clone()))
                     } else {
                         (Vec::new(), None)
+                    };
+                    BgDiffResult::Updated {
+                        key: repo_key,
+                        fp: Some(fp),
+                        repo: Some(r),
+                        scope,
+                        lines,
+                        path,
                     }
                 }
-                None => (Vec::new(), None),
+                None => {
+                    if !had_repo && checked_once {
+                        BgDiffResult::Unchanged(None, git::StatusFingerprint::default())
+                    } else {
+                        BgDiffResult::Updated {
+                            key: None,
+                            fp: None,
+                            repo: None,
+                            scope,
+                            lines: Vec::new(),
+                            path: None,
+                        }
+                    }
+                }
             };
-            let _ = tx.send((repo, scope, lines, path));
+            let _ = tx.send(msg);
         });
     }
 
     fn load_diff(&mut self) {
         self.pending_diff_at = None;
         self.diff_rx = None;
+        self.diff_started = None;
         let Some(repo) = self.repo.as_ref() else {
             self.raw_diff.clear();
             self.diff.clear();
@@ -437,6 +539,7 @@ impl DiffView {
         };
         let (tx, rx) = mpsc::channel();
         self.diff_rx = Some(rx);
+        self.diff_started = Some(Instant::now());
         std::thread::spawn(move || {
             let path = Some(change.path.clone());
             let lines = git::file_diff(&min_repo, &change, scope);
@@ -523,6 +626,7 @@ impl DiffView {
     }
 
     fn stage_selected(&mut self, stage: bool) {
+        self.backoff = MIN_BACKOFF;
         let Some(repo) = self.repo.as_ref() else {
             return;
         };
@@ -555,6 +659,28 @@ impl DiffView {
             Err(msg) => self.flash(msg, ToastKind::Warn),
         }
     }
+    fn check_timeouts(&mut self) -> bool {
+        let mut timed_out = false;
+        if self.bg_rx.is_some() && self.bg_started.is_some_and(|t| t.elapsed() >= GIT_TIMEOUT) {
+            self.bg_rx = None;
+            self.bg_started = None;
+            self.last_bg = Instant::now();
+            self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+            self.flash("git refresh timed out", ToastKind::Warn);
+            timed_out = true;
+        }
+        if self.diff_rx.is_some()
+            && self
+                .diff_started
+                .is_some_and(|t| t.elapsed() >= GIT_TIMEOUT)
+        {
+            self.diff_rx = None;
+            self.diff_started = None;
+            self.flash("git diff timed out", ToastKind::Warn);
+            timed_out = true;
+        }
+        timed_out
+    }
 }
 
 impl tui::App for DiffView {
@@ -565,8 +691,11 @@ impl tui::App for DiffView {
     fn focus(&mut self, focused: bool) {
         let gained = focused && !self.focused;
         self.focused = focused;
-        if gained && self.last_bg.elapsed() >= Duration::from_secs(2) {
-            self.reload_async();
+        if gained {
+            self.backoff = MIN_BACKOFF;
+            if self.last_bg.elapsed() >= MIN_BACKOFF {
+                self.reload_async(true);
+            }
         }
     }
 
@@ -577,49 +706,93 @@ impl tui::App for DiffView {
     fn poll_bg(&mut self) -> bool {
         let mut changed = false;
         if let Some(rx) = &self.bg_rx {
-            if let Ok((repo, res_scope, lines, path)) = rx.try_recv() {
-                self.bg_rx = None;
-                let keep = self.changes().get(self.selected).map(|c| c.path.clone());
-                self.repo = repo;
-                let n = self.changes().len();
-                self.selected = keep
-                    .and_then(|p| self.changes().iter().position(|c| c.path == p))
-                    .unwrap_or(self.selected.min(n.saturating_sub(1)));
-                let current_path = self.changes().get(self.selected).map(|c| c.path.as_str());
-                if current_path == path.as_deref() && res_scope == self.scope {
-                    let same = self.diff_path.as_deref() == path.as_deref();
-                    self.raw_diff = lines;
-                    if !same {
-                        self.scroll = 0;
-                        self.h_scroll = 0;
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.bg_rx = None;
+                    self.bg_started = None;
+                    match res {
+                        BgDiffResult::Unchanged(key, fp) => {
+                            self.checked_once = true;
+                            self.repo_key = key;
+                            self.last_fp = if self.repo.is_some() { Some(fp) } else { None };
+                            self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+                        }
+                        BgDiffResult::Updated {
+                            key,
+                            fp,
+                            repo,
+                            scope: res_scope,
+                            lines,
+                            path,
+                        } => {
+                            self.checked_once = true;
+                            self.repo_key = key;
+                            self.last_fp = fp;
+                            self.backoff = MIN_BACKOFF;
+                            let keep = self.changes().get(self.selected).map(|c| c.path.clone());
+                            self.repo = repo;
+                            let n = self.changes().len();
+                            self.selected = keep
+                                .and_then(|p| self.changes().iter().position(|c| c.path == p))
+                                .unwrap_or(self.selected.min(n.saturating_sub(1)));
+                            let current_path =
+                                self.changes().get(self.selected).map(|c| c.path.as_str());
+                            if current_path == path.as_deref() && res_scope == self.scope {
+                                let same = self.diff_path.as_deref() == path.as_deref();
+                                self.raw_diff = lines;
+                                if !same {
+                                    self.scroll = 0;
+                                    self.h_scroll = 0;
+                                }
+                                self.diff_path = path;
+                                self.rebuild_visible_diff();
+                            } else {
+                                self.spawn_diff_load();
+                            }
+                            changed = true;
+                        }
                     }
-                    self.diff_path = path;
-                    self.rebuild_visible_diff();
-                } else {
-                    self.spawn_diff_load();
                 }
-                changed = true;
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.bg_rx = None;
+                    self.bg_started = None;
+                    if self.repo.is_none() {
+                        changed = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some(rx) = &self.diff_rx {
-            if let Ok((seq, res_scope, path, lines)) = rx.try_recv() {
-                self.diff_rx = None;
-                let current_path = self.changes().get(self.selected).map(|c| c.path.as_str());
-                if seq == self.diff_seq
-                    && res_scope == self.scope
-                    && current_path == path.as_deref()
-                {
-                    let same = self.diff_path.as_deref() == path.as_deref();
-                    self.raw_diff = lines;
-                    if !same {
-                        self.scroll = 0;
-                        self.h_scroll = 0;
+            match rx.try_recv() {
+                Ok((seq, res_scope, path, lines)) => {
+                    self.diff_rx = None;
+                    self.diff_started = None;
+                    let current_path = self.changes().get(self.selected).map(|c| c.path.as_str());
+                    if seq == self.diff_seq
+                        && res_scope == self.scope
+                        && current_path == path.as_deref()
+                    {
+                        let same = self.diff_path.as_deref() == path.as_deref();
+                        self.raw_diff = lines;
+                        if !same {
+                            self.scroll = 0;
+                            self.h_scroll = 0;
+                        }
+                        self.diff_path = path;
+                        self.rebuild_visible_diff();
+                        changed = true;
                     }
-                    self.diff_path = path;
-                    self.rebuild_visible_diff();
-                    changed = true;
                 }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.diff_rx = None;
+                    self.diff_started = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+        if self.check_timeouts() {
+            changed = true;
         }
         if let Some(at) = self.pending_diff_at {
             if Instant::now() >= at {
@@ -630,6 +803,9 @@ impl tui::App for DiffView {
     }
 
     fn mouse(&mut self, m: MouseEvent) -> Flow {
+        if !matches!(m.kind, MouseEventKind::Moved) {
+            self.backoff = MIN_BACKOFF;
+        }
         let pos = ratatui::layout::Position {
             x: m.column,
             y: m.row,
@@ -671,6 +847,7 @@ impl tui::App for DiffView {
     }
 
     fn key(&mut self, k: KeyEvent) -> Flow {
+        self.backoff = MIN_BACKOFF;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.show_help {
             if is_help_dismiss(&k) {
@@ -785,12 +962,25 @@ impl tui::App for DiffView {
         if expired {
             self.toast = None;
         }
-        self.reload_async();
-        expired
+        let timed_out = self.check_timeouts();
+        let force = std::mem::take(&mut self.force_refresh);
+        self.reload_async(force);
+        expired || timed_out
     }
 
     fn every(&self) -> Duration {
-        Duration::from_secs(2)
+        Duration::from_secs(1)
+    }
+
+    fn wake(&mut self) {
+        if !self.hub_vis.is_visible() {
+            self.force_refresh = true;
+            self.backoff = MIN_BACKOFF;
+        }
+    }
+
+    fn wants_refresh_now(&self) -> bool {
+        self.force_refresh
     }
 }
 
@@ -1323,5 +1513,88 @@ mod tests {
         v.key(KeyEvent::from(KeyCode::Char('g')));
         assert_eq!(v.selected, 0);
         assert_eq!(v.key(KeyEvent::from(KeyCode::Char('q'))), Flow::Quit);
+    }
+
+    #[test]
+    fn adaptive_backoff_and_reset() {
+        let mut v = DiffView::with_repo(Some(repo()), diff());
+        assert_eq!(v.backoff, MIN_BACKOFF);
+
+        for expected in [
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(8),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            v.bg_rx = Some(rx);
+            v.bg_started = Some(Instant::now());
+            tx.send(BgDiffResult::Unchanged(
+                None,
+                git::StatusFingerprint::default(),
+            ))
+            .unwrap();
+            assert!(!v.poll_bg());
+            assert_eq!(v.backoff, expected);
+        }
+
+        // Elapsed < backoff skips reload_async without spawning.
+        v.last_bg = Instant::now() - Duration::from_secs(4);
+        v.reload_async(false);
+        assert!(v.bg_rx.is_none());
+
+        // Key interaction resets backoff to MIN_BACKOFF.
+        v.key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(v.backoff, MIN_BACKOFF);
+
+        // Updated result also resets backoff to MIN_BACKOFF.
+        v.backoff = MAX_BACKOFF;
+        let (tx, rx) = mpsc::channel();
+        v.bg_rx = Some(rx);
+        v.bg_started = Some(Instant::now());
+        tx.send(BgDiffResult::Updated {
+            key: None,
+            fp: None,
+            repo: Some(repo()),
+            scope: DiffScope::All,
+            lines: diff(),
+            path: Some("src/main.rs".into()),
+        })
+        .unwrap();
+        assert!(v.poll_bg());
+        assert_eq!(v.backoff, MIN_BACKOFF);
+
+        // Focus gained resets backoff.
+        v.backoff = MAX_BACKOFF;
+        v.last_bg = Instant::now();
+        v.focus(false);
+        v.focus(true);
+        assert_eq!(v.backoff, MIN_BACKOFF);
+    }
+
+    #[test]
+    fn timeout_clears_channels_and_sets_toast() {
+        let mut v = DiffView::with_repo(Some(repo()), diff());
+        let (_bg_tx, bg_rx) = mpsc::channel();
+        v.bg_rx = Some(bg_rx);
+        v.bg_started = Some(Instant::now() - GIT_TIMEOUT - Duration::from_secs(1));
+        assert!(v.poll_bg());
+        assert!(v.bg_rx.is_none());
+        assert!(v.bg_started.is_none());
+        assert_eq!(
+            v.toast.as_ref().map(|t| t.msg.as_str()),
+            Some("git refresh timed out")
+        );
+
+        v.toast = None;
+        let (_diff_tx, diff_rx) = mpsc::channel();
+        v.diff_rx = Some(diff_rx);
+        v.diff_started = Some(Instant::now() - GIT_TIMEOUT - Duration::from_secs(1));
+        assert!(v.refresh());
+        assert!(v.diff_rx.is_none());
+        assert!(v.diff_started.is_none());
+        assert_eq!(
+            v.toast.as_ref().map(|t| t.msg.as_str()),
+            Some("git diff timed out")
+        );
     }
 }

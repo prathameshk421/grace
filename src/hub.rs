@@ -13,7 +13,7 @@ use crate::theme::{Ansi, Theme};
 use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -919,6 +919,15 @@ pub fn conf_text(c: &ConfCtx) -> String {
         "set-hook -g pane-exited {}",
         tmux_quote(&format!("run-shell -b {}", tmux_quote(&reap)))
     ));
+    let wake_sh = format!("{env} {exe} hub wake");
+    let wake_cmd = tmux_quote(&format!("run-shell -b {}", tmux_quote(&wake_sh)));
+    for hook in [
+        "client-attached",
+        "client-detached",
+        "session-window-changed",
+    ] {
+        line(&format!("set-hook -g {hook} {wake_cmd}"));
+    }
     line("bind -T grace C-g send-keys C-g");
     if at_least(3, 2) {
         let sh = format!("{env} {exe} hub keys --wait");
@@ -1047,6 +1056,18 @@ impl Tmux {
             .collect())
     }
 
+    /// Single-call workspace list + visibility for `my_win`.
+    pub fn view(&self, my_win: &str) -> Result<HubView> {
+        let out = self.run(&[
+            "list-windows",
+            "-t",
+            &format!("={SESSION}"),
+            "-F",
+            "#{window_id}|g|#{@grace_path}|g|#{@grace_glyph}|g|#{window_active}|g|#{session_attached}",
+        ])?;
+        Ok(parse_hub_view(&out, my_win))
+    }
+
     /// Workspaces as (window id, folder).
     pub fn windows(&self) -> Result<Vec<(String, String)>> {
         Ok(self
@@ -1108,27 +1129,231 @@ pub fn set_pane_meta(cache: &mut String, meta: &str) {
     }
 }
 
-/// Returns `(window_active, session_attached)` for the current hub pane, or `(true, true)` outside hub.
-pub fn pane_activity() -> (bool, bool) {
-    let Ok(pane) = std::env::var("TMUX_PANE") else {
-        return (true, true);
-    };
-    if !inside_hub(std::env::var("TMUX").ok().as_deref(), &socket()) {
-        return (true, true);
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HubView {
+    pub windows: Vec<(String, String, String)>,
+    pub active: bool,
+    pub attached: bool,
+    pub found_my_win: bool,
+}
+
+fn parse_hub_view(out: &str, my_win: &str) -> HubView {
+    let mut windows = Vec::new();
+    let mut active = false;
+    let mut attached = false;
+    let mut found_my_win = false;
+    for l in out.lines() {
+        let mut parts = l.split(SEP);
+        let Some(w) = parts.next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let p = parts.next().unwrap_or("");
+        let g = parts.next().unwrap_or("");
+        let win_act = parts.next().is_some_and(|v| v == "1");
+        let sess_att = parts.next().is_some_and(|v| v != "0");
+        if sess_att {
+            attached = true;
+        }
+        if !my_win.is_empty() && w == my_win {
+            found_my_win = true;
+            active = win_act;
+        }
+        if !p.is_empty() {
+            windows.push((w.to_string(), p.to_string(), g.to_string()));
+        }
     }
-    let Ok(out) = Tmux::new().run(&[
-        "display-message",
-        "-p",
-        "-t",
-        &pane,
-        "#{window_active}|g|#{session_attached}",
-    ]) else {
-        return (true, true);
+    HubView {
+        windows,
+        active,
+        attached,
+        found_my_win,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VisPoll {
+    pub active: bool,
+    pub attached: bool,
+    pub became_visible: bool,
+    pub windows: Option<Vec<(String, String, String)>>,
+}
+
+impl VisPoll {
+    pub fn visible(&self) -> bool {
+        self.active && self.attached
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WakeStamp {
+    modified: Option<SystemTime>,
+    id: u64,
+}
+
+fn read_wake_stamp(path: &Path) -> Option<WakeStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok();
+    #[cfg(unix)]
+    let id = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
     };
-    let mut parts = out.trim().split(SEP);
-    let win_active = parts.next().is_some_and(|v| v == "1");
-    let attached = parts.next().is_some_and(|v| v != "0");
-    (win_active, attached)
+    #[cfg(not(unix))]
+    let id = meta.len();
+    Some(WakeStamp { modified, id })
+}
+
+pub fn wake_path() -> Option<PathBuf> {
+    crate::db::data_dir().ok().map(|d| d.join("hub.wake"))
+}
+
+/// Ring the hub doorbell so idle/detached panes notice state transitions without polling tmux.
+pub fn wake() -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let Some(path) = wake_path() else {
+        return Ok(());
+    };
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    platform::create_dir_private(dir)?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("refusing to follow symlink at hub.wake");
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    write_file_atomic_0600(
+        &path,
+        "hub.wake",
+        &format!("{nanos}-{}\n", std::process::id()),
+    )
+}
+
+/// Visibility & doorbell tracker shared by hub panes (`sidebar`, `diff`, `tree`).
+pub struct HubVisibility {
+    enabled: bool,
+    tmux: Tmux,
+    my_win: Option<String>,
+    wake_file: Option<PathBuf>,
+    last_wake: Option<WakeStamp>,
+    doorbell_seen: bool,
+    last_poll: Option<Instant>,
+    active: bool,
+    attached: bool,
+    visible: bool,
+}
+
+impl HubVisibility {
+    pub fn new(in_hub: bool) -> Self {
+        let enabled = in_hub
+            && std::env::var_os("TMUX_PANE").is_some_and(|v| !v.is_empty())
+            && inside_hub(std::env::var("TMUX").ok().as_deref(), &socket());
+        let tmux = Tmux::new();
+        let my_win = if enabled {
+            tmux.current_window().ok()
+        } else {
+            None
+        };
+        let wake_file = if enabled { wake_path() } else { None };
+        let last_wake = wake_file.as_deref().and_then(read_wake_stamp);
+        Self {
+            enabled,
+            tmux,
+            my_win,
+            wake_file,
+            last_wake,
+            doorbell_seen: last_wake.is_some(),
+            last_poll: None,
+            active: true,
+            attached: true,
+            visible: true,
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn poll(&mut self, force: bool, need_windows: bool) -> VisPoll {
+        if !self.enabled {
+            return VisPoll {
+                active: true,
+                attached: true,
+                became_visible: false,
+                windows: None,
+            };
+        }
+        let cur_wake = self.wake_file.as_deref().and_then(read_wake_stamp);
+        let bell_changed = cur_wake != self.last_wake;
+        if bell_changed {
+            self.last_wake = cur_wake;
+            if cur_wake.is_some() {
+                self.doorbell_seen = true;
+            }
+        }
+        let fallback_interval = match (self.visible, self.attached, need_windows) {
+            (true, true, true) => Duration::from_secs(1),
+            (true, true, false) => Duration::from_secs(if self.doorbell_seen { 30 } else { 5 }),
+            (false, true, _) => Duration::from_secs(if self.doorbell_seen { 30 } else { 3 }),
+            (_, false, _) => Duration::from_secs(30),
+        };
+        let timer_due = self
+            .last_poll
+            .is_none_or(|t| t.elapsed() >= fallback_interval);
+        if !force && !bell_changed && !timer_due {
+            return VisPoll {
+                active: self.active,
+                attached: self.attached,
+                became_visible: false,
+                windows: None,
+            };
+        }
+        self.last_poll = Some(Instant::now());
+        if self.my_win.is_none() {
+            self.my_win = self.tmux.current_window().ok();
+        }
+        let query_view = |tmux: &Tmux, my_win: Option<&str>| -> Option<HubView> {
+            tmux.view(my_win.unwrap_or("")).ok()
+        };
+        let mut view = query_view(&self.tmux, self.my_win.as_deref());
+        if let Some(ref v) = view {
+            if !v.found_my_win {
+                self.my_win = self.tmux.current_window().ok();
+                if self.my_win.is_some() {
+                    view = query_view(&self.tmux, self.my_win.as_deref());
+                }
+            }
+        }
+        let prev_visible = self.visible;
+        let windows = match view {
+            Some(v) if self.my_win.is_some() && v.found_my_win => {
+                self.active = v.active;
+                self.attached = v.attached;
+                if need_windows {
+                    Some(v.windows)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // Fail open if tmux is unreachable or this pane's window could not be matched.
+                self.active = true;
+                self.attached = true;
+                None
+            }
+        };
+        self.visible = self.active && self.attached;
+        VisPoll {
+            active: self.active,
+            attached: self.attached,
+            became_visible: !prev_visible && self.visible,
+            windows,
+        }
+    }
 }
 
 /// Send literal `text` to the main pane of the current hub window (used by TreeView `i` key).
@@ -1267,12 +1492,55 @@ pub fn apply(
     Ok(())
 }
 
+/// Command specification to start inside a hub workspace main pane.
+#[derive(Debug, Clone, Copy)]
+pub struct HubRun<'a> {
+    pub tag: &'a str,
+    pub cmd: &'a str,
+    pub by_tag: bool,
+}
+
+impl<'a> HubRun<'a> {
+    pub fn tool(tag: &'a str, cmd: &'a str) -> Self {
+        Self {
+            tag,
+            cmd,
+            by_tag: true,
+        }
+    }
+
+    pub fn cmd(tag: &'a str, cmd: &'a str) -> Self {
+        Self {
+            tag,
+            cmd,
+            by_tag: false,
+        }
+    }
+}
+
+fn validate_hub_run(r: HubRun<'_>) -> Result<()> {
+    if !crate::tools::valid_launch(r.cmd) || platform::has_line_break_or_nul(r.cmd) {
+        bail!("invalid launch command for `{}`", r.tag);
+    }
+    Ok(())
+}
+
 fn window_name(path: &str) -> String {
     let raw = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
     platform::sanitize_display(&raw).into_owned()
+}
+
+fn window_name_with_tool(path: &str, tool: &str, ascii: bool) -> String {
+    let base = window_name(path);
+    let clean_tool = platform::sanitize_display(tool);
+    if clean_tool.is_empty() {
+        return base;
+    }
+    let sep = if ascii { "-" } else { "·" };
+    format!("{base}{sep}{clean_tool}")
 }
 
 fn setup_window(
@@ -1295,76 +1563,152 @@ fn setup_window(
     Ok((win.to_string(), pane.to_string()))
 }
 
-pub fn switch(t: &Tmux, db: &Db, path: &str, resume: Option<&str>) -> Result<String> {
+fn append_run_flag(cmd_vec: &mut Vec<String>, r: HubRun<'_>) {
+    if r.by_tag && crate::tools::valid_name(r.tag) {
+        cmd_vec.push(format!("--run-tool={}", r.tag));
+    } else {
+        cmd_vec.push(format!("--run={}", r.cmd));
+    }
+}
+
+fn create_window(
+    t: &Tmux,
+    db: &Db,
+    path: &str,
+    name: &str,
+    run: Option<HubRun<'_>>,
+) -> Result<(String, String)> {
+    let (layout, sizes) = load_layout(db);
+    let exe = exe()?;
+    let mut args: Vec<String> = [
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{window_id}|g|#{pane_id}",
+        "-t",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.extend([
+        format!("={SESSION}:"),
+        "-n".into(),
+        name.into(),
+        "-c".into(),
+        path.into(),
+        "--".into(),
+    ]);
+    let mut cmd_vec = pane_command(&exe, Role::Main, path);
+    if let Some(r) = run {
+        append_run_flag(&mut cmd_vec, r);
+    }
+    args.extend(cmd_vec);
+    let ids = t.run(&args)?;
+    setup_window(t, &ids, path, &exe, layout, &sizes)
+}
+
+pub fn switch(t: &Tmux, db: &Db, path: &str, resume: Option<HubRun<'_>>) -> Result<String> {
     if !Path::new(path).is_dir() {
         bail!("folder does not exist: {path}");
     }
-    let existing = t
+    if let Some(r) = resume {
+        validate_hub_run(r)?;
+    }
+    let matching: Vec<String> = t
         .windows()?
         .into_iter()
-        .find(|(_, p)| platform::same_path(p, path))
-        .map(|(w, _)| w);
-    let fresh = existing.is_none();
-    let (win, known_main) = match existing {
-        Some(w) => (w, None),
-        None => {
-            let (layout, sizes) = load_layout(db);
-            let exe = exe()?;
-            let mut args: Vec<String> = [
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}|g|#{pane_id}",
-                "-t",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            args.extend([
-                format!("={SESSION}:"),
-                "-n".into(),
-                window_name(path),
-                "-c".into(),
-                path.into(),
-                "--".into(),
-            ]);
-            let mut cmd_vec = pane_command(&exe, Role::Main, path);
-            if let Some(run_cmd) = resume {
-                cmd_vec.push(format!("--run={run_cmd}"));
+        .filter(|(_, p)| platform::same_path(p, path))
+        .map(|(w, _)| w)
+        .collect();
+
+    if let Some(r) = resume {
+        for w in &matching {
+            if let Some(main) = main_pane(&t.panes(w)?).map(|p| p.id.clone()) {
+                let cur = t
+                    .run(&[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &main,
+                        "#{pane_current_command}",
+                    ])
+                    .unwrap_or_default();
+                if is_shell(&cur) {
+                    t.run(&["select-window", "-t", w])?;
+                    t.run(&["select-pane", "-t", &main])?;
+                    t.run(&["send-keys", "-t", &main, "-l", "--", r.cmd])?;
+                    t.run(&["send-keys", "-t", &main, "Enter"])?;
+                    return Ok(w.clone());
+                }
             }
-            args.extend(cmd_vec);
-            let ids = t.run(&args)?;
-            let (w, m) = setup_window(t, &ids, path, &exe, layout, &sizes)?;
-            (w, Some(m))
         }
-    };
-    t.run(&["select-window", "-t", &win])?;
-    let main = match known_main {
-        Some(m) => Some(m),
-        None => main_pane(&t.panes(&win)?).map(|p| p.id.clone()),
-    };
-    if let Some(main) = &main {
-        t.run(&["select-pane", "-t", main])?;
-        if let Some(cmd) = resume.filter(|_| !fresh) {
+        // Either no workspace exists yet, or every workspace for this folder is busy running
+        // another agent/program — spin up a dedicated workspace window for this tool.
+        let name = if matching.is_empty() {
+            window_name(path)
+        } else {
+            let ascii = Theme::from_env_and_config(&crate::config::load()).ascii;
+            window_name_with_tool(path, r.tag, ascii)
+        };
+        let (w, main) = create_window(t, db, path, &name, Some(r))?;
+        t.run(&["select-window", "-t", &w])?;
+        t.run(&["select-pane", "-t", &main])?;
+        return Ok(w);
+    }
+
+    if let Some(w) = matching.first() {
+        t.run(&["select-window", "-t", w])?;
+        if let Some(main) = main_pane(&t.panes(w)?).map(|p| p.id.clone()) {
+            t.run(&["select-pane", "-t", &main])?;
+        }
+        return Ok(w.clone());
+    }
+    let (w, main) = create_window(t, db, path, &window_name(path), None)?;
+    t.run(&["select-window", "-t", &w])?;
+    t.run(&["select-pane", "-t", &main])?;
+    Ok(w)
+}
+
+/// Switch to an idle-shell workspace for `path`, or create a new shell workspace if busy.
+pub fn new_shell_workspace(t: &Tmux, db: &Db, path: &str) -> Result<String> {
+    if !Path::new(path).is_dir() {
+        bail!("folder does not exist: {path}");
+    }
+    let matching: Vec<String> = t
+        .windows()?
+        .into_iter()
+        .filter(|(_, p)| platform::same_path(p, path))
+        .map(|(w, _)| w)
+        .collect();
+    for w in &matching {
+        if let Some(main) = main_pane(&t.panes(w)?).map(|p| p.id.clone()) {
             let cur = t
                 .run(&[
                     "display-message",
                     "-p",
                     "-t",
-                    main,
+                    &main,
                     "#{pane_current_command}",
                 ])
                 .unwrap_or_default();
             if is_shell(&cur) {
-                t.run(&["send-keys", "-t", main, "-l", "--", cmd])?;
-                t.run(&["send-keys", "-t", main, "Enter"])?;
-            } else {
-                t.message("a program already runs in this workspace");
+                t.run(&["select-window", "-t", w])?;
+                t.run(&["select-pane", "-t", &main])?;
+                return Ok(w.clone());
             }
         }
     }
-    Ok(win)
+    let name = if matching.is_empty() {
+        window_name(path)
+    } else {
+        let ascii = Theme::from_env_and_config(&crate::config::load()).ascii;
+        window_name_with_tool(path, "sh", ascii)
+    };
+    let (w, main) = create_window(t, db, path, &name, None)?;
+    t.run(&["select-window", "-t", &w])?;
+    t.run(&["select-pane", "-t", &main])?;
+    Ok(w)
 }
 
 /// True for a shell name, as tmux shows in pane_current_command (excludes `grace` itself!).
@@ -1382,14 +1726,17 @@ pub fn is_shell(cmd: &str) -> bool {
 }
 
 /// `grace hub [path]`: open the hub, or switch the workspace when already inside.
-pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
+pub fn start(db: &Db, path: &str, attach: bool, run: Option<HubRun<'_>>) -> Result<()> {
     let version = tmux_version()?;
     if !Path::new(path).is_dir() {
         bail!("folder does not exist: {path}");
     }
+    if let Some(r) = run {
+        validate_hub_run(r)?;
+    }
     let t = Tmux::new();
     if inside_hub(std::env::var("TMUX").ok().as_deref(), &t.socket) {
-        switch(&t, db, path, None)?;
+        switch(&t, db, path, run)?;
         return Ok(());
     }
     if std::env::var_os("TMUX").is_some_and(|v| !v.is_empty()) && attach {
@@ -1430,7 +1777,7 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
 
     if t.ok(&["has-session", "-t", &format!("={SESSION}")]) {
         t.run(&["source-file", &conf_s])?;
-        switch(&t, db, path, None)?;
+        switch(&t, db, path, run)?;
     } else {
         let (w, h) = term_size();
         let (layout, sizes) = load_layout(db);
@@ -1456,14 +1803,20 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
             path.into(),
             "--".into(),
         ]);
-        args.extend(pane_command(&exe, Role::Main, path));
+        let mut cmd_vec = pane_command(&exe, Role::Main, path);
+        if let Some(r) = run {
+            append_run_flag(&mut cmd_vec, r);
+        }
+        args.extend(cmd_vec);
         let ids = t.run(&args)?;
         let (_win, main_pane_id) = setup_window(&t, &ids, path, &exe, layout, &sizes)?;
         let _ = t.run(&["select-pane", "-t", &main_pane_id]);
     }
     if !attach {
+        let _ = wake();
         return Ok(());
     }
+    let _ = wake();
     let status = t
         .cmd()
         .stdin(Stdio::inherit())
@@ -1482,14 +1835,14 @@ pub fn start(db: &Db, path: &str, attach: bool) -> Result<()> {
     Ok(())
 }
 
-fn write_conf_atomic(path: &Path, content: &str) -> Result<()> {
+fn write_file_atomic_0600(path: &Path, tmp_prefix: &str, content: &str) -> Result<()> {
     use std::io::Write;
-    let dir = path.parent().context("bad tmux.conf path")?;
+    let dir = path.parent().context("bad file path")?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!("tmux.conf.tmp-{}-{nanos}", std::process::id()));
+    let tmp = dir.join(format!("{tmp_prefix}.tmp-{}-{nanos}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -1504,6 +1857,10 @@ fn write_conf_atomic(path: &Path, content: &str) -> Result<()> {
     std::fs::rename(&tmp, path)?;
     platform::restrict_file_0600(path);
     Ok(())
+}
+
+fn write_conf_atomic(path: &Path, content: &str) -> Result<()> {
+    write_file_atomic_0600(path, "tmux.conf", content)
 }
 
 /// `grace hub quit`: stop the hub server. This closes every workspace.
@@ -1775,6 +2132,9 @@ pub fn shell(run_cmd: Option<&str>) -> Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "sh".into());
     if let Some(cmd) = run_cmd.filter(|c| !c.trim().is_empty()) {
+        if !crate::tools::valid_launch(cmd) || platform::has_line_break_or_nul(cmd) {
+            bail!("invalid startup command");
+        }
         let flag = match sh_name.as_str() {
             "zsh" | "bash" | "fish" => "-lic",
             _ => "-lc",
@@ -1796,7 +2156,7 @@ pub fn shell(run_cmd: Option<&str>) -> Result<()> {
 }
 
 /// The status glyph for the status bar, with tmux styles.
-pub fn glyph(s: crate::model::Status, frame: usize, ascii: bool, color: bool) -> String {
+pub fn glyph(s: crate::model::Status, _frame: usize, ascii: bool, color: bool) -> String {
     use crate::model::Status;
     let wrap = |fg: &str, ch: &str| -> String {
         if color {
@@ -1808,15 +2168,7 @@ pub fn glyph(s: crate::model::Status, frame: usize, ascii: bool, color: bool) ->
     match s {
         Status::Waiting => wrap("yellow,bold", if ascii { "!" } else { "●" }),
         Status::Ready => (if ascii { "o" } else { "○" }).into(),
-        Status::Working => {
-            let f = if ascii {
-                crate::theme::SPINNER_ASCII[frame % crate::theme::SPINNER_ASCII.len()]
-            } else {
-                crate::theme::SPINNER[frame % crate::theme::SPINNER.len()]
-            };
-            let mut s_buf = [0u8; 4];
-            wrap("cyan", f.encode_utf8(&mut s_buf))
-        }
+        Status::Working => wrap("cyan", if ascii { "*" } else { "◐" }),
         Status::Done => wrap("green", if ascii { "+" } else { "✓" }),
     }
 }
@@ -1908,7 +2260,12 @@ pub fn run_sidebar(
     let ascii = theme.ascii;
     let color = theme.color;
 
-    let initial_rows = t.windows_and_glyphs().unwrap_or_default();
+    let mut hub_vis = HubVisibility::new(true);
+    let init_vis = hub_vis.poll(true, true);
+    let init_visible = init_vis.visible();
+    let initial_rows = init_vis
+        .windows
+        .unwrap_or_else(|| t.windows_and_glyphs().unwrap_or_default());
     let initial_hub_paths: Vec<String> = initial_rows.iter().map(|(_, p, _)| p.clone()).collect();
     let now = crate::model::now();
     let initial_entries = crate::load(db, reg, ignore, None).unwrap_or_default();
@@ -1918,82 +2275,186 @@ pub fn run_sidebar(
         sessions: initial_sessions,
         editors: Vec::new(),
         branches: HashMap::new(),
+        installed: None,
     };
 
     let mut cached_data = initial_data.clone();
     let mut last_ver = db.data_version();
+    let mut last_entries_sig = db.entries_signature().ok();
     let mut last_hub_paths = initial_hub_paths.clone();
     let mut last_best: Best = best_by_path(&initial_data.sessions);
-    let mut last_idle_bg = Instant::now();
-    let mut frame = 0usize;
+    let mut next_deadline = Db::next_deadline(&initial_data.sessions);
+    let mut has_pinned_open = initial_data.sessions.iter().any(|s| {
+        s.status != crate::model::Status::Done && (s.shell_pid.is_some() || s.agent_pid.is_some())
+    });
+    let mut last_pin_check = Instant::now();
 
-    let reload = Box::new(move || -> Option<(Data, Vec<String>)> {
-        let (win_active, attached) = pane_activity();
-        if (!win_active || !attached) && last_idle_bg.elapsed() < Duration::from_secs(15) {
-            return None;
-        }
-        last_idle_bg = Instant::now();
-
-        let ver = db.data_version();
-        let rows = t.windows_and_glyphs().unwrap_or_default();
-        let hub_paths: Vec<String> = rows.iter().map(|(_, p, _)| p.clone()).collect();
-        // A shell that dies without an end hook writes nothing to the DB, so
-        // also reload when a cached open session has expired.
-        let now = crate::model::now();
-        let db_changed = ver != last_ver
-            || cached_data
-                .sessions
-                .iter()
-                .any(|s| crate::db::session_expired(s, now));
-        let hubs_changed = hub_paths != last_hub_paths;
-
-        frame = frame.wrapping_add(1);
-        let has_working = last_best
-            .values()
-            .any(|s| s.status == crate::model::Status::Working);
-        if !db_changed && !hubs_changed {
-            if win_active && attached && has_working {
-                sync_glyphs_rows(&t, &rows, &last_best, frame, ascii, color);
-            }
-            return None;
-        }
-
-        if db_changed {
-            let entries = crate::load(db, reg, ignore, None).ok()?;
-            let sessions = db.sessions(now).unwrap_or_default();
-            last_ver = ver;
-            last_best = best_by_path(&sessions);
-            cached_data = Data {
-                entries,
-                sessions,
-                editors: Vec::new(),
-                branches: HashMap::new(),
+    let reload = Box::new(move |force: bool| -> crate::sidebar::ReloadTick {
+        let vis = hub_vis.poll(force, true);
+        if !vis.visible() {
+            return crate::sidebar::ReloadTick {
+                visible: false,
+                data: None,
             };
         }
-        last_hub_paths = hub_paths.clone();
-        if win_active && attached {
-            sync_glyphs_rows(&t, &rows, &last_best, frame, ascii, color);
+
+        let rows = vis
+            .windows
+            .unwrap_or_else(|| t.windows_and_glyphs().unwrap_or_default());
+        let hub_paths: Vec<String> = rows.iter().map(|(_, p, _)| p.clone()).collect();
+        let ver = db.data_version();
+        let now = crate::model::now();
+        let db_changed = ver != last_ver;
+        let hubs_changed = hub_paths != last_hub_paths;
+        let deadline_hit = now >= next_deadline;
+        let pin_due = has_pinned_open && last_pin_check.elapsed() >= Duration::from_secs(10);
+        let need_sessions = vis.became_visible || db_changed || deadline_hit || pin_due;
+
+        let mut sessions_reloaded = false;
+        if need_sessions {
+            if pin_due || vis.became_visible {
+                last_pin_check = Instant::now();
+            }
+            let sig = db.entries_signature().ok();
+            if vis.became_visible || sig != last_entries_sig || sig.is_none() {
+                if let Ok(entries) = crate::load(db, reg, ignore, None) {
+                    cached_data.entries = entries;
+                    last_entries_sig = sig;
+                }
+            }
+            let sessions = db.sessions(now).unwrap_or_default();
+            next_deadline = Db::next_deadline(&sessions);
+            has_pinned_open = sessions.iter().any(|s| {
+                s.status != crate::model::Status::Done
+                    && (s.shell_pid.is_some() || s.agent_pid.is_some())
+            });
+            last_ver = db.data_version();
+            last_best = best_by_path(&sessions);
+            cached_data.sessions = sessions;
+            sessions_reloaded = true;
         }
-        Some((cached_data.clone(), hub_paths))
+
+        last_hub_paths = hub_paths.clone();
+        if vis.became_visible || sessions_reloaded || hubs_changed {
+            sync_glyphs_rows(&t, &rows, &last_best, 0, ascii, color);
+        }
+        if !sessions_reloaded && !hubs_changed {
+            return crate::sidebar::ReloadTick {
+                visible: true,
+                data: None,
+            };
+        }
+        crate::sidebar::ReloadTick {
+            visible: true,
+            data: Some((cached_data.clone(), hub_paths)),
+        }
     });
+    let mut global_counts: HashMap<String, i64> = HashMap::new();
+    for e in &initial_data.entries {
+        for tag in &e.tags {
+            let c = global_counts.entry(tag.tool.clone()).or_insert(0);
+            *c = c.saturating_add(tag.count.max(0));
+        }
+    }
+
+    let bg_custom = db.custom_tools().unwrap_or_default();
+    let bg_cfg = cfg.clone();
+    let bg_ignore = ignore.clone();
+    let (bg_tx, bg_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let bg_reg = crate::tools::Registry::new(&bg_custom);
+        let installed = crate::launcher::discover_installed(&bg_reg, &bg_cfg);
+        let open = crate::editors_live::open_editors(&bg_ignore);
+        let _ = bg_tx.send((installed, open));
+    });
+
     let t_go = Tmux::new();
     let go = Box::new(
         move |e: &crate::model::Entry, resume: bool| -> std::result::Result<(), String> {
-            let cmd = if resume {
+            let found = if resume {
                 let fresh = crate::tools::Registry::from_db(db).ok();
                 let reg = fresh.as_ref().unwrap_or(reg);
-                let cmd = e
+                let (tag, cmd) = e
                     .tags
                     .iter()
                     .filter(|t| reg.is_ai_tag(&t.tool))
-                    .find_map(|t| reg.launch_command(&t.tool));
-                Some(cmd.ok_or("no AI tool used here")?)
+                    .find_map(|t| reg.launch_command(&t.tool).map(|c| (t.tool.clone(), c)))
+                    .ok_or_else(|| "no AI tool used here".to_string())?;
+                Some((tag, cmd))
             } else {
                 None
             };
-            switch(&t_go, db, &e.path, cmd.as_deref())
+            let run = found.as_ref().map(|(tag, cmd)| HubRun::tool(tag, cmd));
+            switch(&t_go, db, &e.path, run)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
+        },
+    );
+    let cfg_disc = cfg.clone();
+    let discover = Box::new(move || {
+        let fresh = crate::tools::Registry::from_db(db).ok();
+        let reg = fresh.as_ref().unwrap_or(reg);
+        (
+            crate::launcher::discover_installed(reg, &cfg_disc),
+            crate::editors_live::open_editors(ignore),
+        )
+    });
+    let t_launch = Tmux::new();
+    let launch = Box::new(
+        move |e: &crate::model::Entry,
+              choice: &crate::launcher::LaunchChoice,
+              open_editors: &[crate::editors_live::OpenEditor]|
+              -> std::result::Result<String, String> {
+            let target = &choice.target;
+            let now = crate::model::now();
+            let record = |tag: &str| {
+                if !ignore.is_ignored(&e.path) && !tag.is_empty() {
+                    let _ = db.record_tool(&e.path, tag, now);
+                }
+            };
+            match &target.method {
+                crate::launcher::LaunchMethod::Gui { .. }
+                | crate::launcher::LaunchMethod::GuiUrl { .. } => {
+                    let open = crate::launcher::find_open_for_target(target, &e.path, open_editors);
+                    let ed = crate::launcher::build_editor_choice(target, &e.path, open)
+                        .map_err(|err| err.to_string())?;
+                    record(&target.tag);
+                    crate::spawn_gui_editor(&ed).map_err(|err| err.to_string())?;
+                    Ok(format!("opened {}", target.label))
+                }
+                crate::launcher::LaunchMethod::TerminalEditor { .. } => {
+                    let ed = crate::launcher::build_editor_choice(target, &e.path, None)
+                        .map_err(|err| err.to_string())?;
+                    let cmd = crate::emit_editor_cmd(&ed).map_err(|err| err.to_string())?;
+                    record(&target.tag);
+                    switch(&t_launch, db, &e.path, Some(HubRun::cmd(&target.tag, &cmd)))
+                        .map_err(|err| err.to_string())?;
+                    Ok(format!("opened {}", target.label))
+                }
+                crate::launcher::LaunchMethod::CliAgent {
+                    tool_tag,
+                    launch_cmd,
+                } => {
+                    let fresh = crate::tools::Registry::from_db(db).ok();
+                    let r = fresh.as_ref().unwrap_or(reg);
+                    let canonical = r.normalize_tag(tool_tag);
+                    let cmd = r
+                        .launch_command(&canonical)
+                        .unwrap_or_else(|| launch_cmd.clone());
+                    record(&canonical);
+                    switch(&t_launch, db, &e.path, Some(HubRun::tool(&canonical, &cmd)))
+                        .map_err(|err| err.to_string())?;
+                    Ok(format!("started {}", target.label))
+                }
+                crate::launcher::LaunchMethod::HubShell => {
+                    new_shell_workspace(&t_launch, db, &e.path).map_err(|err| err.to_string())?;
+                    Ok("opened shell".into())
+                }
+                crate::launcher::LaunchMethod::Travel => {
+                    switch(&t_launch, db, &e.path, None).map_err(|err| err.to_string())?;
+                    Ok("switched".into())
+                }
+            }
         },
     );
     let home = platform::home_dir().map(|h| platform::clean_path_str(&h.to_string_lossy()));
@@ -2005,7 +2466,9 @@ pub fn run_sidebar(
         home,
         reload,
         go,
-    );
+    )
+    .with_visible(init_visible)
+    .with_launcher(global_counts, Some(bg_rx), Some(discover), Some(launch));
     crate::tui::run(&mut sb)
 }
 
@@ -2288,6 +2751,10 @@ mod tests {
         assert!(c.contains("window-status-current-style"));
         assert!(c.contains("client_key_table"));
         assert!(c.contains("set-hook -g pane-exited"));
+        assert!(c.contains("set-hook -g client-attached"));
+        assert!(c.contains("set-hook -g client-detached"));
+        assert!(c.contains("set-hook -g session-window-changed"));
+        assert!(c.contains("hub wake"));
         assert!(c.contains("bind -T grace ? if -F \"#{e|<:#{client_height},25}\" "));
         assert!(c.contains("display-popup -E -w 46 -h 100%"));
         assert!(c.contains(
@@ -2383,5 +2850,37 @@ mod tests {
         let (sb, rt) = fit_widths(&d, 80, true, true);
         assert!(80 - sb - rt >= 32, "{sb} {rt}");
         assert_eq!(fit_widths(&d, 200, false, true), (0, 80));
+    }
+
+    #[test]
+    fn parses_hub_view_and_static_working_glyph() {
+        let out = "@1|g|/a|g||g|0|g|1\n@2|g|/b|g|◐|g|1|g|1\n";
+        let v = parse_hub_view(out, "@2");
+        assert!(v.found_my_win);
+        assert!(v.active);
+        assert!(v.attached);
+        assert_eq!(v.windows.len(), 2);
+
+        let v_hidden = parse_hub_view("@1|g|/a|g||g|1|g|0\n@2|g|/b|g||g|0|g|0\n", "@2");
+        assert!(v_hidden.found_my_win);
+        assert!(!v_hidden.active);
+        assert!(!v_hidden.attached);
+
+        let g0 = glyph(crate::model::Status::Working, 0, false, true);
+        let g5 = glyph(crate::model::Status::Working, 5, false, true);
+        assert_eq!(g0, g5);
+        assert_eq!(glyph(crate::model::Status::Working, 3, true, false), "*");
+    }
+
+    #[test]
+    fn wake_file_stamp_changes_on_atomic_write() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("hub.wake");
+        assert_eq!(read_wake_stamp(&p), None);
+        write_file_atomic_0600(&p, "hub.wake", "1\n").unwrap();
+        let s1 = read_wake_stamp(&p).unwrap();
+        write_file_atomic_0600(&p, "hub.wake", "2\n").unwrap();
+        let s2 = read_wake_stamp(&p).unwrap();
+        assert_ne!(s1, s2);
     }
 }

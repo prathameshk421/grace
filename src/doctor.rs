@@ -168,6 +168,18 @@ fn validate_config(text: &str) -> std::result::Result<Vec<String>, toml_edit::To
                 )),
                 None => issues.push("`hub_layout` must be a string".into()),
             },
+            "default_action" => match item.as_str() {
+                Some(v) if matches!(v.trim(), "travel" | "launch") => {}
+                Some(v) => issues.push(format!(
+                    "`default_action` must be travel/launch (got `{v}`)"
+                )),
+                None => issues.push("`default_action` must be a string".into()),
+            },
+            "cli_in_hub" => {
+                if item.as_bool().is_none() {
+                    issues.push("`cli_in_hub` must be a boolean".into());
+                }
+            }
             "ignore" => match item.as_array() {
                 Some(arr) => {
                     for (idx, val) in arr.iter().enumerate() {
@@ -513,13 +525,15 @@ fn check_database(a: &Ansi, sum: &mut Summary, home_ref: Option<&str>, fix: bool
 
     let (active, stale_or_dead) = db.inspect_sessions(now).unwrap_or((0, 0));
     let live_sessions = if fix {
-        if stale_or_dead > 0 {
+        let mut sessions_cleaned = false;
+        let result = if stale_or_dead > 0 {
             let _ = db.sessions(now);
             let (active_after, stale_after) =
                 db.inspect_sessions(now).unwrap_or((active, stale_or_dead));
             let cleaned = (active + stale_or_dead).saturating_sub(active_after + stale_after);
             if cleaned > 0 {
                 sum.fixed += 1;
+                sessions_cleaned = true;
                 ok_line(
                     a,
                     "sessions",
@@ -529,7 +543,17 @@ fn check_database(a: &Ansi, sum: &mut Summary, home_ref: Option<&str>, fix: bool
             active_after + stale_after
         } else {
             active
+        };
+        let wal_path = dir.join("grace.db-wal");
+        let wal_big = wal_path.metadata().is_ok_and(|m| m.len() > 1_048_576);
+        if (wal_big || sessions_cleaned)
+            && wal_path.is_file()
+            && db.wal_checkpoint_truncate().is_ok()
+        {
+            sum.fixed += 1;
+            ok_line(a, "wal", "checkpointed and truncated WAL log");
         }
+        result
     } else {
         if stale_or_dead > 0 {
             warn_fixable(
@@ -824,6 +848,8 @@ theme = "dark"
 editor = "nvim"
 ascii = false
 hub_layout = "code+diff"
+default_action = "launch"
+cli_in_hub = true
 ignore = ["/tmp/*", "~/Downloads/*"]
 "#,
         )
@@ -837,6 +863,8 @@ ignore = ["/tmp/*", "~/Downloads/*"]
             r#"
 theme = "blue"
 ascii = "yes"
+default_action = "fly"
+cli_in_hub = "maybe"
 ignore = [""]
 extra = 1
 [hub]
@@ -844,6 +872,6 @@ foo = "bar"
 "#,
         )
         .unwrap();
-        assert_eq!(bad.len(), 5, "{bad:?}");
+        assert_eq!(bad.len(), 7, "{bad:?}");
     }
 }

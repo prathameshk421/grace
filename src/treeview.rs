@@ -58,6 +58,9 @@ const HELP_ROWS_HUB: [(&str, &str); 9] = [
 const SKIP: [&str; 3] = [".git", "node_modules", "target"];
 const MAX_FILES: usize = 20_000;
 const MAX_DEPTH: usize = 128;
+const MIN_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
@@ -329,6 +332,17 @@ fn mark_letter(m: Mark) -> &'static str {
 
 type TreeLoad = (Node, HashMap<String, Mark>, Option<String>);
 
+enum BgTreeResult {
+    Unchanged(Option<git::RepoKey>, Option<(u64, u64)>),
+    Updated {
+        key: Option<git::RepoKey>,
+        fp: Option<(u64, u64)>,
+        root: Node,
+        marks: HashMap<String, Mark>,
+        branch: Option<String>,
+    },
+}
+
 pub struct TreeView {
     dir: PathBuf,
     editor: Option<String>,
@@ -343,6 +357,7 @@ pub struct TreeView {
     page: usize,
     theme: Theme,
     in_hub: bool,
+    hub_vis: crate::hub::HubVisibility,
     focused: bool,
     meta_cache: String,
     changed_only: bool,
@@ -354,14 +369,20 @@ pub struct TreeView {
     toast: Option<Toast>,
     list_area: Rect,
     last_click: DoubleClick,
-    bg_rx: Option<Receiver<TreeLoad>>,
+    repo_key: Option<git::RepoKey>,
+    last_fp: Option<(u64, u64)>,
+    bg_rx: Option<Receiver<BgTreeResult>>,
+    bg_started: Option<Instant>,
     last_bg: Instant,
+    backoff: Duration,
+    force_refresh: bool,
     hints: [(&'static str, &'static str); 5],
 }
 
 impl TreeView {
     pub fn in_hub(mut self, yes: bool) -> TreeView {
         self.in_hub = yes;
+        self.hub_vis = crate::hub::HubVisibility::new(yes);
         if yes {
             self.hints[4] = ("q", "hide");
         }
@@ -392,6 +413,7 @@ impl TreeView {
             page: 10,
             theme,
             in_hub: false,
+            hub_vis: crate::hub::HubVisibility::new(false),
             focused: true,
             meta_cache: String::new(),
             changed_only: false,
@@ -403,11 +425,16 @@ impl TreeView {
             toast: None,
             list_area: Rect::default(),
             last_click: DoubleClick::default(),
+            repo_key: None,
+            last_fp: None,
             bg_rx: None,
+            bg_started: None,
             last_bg: Instant::now() - Duration::from_secs(30),
+            backoff: MIN_BACKOFF,
+            force_refresh: false,
             hints: HINTS,
         };
-        v.reload_async();
+        v.reload_async(false);
         v
     }
 
@@ -428,6 +455,7 @@ impl TreeView {
             page: 10,
             theme: Theme::dark(),
             in_hub: false,
+            hub_vis: crate::hub::HubVisibility::new(false),
             focused: true,
             meta_cache: String::new(),
             changed_only: false,
@@ -439,22 +467,27 @@ impl TreeView {
             toast: None,
             list_area: Rect::default(),
             last_click: DoubleClick::default(),
+            repo_key: None,
+            last_fp: None,
             bg_rx: None,
+            bg_started: None,
             last_bg: Instant::now(),
+            backoff: MIN_BACKOFF,
+            force_refresh: false,
             hints: HINTS,
         };
         v.rebuild_rows(None);
         v
     }
 
-    fn compute_tree_data(dir: &Path) -> TreeLoad {
-        let (mut files, repo) = match git::ls_files(dir) {
-            Some(f) => (f, git::status_opts(dir, false)),
-            None => (walk_dir(dir), None),
+    fn build_tree_from_repo(dir: &Path, repo: Option<&git::Repo>) -> TreeLoad {
+        let mut files = match repo {
+            Some(_) => git::ls_files(dir).unwrap_or_else(|| walk_dir(dir)),
+            None => walk_dir(dir),
         };
         let mut marks = HashMap::new();
-        let branch = repo.as_ref().map(|r| r.branch.name.clone());
-        if let Some(r) = &repo {
+        let branch = repo.map(|r| r.branch.name.clone());
+        if let Some(r) = repo {
             for c in &r.changes {
                 let Some(rel) = c.path.strip_prefix(&r.prefix) else {
                     continue;
@@ -464,6 +497,52 @@ impl TreeView {
             }
         }
         (build_tree(&files), marks, branch)
+    }
+
+    fn compute_tree_result(
+        dir: &Path,
+        mut repo_key: Option<git::RepoKey>,
+        prev_fp: Option<(u64, u64)>,
+    ) -> BgTreeResult {
+        if repo_key.is_none() {
+            repo_key = git::resolve_repo(dir);
+        }
+        let status = if let Some(ref k) = repo_key {
+            match git::tree_status_with_key(k, prev_fp) {
+                Some(res) => Some(res),
+                None => {
+                    repo_key = git::resolve_repo(dir);
+                    repo_key
+                        .as_ref()
+                        .and_then(|k2| git::tree_status_with_key(k2, None))
+                }
+            }
+        } else {
+            None
+        };
+        match status {
+            Some((None, fp)) => BgTreeResult::Unchanged(repo_key, Some(fp)),
+            Some((Some(repo), fp)) => {
+                let (root, marks, branch) = Self::build_tree_from_repo(dir, Some(&repo));
+                BgTreeResult::Updated {
+                    key: repo_key,
+                    fp: Some(fp),
+                    root,
+                    marks,
+                    branch,
+                }
+            }
+            None => {
+                let (root, marks, branch) = Self::build_tree_from_repo(dir, None);
+                BgTreeResult::Updated {
+                    key: None,
+                    fp: None,
+                    root,
+                    marks,
+                    branch,
+                }
+            }
+        }
     }
 
     fn apply_tree_data(&mut self, data: TreeLoad) {
@@ -483,28 +562,57 @@ impl TreeView {
     }
 
     fn reload_sync(&mut self) {
-        let data = Self::compute_tree_data(&self.dir);
-        self.apply_tree_data(data);
+        self.bg_rx = None;
+        self.bg_started = None;
+        self.last_fp = None;
+        self.repo_key = git::resolve_repo(&self.dir);
+        self.backoff = MIN_BACKOFF;
+        self.last_bg = Instant::now();
+        match Self::compute_tree_result(&self.dir, self.repo_key.clone(), None) {
+            BgTreeResult::Updated {
+                key,
+                fp,
+                root,
+                marks,
+                branch,
+            } => {
+                self.repo_key = key;
+                self.last_fp = fp;
+                self.apply_tree_data((root, marks, branch));
+            }
+            BgTreeResult::Unchanged(key, fp) => {
+                self.repo_key = key;
+                self.last_fp = fp;
+            }
+        }
     }
 
-    fn reload_async(&mut self) {
+    fn reload_async(&mut self, force: bool) {
         if self.bg_rx.is_some() {
             return;
         }
-        if self.in_hub {
-            let (win_active, attached) = crate::hub::pane_activity();
-            if (!self.focused || !win_active || !attached)
-                && self.last_bg.elapsed() < Duration::from_secs(15)
-            {
-                return;
-            }
+        let vis = self.hub_vis.poll(force, false);
+        if !vis.visible() {
+            return;
+        }
+        if vis.became_visible || force {
+            self.backoff = MIN_BACKOFF;
+        } else if self.last_bg.elapsed() < self.backoff {
+            return;
         }
         self.last_bg = Instant::now();
         let dir = self.dir.clone();
+        let repo_key = self.repo_key.clone();
+        let prev_fp = if self.initial_expand_done && !force {
+            self.last_fp
+        } else {
+            None
+        };
         let (tx, rx) = mpsc::channel();
         self.bg_rx = Some(rx);
+        self.bg_started = Some(Instant::now());
         std::thread::spawn(move || {
-            let _ = tx.send(Self::compute_tree_data(&dir));
+            let _ = tx.send(Self::compute_tree_result(&dir, repo_key, prev_fp));
         });
     }
 
@@ -660,6 +768,18 @@ impl TreeView {
             Err(msg) => self.flash(msg, ToastKind::Warn),
         }
     }
+
+    fn check_timeouts(&mut self) -> bool {
+        if self.bg_rx.is_some() && self.bg_started.is_some_and(|t| t.elapsed() >= GIT_TIMEOUT) {
+            self.bg_rx = None;
+            self.bg_started = None;
+            self.last_bg = Instant::now();
+            self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+            self.flash("file tree refresh timed out", ToastKind::Warn);
+            return true;
+        }
+        false
+    }
 }
 
 impl tui::App for TreeView {
@@ -670,8 +790,11 @@ impl tui::App for TreeView {
     fn focus(&mut self, focused: bool) {
         let gained = focused && !self.focused;
         self.focused = focused;
-        if gained && self.last_bg.elapsed() >= Duration::from_secs(2) {
-            self.reload_async();
+        if gained {
+            self.backoff = MIN_BACKOFF;
+            if self.last_bg.elapsed() >= MIN_BACKOFF {
+                self.reload_async(true);
+            }
         }
     }
 
@@ -680,16 +803,57 @@ impl tui::App for TreeView {
     }
 
     fn poll_bg(&mut self) -> bool {
-        let Some(rx) = &self.bg_rx else { return false };
-        let Ok(data) = rx.try_recv() else {
+        let Some(rx) = &self.bg_rx else {
             return false;
         };
-        self.bg_rx = None;
-        self.apply_tree_data(data);
-        true
+        match rx.try_recv() {
+            Ok(res) => {
+                self.bg_rx = None;
+                self.bg_started = None;
+                match res {
+                    BgTreeResult::Unchanged(key, fp) => {
+                        self.repo_key = key;
+                        self.last_fp = fp;
+                        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+                        false
+                    }
+                    BgTreeResult::Updated {
+                        key,
+                        fp,
+                        root,
+                        marks,
+                        branch,
+                    } => {
+                        self.repo_key = key;
+                        self.last_fp = fp;
+                        if self.repo_key.is_none()
+                            && self.initial_expand_done
+                            && root == self.root
+                            && marks == self.marks
+                            && branch == self.branch
+                        {
+                            self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+                            return false;
+                        }
+                        self.backoff = MIN_BACKOFF;
+                        self.apply_tree_data((root, marks, branch));
+                        true
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => self.check_timeouts(),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.bg_rx = None;
+                self.bg_started = None;
+                !self.initial_expand_done
+            }
+        }
     }
 
     fn mouse(&mut self, m: MouseEvent) -> Flow {
+        if !matches!(m.kind, MouseEventKind::Moved) {
+            self.backoff = MIN_BACKOFF;
+        }
         match m.kind {
             MouseEventKind::ScrollUp => self.mv(-1),
             MouseEventKind::ScrollDown => self.mv(1),
@@ -723,6 +887,7 @@ impl tui::App for TreeView {
     }
 
     fn key(&mut self, k: KeyEvent) -> Flow {
+        self.backoff = MIN_BACKOFF;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.show_help {
             if is_help_dismiss(&k) {
@@ -831,12 +996,25 @@ impl tui::App for TreeView {
         if expired {
             self.toast = None;
         }
-        self.reload_async();
-        expired
+        let timed_out = self.check_timeouts();
+        let force = std::mem::take(&mut self.force_refresh);
+        self.reload_async(force);
+        expired || timed_out
     }
 
     fn every(&self) -> Duration {
-        Duration::from_secs(2)
+        Duration::from_secs(1)
+    }
+
+    fn wake(&mut self) {
+        if !self.hub_vis.is_visible() {
+            self.force_refresh = true;
+            self.backoff = MIN_BACKOFF;
+        }
+    }
+
+    fn wants_refresh_now(&self) -> bool {
+        self.force_refresh
     }
 }
 
@@ -1168,5 +1346,100 @@ mod tests {
         std::fs::write(d.path().join("node_modules/x/i.js"), "").unwrap();
         std::fs::write(d.path().join("src/m.rs"), "").unwrap();
         assert_eq!(walk_dir(d.path()), vec!["src/m.rs".to_string()]);
+    }
+
+    #[test]
+    fn adaptive_backoff_and_reset() {
+        let mut v = TreeView::with_data("grace", &["src/main.rs"], &[]);
+        assert_eq!(v.backoff, MIN_BACKOFF);
+
+        for expected in [
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(8),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            v.bg_rx = Some(rx);
+            v.bg_started = Some(Instant::now());
+            tx.send(BgTreeResult::Unchanged(None, None)).unwrap();
+            assert!(!v.poll_bg());
+            assert_eq!(v.backoff, expected);
+        }
+
+        // Non-git unchanged tree also advances backoff without redrawing.
+        v.backoff = MIN_BACKOFF;
+        let (tx, rx) = mpsc::channel();
+        v.bg_rx = Some(rx);
+        v.bg_started = Some(Instant::now());
+        tx.send(BgTreeResult::Updated {
+            key: None,
+            fp: None,
+            root: build_tree(&["src/main.rs".into()]),
+            marks: HashMap::new(),
+            branch: Some("main".into()),
+        })
+        .unwrap();
+        assert!(!v.poll_bg());
+        assert_eq!(v.backoff, Duration::from_secs(4));
+
+        // Elapsed < backoff skips reload_async without spawning.
+        v.backoff = MAX_BACKOFF;
+        v.last_bg = Instant::now() - Duration::from_secs(4);
+        v.reload_async(false);
+        assert!(v.bg_rx.is_none());
+
+        // Key interaction resets backoff to MIN_BACKOFF.
+        v.key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(v.backoff, MIN_BACKOFF);
+
+        // Updated tree resets backoff to MIN_BACKOFF.
+        v.backoff = MAX_BACKOFF;
+        let (tx, rx) = mpsc::channel();
+        v.bg_rx = Some(rx);
+        v.bg_started = Some(Instant::now());
+        tx.send(BgTreeResult::Updated {
+            key: None,
+            fp: None,
+            root: build_tree(&["src/main.rs".into(), "src/new.rs".into()]),
+            marks: HashMap::new(),
+            branch: Some("main".into()),
+        })
+        .unwrap();
+        assert!(v.poll_bg());
+        assert_eq!(v.backoff, MIN_BACKOFF);
+
+        // Focus gained resets backoff.
+        v.backoff = MAX_BACKOFF;
+        v.last_bg = Instant::now();
+        v.focus(false);
+        v.focus(true);
+        assert_eq!(v.backoff, MIN_BACKOFF);
+    }
+
+    #[test]
+    fn timeout_clears_channel_and_sets_toast() {
+        let mut v = TreeView::with_data("grace", &["src/main.rs"], &[]);
+        let (_tx, rx) = mpsc::channel();
+        v.bg_rx = Some(rx);
+        v.bg_started = Some(Instant::now() - GIT_TIMEOUT - Duration::from_secs(1));
+        assert!(v.poll_bg());
+        assert!(v.bg_rx.is_none());
+        assert!(v.bg_started.is_none());
+        assert_eq!(
+            v.toast.as_ref().map(|t| t.msg.as_str()),
+            Some("file tree refresh timed out")
+        );
+
+        v.toast = None;
+        let (_tx2, rx2) = mpsc::channel();
+        v.bg_rx = Some(rx2);
+        v.bg_started = Some(Instant::now() - GIT_TIMEOUT - Duration::from_secs(1));
+        assert!(v.refresh());
+        assert!(v.bg_rx.is_none());
+        assert!(v.bg_started.is_none());
+        assert_eq!(
+            v.toast.as_ref().map(|t| t.msg.as_str()),
+            Some("file tree refresh timed out")
+        );
     }
 }
